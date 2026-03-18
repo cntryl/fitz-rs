@@ -78,11 +78,11 @@ impl LeaseClient {
         })
     }
 
-    /// Renew an existing lease.
+    /// Extend an existing lease.
     ///
-    /// `fencing_token` must match the token returned by a previous acquire/renew.
+    /// `fencing_token` must match the token returned by a previous acquire/extend.
     /// Returns the (possibly new) fencing token.
-    pub fn renew(
+    pub fn extend(
         &self,
         route: &str,
         owner_id: &str,
@@ -100,7 +100,7 @@ impl LeaseClient {
             .send_request(message_type::LEASE_RENEW, &enc.finish())?;
 
         let token = decode_success_response(&resp)?
-            .ok_or_else(|| FitzError::Protocol("RENEW response missing fencing token".into()))?;
+            .ok_or_else(|| FitzError::Protocol("EXTEND response missing fencing token".into()))?;
 
         Ok(LeaseGrant {
             fencing_token: token,
