@@ -4,6 +4,7 @@ pub mod tcp;
 pub mod websocket;
 
 use std::io;
+use std::time::Duration;
 
 /// Abstract transport trait - implemented by TCP and WebSocket
 pub trait Transport: Send + Sync {
@@ -12,6 +13,13 @@ pub trait Transport: Send + Sync {
 
     /// Receive a single frame
     fn recv_frame(&mut self) -> io::Result<Vec<u8>>;
+
+    /// Update transport-level read/write timeouts.
+    fn set_timeouts(
+        &mut self,
+        read_timeout: Option<Duration>,
+        write_timeout: Option<Duration>,
+    ) -> io::Result<()>;
 
     /// Close the connection gracefully
     fn close(&mut self) -> io::Result<()>;
@@ -35,6 +43,17 @@ impl Transport for AnyTransport {
         match self {
             AnyTransport::Tcp(t) => t.recv_frame(),
             AnyTransport::WebSocket(t) => t.recv_frame(),
+        }
+    }
+
+    fn set_timeouts(
+        &mut self,
+        read_timeout: Option<Duration>,
+        write_timeout: Option<Duration>,
+    ) -> io::Result<()> {
+        match self {
+            AnyTransport::Tcp(t) => t.set_timeouts(read_timeout, write_timeout),
+            AnyTransport::WebSocket(t) => t.set_timeouts(read_timeout, write_timeout),
         }
     }
 

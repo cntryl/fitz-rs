@@ -23,10 +23,10 @@
 pub mod auth;
 pub mod codec;
 pub mod connection;
+pub mod domains;
 pub mod error;
 pub mod protocol;
 pub mod transport;
-pub mod domains;
 
 pub use auth::TestTokenGenerator;
 pub use error::{FitzError, Result};
@@ -72,7 +72,8 @@ impl FitzClientBuilder {
         self.finish(conn)
     }
 
-    fn finish(self, conn: FitzConnection) -> Result<FitzClient> {
+    fn finish(self, mut conn: FitzConnection) -> Result<FitzClient> {
+        conn.set_timeout(self.timeout)?;
         let shared = SharedConnection::new(conn);
 
         // Generate JWT and send CONNECT frame.
@@ -120,6 +121,31 @@ impl FitzClient {
     /// Get a Lease domain client.
     pub fn lease(&self) -> domains::lease::LeaseClient {
         domains::lease::LeaseClient::new(self.connection.clone())
+    }
+
+    /// Get a Queue domain client.
+    pub fn queue(&self) -> domains::queue::QueueClient {
+        domains::queue::QueueClient::new(self.connection.clone())
+    }
+
+    /// Get a Notice domain client.
+    pub fn notice(&self) -> domains::notice::NoticeClient {
+        domains::notice::NoticeClient::new(self.connection.clone())
+    }
+
+    /// Get a Schedule domain client.
+    pub fn schedule(&self) -> domains::schedule::ScheduleClient {
+        domains::schedule::ScheduleClient::new(self.connection.clone())
+    }
+
+    /// Get an RPC domain client.
+    pub fn rpc(&self) -> domains::rpc::RpcClient {
+        domains::rpc::RpcClient::new(self.connection.clone())
+    }
+
+    /// Get a Stream domain client.
+    pub fn stream(&self) -> domains::stream::StreamClient {
+        domains::stream::StreamClient::new(self.connection.clone())
     }
 
     /// Close the connection.

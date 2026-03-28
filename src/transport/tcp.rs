@@ -15,15 +15,25 @@ impl TcpTransport {
     pub fn connect(host: &str, port: u16) -> std::io::Result<Self> {
         let addr = format!("{}:{}", host, port);
         let stream = TcpStream::connect(&addr)?;
-        
+
         // Set timeouts
         stream.set_read_timeout(Some(Duration::from_secs(30)))?;
         stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-        
+
         Ok(Self {
             stream,
             read_buf: vec![0u8; 65536],
         })
+    }
+
+    pub fn set_timeouts(
+        &mut self,
+        read_timeout: Option<Duration>,
+        write_timeout: Option<Duration>,
+    ) -> std::io::Result<()> {
+        self.stream.set_read_timeout(read_timeout)?;
+        self.stream.set_write_timeout(write_timeout)?;
+        Ok(())
     }
 }
 
@@ -50,6 +60,14 @@ impl Transport for TcpTransport {
         // Read payload exactly
         self.stream.read_exact(&mut self.read_buf[..len])?;
         Ok(self.read_buf[..len].to_vec())
+    }
+
+    fn set_timeouts(
+        &mut self,
+        read_timeout: Option<Duration>,
+        write_timeout: Option<Duration>,
+    ) -> std::io::Result<()> {
+        TcpTransport::set_timeouts(self, read_timeout, write_timeout)
     }
 
     fn close(&mut self) -> std::io::Result<()> {

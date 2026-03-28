@@ -10,7 +10,7 @@ A high-performance, fully type-safe Rust client library for the [Fitz](../README
 - ✅ **Transaction support**: Full ACID transaction semantics for KV domain
 - ✅ **Embedded authentication**: Built-in JWT token generation for testing
 - ✅ **Synchronous API**: Blocking API over async tokio runtime (no callback hell)
-- ✅ **Type-safe**: Compile-time routes and message types via Rust enums
+- ✅ **Focused domain helpers**: Small blocking clients for each broker subsystem
 
 ## Quick Start
 
@@ -37,8 +37,8 @@ let client = FitzClient::connect_tcp(
 // Get KV client
 let kv = client.kv();
 
-// Begin transaction
-let mut tx = kv.begin("app", "users", TransactionMode::ReadWrite)?;
+// Begin transaction on a fully qualified Fitz route
+let tx = kv.begin("kv://my-realm/app/users", TransactionMode::ReadWrite)?;
 
 // Put / Get / Delete
 tx.put(b"alice", b"Alice Johnson")?;
@@ -58,14 +58,14 @@ client.close()?;
 ```rust
 // Same API, just swap the connect method
 let client = FitzClient::connect_ws(
-    "ws://127.0.0.1:4092/fitz",
+    "ws://127.0.0.1:4090/ws",
     "my-realm",
     "shared-secret"
 )?;
 
 // Everything else is identical - transport is abstracted
 let kv = client.kv();
-let mut tx = kv.begin("app", "users", TransactionMode::ReadWrite)?;
+let tx = kv.begin("kv://my-realm/app/users", TransactionMode::ReadWrite)?;
 // ...
 ```
 
@@ -97,12 +97,12 @@ All communication uses **TLV (Tag-Length-Value) encoding**:
 | Domain | Range | Constants |
 |--------|-------|-----------|
 | KV | 100-199 | `BEGIN`, `GET`, `PUT`, `DELETE`, `COMMIT`, `ROLLBACK` |
-| Queue | 200-299 | `SEND`, `RECEIVE`, `ACK` |
-| Notice | 300-399 | `PUBLISH`, `SUBSCRIBE`, `UNSUBSCRIBE` |
-| RPC | 400-499 | `SEND`, `RESPONSE` |
-| Lease | 500-599 | `ACQUIRE`, `EXTEND`, `RELEASE` |
-| Stream | 600-699 | `OPEN`, `WRITE`, `READ` |
-| Schedule | 700-799 | `SCHEDULE`, `CANCEL` |
+| Queue | 200-299 | `ENQUEUE`, `RESERVE`, `EXTEND`, `COMPLETE`, `SUBSCRIBE`, `NOTIFY` |
+| RPC | 300-399 | `SUBSCRIBE`, `UNSUBSCRIBE`, `REQUEST`, `RESPONSE`, `ACK` |
+| Lease | 400-499 | `ACQUIRE`, `RENEW`, `RELEASE`, `QUERY` |
+| Notice | 500-599 | `PUBLISH`, `SUBSCRIBE`, `UNSUBSCRIBE`, `UNSUBSCRIBE_ALL`, `NOTIFY` |
+| Stream | 600-699 | `BEGIN`, `APPEND`, `COMMIT`, `ROLLBACK`, `READ`, `SUBSCRIBE`, `NOTIFY` |
+| Schedule | 700-799 | `CREATE`, `CANCEL`, `LIST`, `SUBSCRIBE`, `NOTIFY` |
 
 ## Domain Clients
 
@@ -112,7 +112,7 @@ Full transaction support with ACID semantics:
 
 ```rust
 let kv = client.kv();
-let mut tx = kv.begin("area", "resource", TransactionMode::ReadWrite)?;
+let tx = kv.begin("kv://my-realm/app/users", TransactionMode::ReadWrite)?;
 
 tx.put(key, value)?;           // Write value
 let v = tx.get(key)?;           // Read value (Option<Vec<u8>>)
@@ -132,58 +132,73 @@ tx.rollback()?;                // Discard all changes
 
 ```rust
 let queue = client.queue();
-queue.send("queue-area", "queue-name", message)?;
-let item = queue.receive("queue-area", "queue-name")?;
-queue.ack(item.id)?;
+queue.enqueue("queue://my-realm/jobs/email", message, None)?;
+
+let items = queue.reserve("queue://my-realm/jobs/email", 30, Some(1), Some(5))?;
+if let Some(item) = items.first() {
+    item.complete()?;
+}
 ```
 
 ### Notice (Pub/Sub)
 
 ```rust
 let notice = client.notice();
-notice.publish("area", "topic", message)?;
+notice.publish("notice://my-realm/app/events", message)?;
 
-let subscriber = notice.subscribe("area", "topic/*")?;  // Supports * and ** wildcards
-while let Some(msg) = subscriber.next()? {
-    println!("Received: {:?}", msg);
-}
+let subscription = notice.subscribe("notice://my-realm/app/*")?;
+let msg = subscription.next()?;
+println!("Received notice on {}", msg.route);
 ```
 
 ### RPC (Remote Procedure Call)
 
 ```rust
 let rpc = client.rpc();
-let response = rpc.send("area", "service", request)?;
+
+let mut responses = rpc.call("rpc://my-realm/app/echo", b"ping")?;
+while let Some(frame) = responses.next()? {
+    println!("rpc frame {}: {} bytes", frame.sequence, frame.body.len());
+}
+
+let worker = rpc.register_worker("rpc://my-realm/app/echo")?;
+let mut request = worker.next()?;
+request.respond(request.body.as_slice(), true)?;
 ```
 
 ### Lease (Distributed Locks)
 
 ```rust
 let lease = client.lease();
-let grant = lease.acquire("area", "resource", duration)?;
-grant.extend()?;
-grant.release()?;
+let grant = lease.acquire("lease://my-realm/locks/leader", "node-1", 30)?;
+let renewed = lease.extend("lease://my-realm/locks/leader", "node-1", grant.fencing_token, 30)?;
+lease.release("lease://my-realm/locks/leader", "node-1", renewed.fencing_token)?;
 ```
 
 ### Stream (Named Channels)
 
 ```rust
 let stream = client.stream();
-let writer = stream.open_write("area", "stream-name")?;
-writer.write(data)?;
+let mut session = stream.begin("stream://my-realm/orders/events", 0, None)?;
+session.append(b"created", None)?;
+session.commit(cntryl::domains::stream::StreamCommitMode::Sync)?;
 
-let reader = stream.open_read("area", "stream-name")?;
-while let Some(chunk) = reader.read()? {
-    println!("Got chunk: {:?}", chunk);
-}
+let records = stream.read("stream://my-realm/orders/events", 0, 100, None)?;
+let last = stream.peek("stream://my-realm/orders/events")?;
+let metadata = stream.metadata("stream://my-realm/orders/events")?;
+
+let subscription = stream.subscribe("stream://my-realm/orders/events")?;
+let notification = subscription.next()?;
+println!("{} {}", notification.route, notification.event);
 ```
 
 ### Schedule (Job Scheduling)
 
 ```rust
 let schedule = client.schedule();
-let job_id = schedule.schedule("area", scheduled_time, job_spec)?;
-schedule.cancel(job_id)?;
+let schedule_id = schedule.create("schedule://my-realm/app/orders/run", "*/5 * * * *", b"sync")?;
+let (_entries, total) = schedule.list(None, Some(100))?;
+schedule.cancel(&schedule_id)?;
 ```
 
 ## Testing
@@ -194,19 +209,17 @@ schedule.cancel(job_id)?;
 cargo test --lib
 ```
 
-Tests TLV codec, authentication, connection management.
+Tests codec/auth/connection layers plus domain decode helpers.
 
 ### Integration Tests (Requires Running Server)
 
 ```bash
-# TCP tests
-cargo test integration_kv_tcp -- --ignored --nocapture
+# Full library and integration suite
+cargo test --lib --tests
 
-# WebSocket tests
-cargo test integration_kv_websocket -- --ignored --nocapture
-
-# Both transports with same tests
-cargo test integration_multiprotocol -- --ignored --nocapture
+# Targeted end-to-end suites
+cargo test --test integration_rpc -- --nocapture
+cargo test --test integration_stream -- --nocapture
 ```
 
 To run integration tests, start the Fitz server first:

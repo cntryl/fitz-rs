@@ -1,10 +1,188 @@
-//! Notice (pub/sub) domain client - placeholder
+//! Notice (pub/sub) domain client.
 
-#[derive(Default)]
-pub struct NoticeClient;
+use crate::codec::{PayloadDecoder, PayloadEncoder};
+use crate::connection::SharedConnection;
+use crate::error::{FitzError, Result};
+use crate::protocol::message_type;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoticeMessage {
+    pub route: String,
+    pub body: Vec<u8>,
+}
+
+pub struct NoticeClient {
+    conn: SharedConnection,
+}
 
 impl NoticeClient {
-    pub fn new() -> Self {
-        Self
+    pub fn new(conn: SharedConnection) -> Self {
+        Self { conn }
+    }
+
+    pub fn publish(&self, route: &str, body: &[u8]) -> Result<()> {
+        let mut enc = PayloadEncoder::new();
+        enc.put_string(route);
+        enc.put_bytes(body);
+
+        let resp = self
+            .conn
+            .send_request(message_type::NOTICE_PUBLISH, &enc.finish())?;
+
+        decode_notice_response("PUBLISH", &resp)
+    }
+
+    pub fn subscribe(&self, pattern: &str) -> Result<NoticeSubscription> {
+        let mut enc = PayloadEncoder::new();
+        enc.put_string(pattern);
+
+        let resp = self
+            .conn
+            .send_request(message_type::NOTICE_SUBSCRIBE, &enc.finish())?;
+
+        let subscription_id = decode_subscription_response("SUBSCRIBE", &resp)?;
+        Ok(NoticeSubscription {
+            conn: self.conn.clone(),
+            pattern: pattern.to_string(),
+            subscription_id,
+        })
+    }
+
+    pub fn unsubscribe_all(&self) -> Result<()> {
+        let resp = self
+            .conn
+            .send_request(message_type::NOTICE_UNSUBSCRIBE_ALL, &[])?;
+
+        decode_notice_response("UNSUBSCRIBE_ALL", &resp)
+    }
+}
+
+pub struct NoticeSubscription {
+    conn: SharedConnection,
+    pattern: String,
+    subscription_id: u64,
+}
+
+impl NoticeSubscription {
+    pub fn subscription_id(&self) -> u64 {
+        self.subscription_id
+    }
+
+    pub fn next(&self) -> Result<NoticeMessage> {
+        let (_, payload) = self.conn.recv_message_matching(|msg_type, payload| {
+            msg_type == message_type::NOTICE_NOTIFY
+                && decode_notify_subscription_id(payload)
+                    .map(|sub_id| sub_id == self.subscription_id)
+                    .unwrap_or(false)
+        })?;
+
+        decode_notice_notify(&payload)
+    }
+
+    pub fn unsubscribe(&self) -> Result<()> {
+        let mut enc = PayloadEncoder::new();
+        enc.put_string(&self.pattern);
+
+        let resp = self
+            .conn
+            .send_request(message_type::NOTICE_UNSUBSCRIBE, &enc.finish())?;
+
+        decode_notice_response("UNSUBSCRIBE", &resp)
+    }
+}
+
+fn decode_notice_response(operation: &str, buf: &[u8]) -> Result<()> {
+    let mut dec = PayloadDecoder::new(buf);
+    let status = dec.get_u8()?;
+    match status {
+        0 => Ok(()),
+        1 => {
+            let message = dec.get_string()?;
+            Err(FitzError::DomainError(format!(
+                "{operation} failed: {message}"
+            )))
+        }
+        other => Err(FitzError::Protocol(format!(
+            "{operation} failed with unknown status byte: {other}"
+        ))),
+    }
+}
+
+fn decode_subscription_response(operation: &str, buf: &[u8]) -> Result<u64> {
+    let mut dec = PayloadDecoder::new(buf);
+    let status = dec.get_u8()?;
+    match status {
+        0 => {
+            let has_subscription_id = if dec.is_empty() { 0 } else { dec.get_u8()? };
+            if has_subscription_id != 1 {
+                return Err(FitzError::Protocol(format!(
+                    "{operation} response missing subscription id"
+                )));
+            }
+            dec.get_u64()
+        }
+        1 => {
+            let message = dec.get_string()?;
+            Err(FitzError::DomainError(format!(
+                "{operation} failed: {message}"
+            )))
+        }
+        other => Err(FitzError::Protocol(format!(
+            "{operation} failed with unknown status byte: {other}"
+        ))),
+    }
+}
+
+fn decode_notify_subscription_id(payload: &[u8]) -> Result<u64> {
+    let mut dec = PayloadDecoder::new(payload);
+    dec.get_u64()
+}
+
+fn decode_notice_notify(payload: &[u8]) -> Result<NoticeMessage> {
+    let mut dec = PayloadDecoder::new(payload);
+    let _subscription_id = dec.get_u64()?;
+    let route = dec.get_string()?;
+    let body = dec.get_bytes()?;
+    Ok(NoticeMessage { route, body })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_decode_notice_ok_response() {
+        decode_notice_response("PUBLISH", &[0]).unwrap();
+    }
+
+    #[test]
+    fn should_decode_notice_error_response() {
+        let mut buf = vec![1];
+        buf.extend_from_slice(&(4u32).to_be_bytes());
+        buf.extend_from_slice(b"nope");
+        let err = decode_notice_response("PUBLISH", &buf).unwrap_err();
+        assert!(err.to_string().contains("nope"));
+    }
+
+    #[test]
+    fn should_decode_notice_subscription_response() {
+        let mut buf = vec![0, 1];
+        buf.extend_from_slice(&11u64.to_be_bytes());
+        let sub_id = decode_subscription_response("SUBSCRIBE", &buf).unwrap();
+        assert_eq!(sub_id, 11);
+    }
+
+    #[test]
+    fn should_decode_notice_notify_payload() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&11u64.to_be_bytes());
+        buf.extend_from_slice(&(21u32).to_be_bytes());
+        buf.extend_from_slice(b"notice://realm/area/x");
+        buf.extend_from_slice(&(4u32).to_be_bytes());
+        buf.extend_from_slice(b"ping");
+
+        let message = decode_notice_notify(&buf).unwrap();
+        assert_eq!(message.route, "notice://realm/area/x");
+        assert_eq!(message.body, b"ping");
     }
 }

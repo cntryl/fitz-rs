@@ -4,10 +4,14 @@
 //! plus a thread-safe `SharedConnection` wrapper that eliminates the
 //! encode→send→recv→decode boilerplate from every domain method.
 
-use crate::codec::{decode_message_frame, encode_message_frame};
+use crate::codec::{decode_message_frame, try_encode_message_frame};
 use crate::error::{FitzError, Result};
+use crate::protocol::message_type;
 use crate::transport::{AnyTransport, Transport};
-use std::sync::{Arc, Mutex};
+use parking_lot::{Mutex, MutexGuard};
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::time::Duration;
 
 pub struct FitzConnection {
     transport: AnyTransport,
@@ -35,19 +39,21 @@ impl FitzConnection {
     pub fn send_frame(&mut self, frame: &[u8]) -> Result<()> {
         self.transport
             .send_frame(frame)
-            .map_err(|e| FitzError::Transport(e.to_string()))
+            .map_err(map_transport_error)
     }
 
     pub fn recv_frame(&mut self) -> Result<Vec<u8>> {
+        self.transport.recv_frame().map_err(map_transport_error)
+    }
+
+    pub fn set_timeout(&mut self, timeout: Duration) -> Result<()> {
         self.transport
-            .recv_frame()
-            .map_err(|e| FitzError::Transport(e.to_string()))
+            .set_timeouts(Some(timeout), Some(timeout))
+            .map_err(map_transport_error)
     }
 
     pub fn close(&mut self) -> Result<()> {
-        self.transport
-            .close()
-            .map_err(|e| FitzError::Transport(e.to_string()))
+        self.transport.close().map_err(map_transport_error)
     }
 }
 
@@ -59,12 +65,14 @@ impl FitzConnection {
 #[derive(Clone)]
 pub struct SharedConnection {
     inner: Arc<Mutex<FitzConnection>>,
+    deferred_frames: Arc<Mutex<VecDeque<(u16, Vec<u8>)>>>,
 }
 
 impl SharedConnection {
     pub fn new(conn: FitzConnection) -> Self {
         Self {
             inner: Arc::new(Mutex::new(conn)),
+            deferred_frames: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
@@ -73,38 +81,180 @@ impl SharedConnection {
     /// This is the single point of encode→send→recv→decode for the entire client.
     /// Domain methods call this instead of manually locking, framing, and stripping.
     pub fn send_request(&self, msg_type: u16, payload: &[u8]) -> Result<Vec<u8>> {
-        let frame = encode_message_frame(msg_type, payload);
-        let mut conn = self.lock()?;
-        conn.send_frame(&frame)?;
-        let resp_frame = conn.recv_frame()?;
-        drop(conn); // release lock before decoding
-        strip_tlv_header(&resp_frame)
+        let frame = try_encode_message_frame(msg_type, payload)?;
+        {
+            let mut conn = self.lock();
+            conn.send_frame(&frame)?;
+        }
+
+        let (_, resp_payload) =
+            self.recv_message_matching(|received_type, _| !is_server_notification(received_type))?;
+        Ok(resp_payload)
     }
 
     /// Send a frame with no response expected (fire-and-forget, e.g. CONNECT).
     pub fn send_only(&self, msg_type: u16, payload: &[u8]) -> Result<()> {
-        let frame = encode_message_frame(msg_type, payload);
-        let mut conn = self.lock()?;
+        let frame = try_encode_message_frame(msg_type, payload)?;
+        let mut conn = self.lock();
         conn.send_frame(&frame)
     }
 
     pub fn close(&self) -> Result<()> {
-        let mut conn = self.lock()?;
+        let mut conn = self.lock();
         conn.close()
     }
 
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, FitzConnection>> {
-        self.inner
-            .lock()
-            .map_err(|_| FitzError::Connection("Connection lock poisoned".into()))
+    pub(crate) fn recv_message_matching<F>(&self, mut matcher: F) -> Result<(u16, Vec<u8>)>
+    where
+        F: FnMut(u16, &[u8]) -> bool,
+    {
+        if let Some(frame) = self.take_deferred_matching(&mut matcher) {
+            return Ok(frame);
+        }
+
+        loop {
+            let frame = self.read_next_message()?;
+            if matcher(frame.0, &frame.1) {
+                return Ok(frame);
+            }
+            self.deferred_frames.lock().push_back(frame);
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, FitzConnection> {
+        self.inner.lock()
+    }
+
+    fn read_next_message(&self) -> Result<(u16, Vec<u8>)> {
+        let frame = {
+            let mut conn = self.lock();
+            conn.recv_frame()?
+        };
+
+        let (msg_type, payload_start) = decode_message_frame(&frame)?;
+        Ok((msg_type, frame[payload_start..].to_vec()))
+    }
+
+    fn take_deferred_matching<F>(&self, matcher: &mut F) -> Option<(u16, Vec<u8>)>
+    where
+        F: FnMut(u16, &[u8]) -> bool,
+    {
+        let mut deferred = self.deferred_frames.lock();
+        let mut kept = VecDeque::with_capacity(deferred.len());
+        let mut matched = None;
+
+        while let Some(frame) = deferred.pop_front() {
+            if matched.is_none() && matcher(frame.0, &frame.1) {
+                matched = Some(frame);
+            } else {
+                kept.push_back(frame);
+            }
+        }
+
+        *deferred = kept;
+        matched
     }
 }
 
 /// Strip the TLV header from a response frame and return just the payload bytes.
+#[cfg(test)]
 fn strip_tlv_header(frame: &[u8]) -> Result<Vec<u8>> {
     if frame.is_empty() {
         return Ok(Vec::new());
     }
     let (_msg_type, payload_start) = decode_message_frame(frame)?;
     Ok(frame[payload_start..].to_vec())
+}
+
+fn is_server_notification(msg_type: u16) -> bool {
+    matches!(
+        msg_type,
+        message_type::RPC_REQUEST
+            | message_type::RPC_RESPONSE
+            | message_type::RPC_ACK
+            | message_type::QUEUE_NOTIFY
+            | message_type::NOTICE_NOTIFY
+            | message_type::STREAM_NOTIFY
+            | message_type::SCHEDULE_NOTIFY
+    )
+}
+
+fn map_transport_error(err: std::io::Error) -> FitzError {
+    use std::io::ErrorKind;
+
+    match err.kind() {
+        ErrorKind::TimedOut => FitzError::Timeout,
+        ErrorKind::ConnectionAborted
+        | ErrorKind::ConnectionReset
+        | ErrorKind::BrokenPipe
+        | ErrorKind::UnexpectedEof
+        | ErrorKind::NotConnected => FitzError::ConnectionClosed,
+        _ => FitzError::Transport(err.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::TransactionMode;
+    use crate::FitzClient;
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn read_length_prefixed_frame(stream: &mut std::net::TcpStream) {
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).unwrap();
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut frame = vec![0u8; len];
+        stream.read_exact(&mut frame).unwrap();
+    }
+
+    #[test]
+    fn should_strip_payload_from_valid_frame() {
+        let frame = vec![100, 0, 2, b'o', b'k'];
+        let payload = strip_tlv_header(&frame).unwrap();
+        assert_eq!(payload, b"ok");
+    }
+
+    #[test]
+    fn should_reject_frame_with_trailing_bytes_when_stripping_header() {
+        let frame = vec![100, 0, 1, b'o', b'k'];
+        let err = strip_tlv_header(&frame).unwrap_err();
+        assert!(err.to_string().contains("Frame length does not match"));
+    }
+
+    #[test]
+    fn should_apply_builder_timeout_to_request_path() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+
+            // CONNECT frame
+            read_length_prefixed_frame(&mut socket);
+            // First request frame; keep the socket open but never respond.
+            read_length_prefixed_frame(&mut socket);
+
+            thread::sleep(Duration::from_millis(250));
+        });
+
+        let client = FitzClient::builder("test-realm", "secret")
+            .with_timeout(Duration::from_millis(50))
+            .connect_tcp("127.0.0.1", port)
+            .unwrap();
+
+        let err = match client
+            .kv()
+            .begin("kv://test-realm/app/users", TransactionMode::ReadWrite)
+        {
+            Ok(_) => panic!("request unexpectedly succeeded"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, FitzError::Timeout));
+
+        server.join().unwrap();
+    }
 }

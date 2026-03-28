@@ -22,6 +22,9 @@ pub mod message_type {
     pub const QUEUE_RESERVE: u16 = 202;
     pub const QUEUE_EXTEND: u16 = 203;
     pub const QUEUE_COMPLETE: u16 = 204;
+    pub const QUEUE_SUBSCRIBE: u16 = 207;
+    pub const QUEUE_UNSUBSCRIBE: u16 = 208;
+    pub const QUEUE_NOTIFY: u16 = 209;
 
     // RPC domain (300-399)
     pub const RPC_SUBSCRIBE: u16 = 300;

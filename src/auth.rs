@@ -1,16 +1,24 @@
 //! Authentication - JWT token generation for testing
 
 use crate::error::{FitzError, Result};
-use jsonwebtoken::{encode, Header, EncodingKey};
+use jsonwebtoken::{encode, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct FitzClaims {
+    pub permissions: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct TestTokenClaims {
+    pub iss: String,
+    pub aud: String,
     pub sub: String,
-    pub realm: String,
-    pub scope: Vec<String>,
+    pub tid: String,
     pub exp: u64,
+    pub iat: u64,
+    pub fitz: FitzClaims,
 }
 
 pub struct TestTokenGenerator {
@@ -33,18 +41,23 @@ impl TestTokenGenerator {
         let exp = now + 3600; // 1 hour
 
         let claims = TestTokenClaims {
+            iss: String::new(),
+            aud: "fitz".to_string(),
             sub: user.to_string(),
-            realm: realm.to_string(),
-            scope: vec![
-                "kv://*//**#*".to_string(),
-                "queue://*//**#*".to_string(),
-                "rpc://*//**#*".to_string(),
-                "notice://*//**#*".to_string(),
-                "lease://*//**#*".to_string(),
-                "stream://*//**#*".to_string(),
-                "schedule://*//**#*".to_string(),
-            ],
+            tid: realm.to_string(),
             exp,
+            iat: now,
+            fitz: FitzClaims {
+                permissions: vec![
+                    "kv://**#*".to_string(),
+                    "queue://**#*".to_string(),
+                    "rpc://**#*".to_string(),
+                    "notice://**#*".to_string(),
+                    "lease://**#*".to_string(),
+                    "stream://**#*".to_string(),
+                    "schedule://**#*".to_string(),
+                ],
+            },
         };
 
         encode(
