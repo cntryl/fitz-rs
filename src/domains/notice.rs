@@ -43,7 +43,6 @@ impl NoticeClient {
         let subscription_id = decode_subscription_response("SUBSCRIBE", &resp)?;
         Ok(NoticeSubscription {
             conn: self.conn.clone(),
-            pattern: pattern.to_string(),
             subscription_id,
         })
     }
@@ -59,7 +58,6 @@ impl NoticeClient {
 
 pub struct NoticeSubscription {
     conn: SharedConnection,
-    pattern: String,
     subscription_id: u64,
 }
 
@@ -81,7 +79,7 @@ impl NoticeSubscription {
 
     pub fn unsubscribe(&self) -> Result<()> {
         let mut enc = PayloadEncoder::new();
-        enc.put_string(&self.pattern);
+        enc.put_u64(self.subscription_id);
 
         let resp = self
             .conn
