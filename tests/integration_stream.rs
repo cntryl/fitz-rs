@@ -36,15 +36,15 @@ fn run_stream_commit_and_read(transport: Transport) {
 
     let mut session = client
         .stream()
-        .begin(&route, 0, None)
+        .begin(&route, None)
         .expect("failed to begin stream session");
 
     let first_offset = session
-        .append(b"record-1", None)
+        .append(0, b"record-1", None)
         .expect("failed to append first record")
         .expect("missing first offset");
     let second_offset = session
-        .append(b"record-2", None)
+        .append(first_offset + 1, b"record-2", None)
         .expect("failed to append second record")
         .expect("missing second offset");
 
@@ -108,10 +108,10 @@ fn run_stream_subscription(transport: Transport) {
 
     let mut session = writer_client
         .stream()
-        .begin(&route, 0, None)
+        .begin(&route, None)
         .expect("failed to begin writer session");
     session
-        .append(b"notify", None)
+        .append(0, b"notify", None)
         .expect("failed to append notification record");
     session
         .commit(StreamCommitMode::Sync)

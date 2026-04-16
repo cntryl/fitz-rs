@@ -51,12 +51,10 @@ impl StreamClient {
     pub fn begin(
         &self,
         route: &str,
-        expected_offset: u64,
         ingest_metadata: Option<&[u8]>,
     ) -> Result<StreamSession> {
         let mut enc = PayloadEncoder::new();
         enc.put_string(route);
-        enc.put_u64(expected_offset);
         match ingest_metadata.filter(|metadata| !metadata.is_empty()) {
             Some(metadata) => {
                 enc.put_u8(1);
@@ -177,11 +175,17 @@ impl StreamSession {
         self.session_id
     }
 
-    pub fn append(&mut self, body: &[u8], metadata: Option<&[u8]>) -> Result<Option<u64>> {
+    pub fn append(
+        &mut self,
+        expected_offset: u64,
+        body: &[u8],
+        metadata: Option<&[u8]>,
+    ) -> Result<Option<u64>> {
         self.ensure_active("APPEND")?;
 
         let mut enc = PayloadEncoder::new();
         enc.put_u64(self.session_id);
+        enc.put_u64(expected_offset);
         enc.put_bytes(body);
         match metadata.filter(|value| !value.is_empty()) {
             Some(value) => {

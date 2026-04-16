@@ -180,7 +180,7 @@ lease.release("lease://my-realm/locks/leader", "node-1", renewed.fencing_token)?
 ```rust
 let stream = client.stream();
 let mut session = stream.begin("stream://my-realm/orders/events", 0, None)?;
-session.append(b"created", None)?;
+session.append(0, b"created", None)?;
 session.commit(cntryl::domains::stream::StreamCommitMode::Sync)?;
 
 let records = stream.read("stream://my-realm/orders/events", 0, 100, None)?;
