@@ -2,6 +2,7 @@
 
 use crate::codec::{PayloadDecoder, PayloadEncoder};
 use crate::connection::SharedConnection;
+use crate::domains::routes::{validate_fixed_route, validate_selector_route};
 use crate::error::{FitzError, Result};
 use crate::protocol::message_type;
 
@@ -21,6 +22,8 @@ impl NoticeClient {
     }
 
     pub fn publish(&self, route: &str, body: &[u8]) -> Result<()> {
+        validate_fixed_route(route, "notice", 3)?;
+
         let mut enc = PayloadEncoder::new();
         enc.put_string(route);
         enc.put_bytes(body);
@@ -33,6 +36,8 @@ impl NoticeClient {
     }
 
     pub fn subscribe(&self, pattern: &str) -> Result<NoticeSubscription> {
+        validate_selector_route(pattern, "notice", 3, true)?;
+
         let mut enc = PayloadEncoder::new();
         enc.put_string(pattern);
 
