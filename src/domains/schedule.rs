@@ -219,19 +219,25 @@ fn decode_schedule_notify(payload: &[u8]) -> Result<ScheduleNotification> {
 fn validate_schedule_route(route: &str) -> Result<()> {
     if !route.starts_with("schedule://") {
         return Err(FitzError::DomainError(format!(
-            "Invalid schedule route: {route}"
+            "schedule route {route:?} must start with schedule://"
         )));
     }
 
     let remainder = &route["schedule://".len()..];
     let segments: Vec<&str> = remainder.split('/').collect();
-    if segments.len() != 4
-        || segments
-            .iter()
-            .any(|segment| segment.is_empty() || *segment == "*" || *segment == "**")
-    {
+    if segments.iter().any(|segment| segment.is_empty()) {
         return Err(FitzError::DomainError(format!(
-            "Invalid schedule route: {route}"
+            "schedule route {route:?} segments must be non-empty"
+        )));
+    }
+    if segments.len() != 4 {
+        return Err(FitzError::DomainError(format!(
+            "schedule route {route:?} must be schedule://{{realm}}/{{area}}/{{resource}}/{{operation}}"
+        )));
+    }
+    if segments.iter().any(|segment| *segment == "*" || *segment == "**") {
+        return Err(FitzError::DomainError(format!(
+            "schedule route {route:?} must not contain wildcards"
         )));
     }
 
@@ -268,7 +274,25 @@ mod tests {
     fn should_validate_schedule_route_shape() {
         validate_schedule_route("schedule://realm/area/resource/op").unwrap();
         let err = validate_schedule_route("schedule://realm/area/resource").unwrap_err();
-        assert!(err.to_string().contains("Invalid schedule route"));
+        assert!(err.to_string().contains("must be schedule://{realm}/{area}/{resource}/{operation}"));
+    }
+
+    #[test]
+    fn should_reject_schedule_route_given_wrong_scheme() {
+        let err = validate_schedule_route("queue://realm/area/resource/op").unwrap_err();
+        assert!(err.to_string().contains("must start with schedule://"));
+    }
+
+    #[test]
+    fn should_reject_schedule_route_given_empty_segment() {
+        let err = validate_schedule_route("schedule://realm//resource/op").unwrap_err();
+        assert!(err.to_string().contains("segments must be non-empty"));
+    }
+
+    #[test]
+    fn should_reject_schedule_route_given_wildcard() {
+        let err = validate_schedule_route("schedule://realm/area/resource/*").unwrap_err();
+        assert!(err.to_string().contains("must not contain wildcards"));
     }
 
     #[test]
