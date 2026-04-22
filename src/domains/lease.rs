@@ -22,6 +22,7 @@
 
 use crate::codec::{PayloadDecoder, PayloadEncoder};
 use crate::connection::SharedConnection;
+use crate::domains::routes::validate_fixed_route;
 use crate::error::{FitzError, Result};
 use crate::protocol::message_type;
 
@@ -61,6 +62,8 @@ impl LeaseClient {
     ///
     /// Returns the fencing token on success.
     pub fn acquire(&self, route: &str, owner_id: &str, ttl_secs: u64) -> Result<LeaseGrant> {
+        validate_fixed_route(route, "lease", 3)?;
+
         let mut enc = PayloadEncoder::new();
         enc.put_string(route);
         enc.put_string(owner_id);
@@ -89,6 +92,8 @@ impl LeaseClient {
         fencing_token: u64,
         ttl_secs: u64,
     ) -> Result<LeaseGrant> {
+        validate_fixed_route(route, "lease", 3)?;
+
         let mut enc = PayloadEncoder::new();
         enc.put_string(route);
         enc.put_string(owner_id);
@@ -111,6 +116,8 @@ impl LeaseClient {
     ///
     /// `fencing_token` must match the current token.
     pub fn release(&self, route: &str, owner_id: &str, fencing_token: u64) -> Result<()> {
+        validate_fixed_route(route, "lease", 3)?;
+
         let mut enc = PayloadEncoder::new();
         enc.put_string(route);
         enc.put_string(owner_id);
@@ -128,6 +135,8 @@ impl LeaseClient {
     ///
     /// Returns whether the lease is held (with fencing token) or free.
     pub fn query(&self, route: &str) -> Result<LeaseStatus> {
+        validate_fixed_route(route, "lease", 3)?;
+
         let mut enc = PayloadEncoder::new();
         enc.put_string(route);
 

@@ -2,6 +2,7 @@
 
 use crate::codec::{PayloadDecoder, PayloadEncoder};
 use crate::connection::SharedConnection;
+use crate::domains::routes::{validate_fixed_route, validate_selector_route};
 use crate::error::{FitzError, Result};
 use crate::protocol::message_type;
 
@@ -16,6 +17,8 @@ pub struct QueueItem {
 
 impl QueueItem {
     pub fn extend(&self, lease_seconds: u64) -> Result<()> {
+        validate_fixed_route(&self.route, "queue", 3)?;
+
         let mut enc = PayloadEncoder::new();
         enc.put_string(&self.route);
         enc.put_u64(self.id);
@@ -30,6 +33,8 @@ impl QueueItem {
     }
 
     pub fn complete(&self) -> Result<()> {
+        validate_fixed_route(&self.route, "queue", 3)?;
+
         let mut enc = PayloadEncoder::new();
         enc.put_string(&self.route);
         enc.put_u64(self.id);
@@ -53,6 +58,8 @@ impl QueueClient {
     }
 
     pub fn enqueue(&self, route: &str, body: &[u8], delay_ms: Option<u64>) -> Result<u64> {
+        validate_fixed_route(route, "queue", 3)?;
+
         let mut enc = PayloadEncoder::new();
         enc.put_string(route);
         enc.put_bytes(body);
@@ -77,6 +84,8 @@ impl QueueClient {
         batch_size: Option<u32>,
         wait_seconds: Option<u64>,
     ) -> Result<Vec<QueueItem>> {
+        validate_selector_route(route, "queue", 3, false)?;
+
         let mut enc = PayloadEncoder::new();
         enc.put_string(route);
         enc.put_u64(lease_seconds);
@@ -103,6 +112,8 @@ impl QueueClient {
     }
 
     pub fn extend(&self, route: &str, id: u64, token: u64, lease_seconds: u64) -> Result<()> {
+        validate_fixed_route(route, "queue", 3)?;
+
         let mut enc = PayloadEncoder::new();
         enc.put_string(route);
         enc.put_u64(id);
@@ -117,6 +128,8 @@ impl QueueClient {
     }
 
     pub fn complete(&self, route: &str, id: u64, token: u64) -> Result<()> {
+        validate_fixed_route(route, "queue", 3)?;
+
         let mut enc = PayloadEncoder::new();
         enc.put_string(route);
         enc.put_u64(id);
@@ -130,6 +143,8 @@ impl QueueClient {
     }
 
     pub fn subscribe(&self, pattern: &str) -> Result<QueueSubscription> {
+        validate_selector_route(pattern, "queue", 3, true)?;
+
         let mut enc = PayloadEncoder::new();
         enc.put_string(pattern);
 

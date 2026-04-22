@@ -2,6 +2,7 @@
 
 use crate::codec::{PayloadDecoder, PayloadEncoder};
 use crate::connection::SharedConnection;
+use crate::domains::routes::validate_concrete_route;
 use crate::error::{FitzError, Result};
 use crate::protocol::message_type;
 use uuid::Uuid;
@@ -30,6 +31,8 @@ impl RpcClient {
     }
 
     pub fn call(&self, route: &str, body: &[u8]) -> Result<RpcResponseStream> {
+        validate_concrete_route(route, "rpc")?;
+
         let correlation_id = *Uuid::new_v4().as_bytes();
 
         let mut enc = PayloadEncoder::new();
@@ -57,6 +60,8 @@ impl RpcClient {
     }
 
     pub fn register_worker(&self, pattern: &str) -> Result<RpcWorkerRegistration> {
+        validate_concrete_route(pattern, "rpc")?;
+
         let mut enc = PayloadEncoder::new();
         enc.put_string(pattern);
 

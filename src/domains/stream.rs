@@ -2,6 +2,7 @@
 
 use crate::codec::{PayloadDecoder, PayloadEncoder};
 use crate::connection::SharedConnection;
+use crate::domains::routes::{validate_fixed_route, validate_selector_route};
 use crate::error::{FitzError, Result};
 use crate::protocol::message_type;
 use serde::Deserialize;
@@ -62,6 +63,8 @@ impl StreamClient {
         route: &str,
         ingest_metadata: Option<&[u8]>,
     ) -> Result<StreamSession> {
+        validate_fixed_route(route, "stream", 3)?;
+
         let mut enc = PayloadEncoder::new();
         enc.put_string(route);
         match ingest_metadata.filter(|metadata| !metadata.is_empty()) {
@@ -96,6 +99,8 @@ impl StreamClient {
         limit: u64,
         max_bytes: Option<u64>,
     ) -> Result<Vec<StreamRecord>> {
+        validate_selector_route(route, "stream", 3, true)?;
+
         let mut enc = PayloadEncoder::new();
         enc.put_string(route);
         enc.put_u64(start_offset);
@@ -118,6 +123,8 @@ impl StreamClient {
     }
 
     pub fn peek(&self, route: &str) -> Result<Option<StreamRecord>> {
+        validate_fixed_route(route, "stream", 3)?;
+
         let mut enc = PayloadEncoder::new();
         enc.put_string(route);
 
@@ -129,6 +136,8 @@ impl StreamClient {
     }
 
     pub fn metadata(&self, route: &str) -> Result<StreamMetadata> {
+        validate_fixed_route(route, "stream", 3)?;
+
         let mut enc = PayloadEncoder::new();
         enc.put_string(route);
 
@@ -154,6 +163,8 @@ impl StreamClient {
     }
 
     pub fn subscribe(&self, pattern: &str) -> Result<StreamSubscription> {
+        validate_selector_route(pattern, "stream", 3, true)?;
+
         let mut enc = PayloadEncoder::new();
         enc.put_string(pattern);
 

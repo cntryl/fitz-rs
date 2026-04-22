@@ -23,6 +23,7 @@
 
 use crate::codec::{PayloadDecoder, PayloadEncoder};
 use crate::connection::SharedConnection;
+use crate::domains::routes::validate_fixed_route;
 use crate::error::{FitzError, Result};
 use crate::protocol::{message_type, TransactionMode};
 
@@ -46,6 +47,8 @@ impl KvClient {
     ///
     /// Returns a `KvTransaction` which holds the tx_id and route internally.
     pub fn begin(&self, route: &str, mode: TransactionMode) -> Result<KvTransaction> {
+        validate_fixed_route(route, "kv", 3)?;
+
         let mut enc = PayloadEncoder::new();
         enc.put_string(route);
         enc.put_u8(mode as u8);

@@ -69,6 +69,14 @@ let tx = kv.begin("kv://my-realm/app/users", TransactionMode::ReadWrite)?;
 // ...
 ```
 
+## Documentation
+
+- [docs/README.md](docs/README.md)
+- [CLIENT_SPEC.md](CLIENT_SPEC.md)
+- [CLIENT_ACCEPTANCE_CRITERIA.md](CLIENT_ACCEPTANCE_CRITERIA.md)
+
+Canonical Fitz client behavior is defined in the server repository under [fitz/docs/clients](../fitz/docs/clients).
+
 ## Architecture
 
 ### Transport Abstraction
