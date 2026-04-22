@@ -16,6 +16,10 @@ pub enum StreamCommitMode {
 pub struct StreamRecord {
     pub offset: u64,
     pub body: Vec<u8>,
+    pub area_offset: Option<u64>,
+    pub realm_offset: Option<u64>,
+    pub metadata: Option<Vec<u8>>,
+    pub timestamp: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +27,11 @@ pub struct StreamMetadata {
     pub first_offset: u64,
     pub last_offset: u64,
     pub record_count: u64,
+    pub max_batch_events: u64,
+    pub max_batch_bytes: u64,
+    pub ttl_seconds: Option<u64>,
+    pub area_watermark: u64,
+    pub realm_watermark: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,15 +142,15 @@ impl StreamClient {
                 first_offset: 0,
                 last_offset: 0,
                 record_count: 0,
+                max_batch_events: 0,
+                max_batch_bytes: 0,
+                ttl_seconds: None,
+                area_watermark: 0,
+                realm_watermark: 0,
             });
         }
 
-        let mut dec = PayloadDecoder::new(&decoded.data);
-        Ok(StreamMetadata {
-            first_offset: dec.get_u64()?,
-            last_offset: dec.get_u64()?,
-            record_count: dec.get_u64()?,
-        })
+        decode_stream_metadata(&decoded.data)
     }
 
     pub fn subscribe(&self, pattern: &str) -> Result<StreamSubscription> {
@@ -339,10 +348,7 @@ fn parse_stream_record(buf: &[u8]) -> Result<Option<StreamRecord>> {
     }
 
     let mut dec = PayloadDecoder::new(buf);
-    Ok(Some(StreamRecord {
-        offset: dec.get_u64()?,
-        body: dec.get_bytes()?,
-    }))
+    Ok(Some(decode_stream_record(&mut dec)?))
 }
 
 fn parse_stream_records(buf: &[u8]) -> Result<Vec<StreamRecord>> {
@@ -350,43 +356,69 @@ fn parse_stream_records(buf: &[u8]) -> Result<Vec<StreamRecord>> {
         return Ok(Vec::new());
     }
 
-    if let Ok(records) = try_parse_count_prefixed_records(buf) {
-        return Ok(records);
-    }
-
-    parse_flat_records(buf)
-}
-
-fn try_parse_count_prefixed_records(buf: &[u8]) -> Result<Vec<StreamRecord>> {
     let mut dec = PayloadDecoder::new(buf);
     let count = dec.get_u32()? as usize;
     let mut records = Vec::with_capacity(count);
+
     for _ in 0..count {
-        records.push(StreamRecord {
-            offset: dec.get_u64()?,
-            body: dec.get_bytes()?,
-        });
+        records.push(decode_stream_record(&mut dec)?);
     }
 
+    let _last_resource_offset = dec.get_u64()?;
+    let _last_area_offset = decode_optional_u64(&mut dec)?;
+    let _last_realm_offset = decode_optional_u64(&mut dec)?;
+    let _has_more = dec.get_u8()?;
+
     if !dec.is_empty() {
-        return Err(FitzError::Protocol(
-            "READ response has trailing bytes".to_string(),
-        ));
+        return Err(FitzError::Protocol("READ response has trailing bytes".to_string()));
     }
 
     Ok(records)
 }
 
-fn parse_flat_records(buf: &[u8]) -> Result<Vec<StreamRecord>> {
+fn decode_stream_metadata(buf: &[u8]) -> Result<StreamMetadata> {
     let mut dec = PayloadDecoder::new(buf);
-    let mut records = Vec::new();
-    while !dec.is_empty() {
-        records.push(StreamRecord {
-            offset: dec.get_u64()?,
-            body: dec.get_bytes()?,
-        });
+    Ok(StreamMetadata {
+        first_offset: decode_optional_u64(&mut dec)?.unwrap_or(0),
+        last_offset: decode_optional_u64(&mut dec)?.unwrap_or(0),
+        record_count: dec.get_u64()?,
+        max_batch_events: dec.get_u64()?,
+        max_batch_bytes: dec.get_u64()?,
+        ttl_seconds: decode_optional_u64(&mut dec)?,
+        area_watermark: dec.get_u64()?,
+        realm_watermark: dec.get_u64()?,
+    })
+}
+
+fn decode_stream_record(dec: &mut PayloadDecoder<'_>) -> Result<StreamRecord> {
+    Ok(StreamRecord {
+        offset: dec.get_u64()?,
+        area_offset: decode_optional_u64(dec)?,
+        realm_offset: decode_optional_u64(dec)?,
+        body: dec.get_bytes()?,
+        metadata: decode_optional_bytes(dec)?,
+        timestamp: dec.get_u64()?,
+    })
+}
+
+fn decode_optional_u64(dec: &mut PayloadDecoder<'_>) -> Result<Option<u64>> {
+    match dec.get_u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(dec.get_u64()?)),
+        other => Err(FitzError::Protocol(format!(
+            "invalid optional u64 flag: {other}"
+        ))),
     }
-    Ok(records)
+}
+
+fn decode_optional_bytes(dec: &mut PayloadDecoder<'_>) -> Result<Option<Vec<u8>>> {
+    match dec.get_u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(dec.get_bytes()?)),
+        other => Err(FitzError::Protocol(format!(
+            "invalid optional bytes flag: {other}"
+        ))),
+    }
 }
 
 fn decode_stream_notify_subscription_id(payload: &[u8]) -> Result<u64> {
@@ -466,32 +498,89 @@ mod tests {
         let mut buf = Vec::new();
         buf.extend_from_slice(&(2u32).to_be_bytes());
         buf.extend_from_slice(&1u64.to_be_bytes());
+        buf.push(1);
+        buf.extend_from_slice(&10u64.to_be_bytes());
+        buf.push(1);
+        buf.extend_from_slice(&20u64.to_be_bytes());
         buf.extend_from_slice(&(1u32).to_be_bytes());
         buf.extend_from_slice(b"a");
+        buf.push(1);
+        buf.extend_from_slice(&(2u32).to_be_bytes());
+        buf.extend_from_slice(b"m1");
+        buf.extend_from_slice(&111u64.to_be_bytes());
         buf.extend_from_slice(&2u64.to_be_bytes());
+        buf.push(0);
+        buf.push(1);
+        buf.extend_from_slice(&21u64.to_be_bytes());
         buf.extend_from_slice(&(1u32).to_be_bytes());
         buf.extend_from_slice(b"b");
+        buf.push(0);
+        buf.extend_from_slice(&222u64.to_be_bytes());
+        buf.extend_from_slice(&2u64.to_be_bytes());
+        buf.push(0);
+        buf.push(0);
+        buf.push(0);
 
         let records = parse_stream_records(&buf).unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].offset, 1);
+        assert_eq!(records[0].area_offset, Some(10));
+        assert_eq!(records[0].realm_offset, Some(20));
+        assert_eq!(records[0].metadata.as_deref(), Some(&b"m1"[..]));
+        assert_eq!(records[0].timestamp, 111);
         assert_eq!(records[1].body, b"b");
+        assert_eq!(records[1].offset, 2);
+        assert_eq!(records[1].timestamp, 222);
     }
 
     #[test]
-    fn should_parse_flat_stream_records_when_count_prefix_is_invalid() {
+    fn should_parse_full_stream_record() {
         let mut buf = Vec::new();
         buf.extend_from_slice(&1u64.to_be_bytes());
-        buf.extend_from_slice(&(1u32).to_be_bytes());
-        buf.extend_from_slice(b"a");
+        buf.push(1);
         buf.extend_from_slice(&2u64.to_be_bytes());
-        buf.extend_from_slice(&(1u32).to_be_bytes());
-        buf.extend_from_slice(b"b");
+        buf.push(1);
+        buf.extend_from_slice(&3u64.to_be_bytes());
+        buf.extend_from_slice(&(4u32).to_be_bytes());
+        buf.extend_from_slice(b"body");
+        buf.push(1);
+        buf.extend_from_slice(&(4u32).to_be_bytes());
+        buf.extend_from_slice(b"meta");
+        buf.extend_from_slice(&5u64.to_be_bytes());
 
-        let records = parse_stream_records(&buf).unwrap();
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[0].body, b"a");
-        assert_eq!(records[1].offset, 2);
+        let record = parse_stream_record(&buf).unwrap().unwrap();
+        assert_eq!(record.offset, 1);
+        assert_eq!(record.area_offset, Some(2));
+        assert_eq!(record.realm_offset, Some(3));
+        assert_eq!(record.body, b"body");
+        assert_eq!(record.metadata.as_deref(), Some(&b"meta"[..]));
+        assert_eq!(record.timestamp, 5);
+    }
+
+    #[test]
+    fn should_decode_stream_metadata_payload() {
+        let mut buf = Vec::new();
+        buf.push(1);
+        buf.extend_from_slice(&4u64.to_be_bytes());
+        buf.push(1);
+        buf.extend_from_slice(&9u64.to_be_bytes());
+        buf.extend_from_slice(&2u64.to_be_bytes());
+        buf.extend_from_slice(&100u64.to_be_bytes());
+        buf.extend_from_slice(&200u64.to_be_bytes());
+        buf.push(1);
+        buf.extend_from_slice(&300u64.to_be_bytes());
+        buf.extend_from_slice(&7u64.to_be_bytes());
+        buf.extend_from_slice(&8u64.to_be_bytes());
+
+        let metadata = decode_stream_metadata(&buf).unwrap();
+        assert_eq!(metadata.first_offset, 4);
+        assert_eq!(metadata.last_offset, 9);
+        assert_eq!(metadata.record_count, 2);
+        assert_eq!(metadata.max_batch_events, 100);
+        assert_eq!(metadata.max_batch_bytes, 200);
+        assert_eq!(metadata.ttl_seconds, Some(300));
+        assert_eq!(metadata.area_watermark, 7);
+        assert_eq!(metadata.realm_watermark, 8);
     }
 
     #[test]
