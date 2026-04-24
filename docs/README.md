@@ -12,7 +12,10 @@ The Rust SDK follows the canonical Fitz client docs in the server repository und
 ## Local Docs
 
 - [../README.md](../README.md)
+- [GRADING.md](GRADING.md)
 - [../CLIENT_SPEC.md](../CLIENT_SPEC.md)
 - [../CLIENT_ACCEPTANCE_CRITERIA.md](../CLIENT_ACCEPTANCE_CRITERIA.md)
+
+The local parity story is tracked in [GRADING.md](GRADING.md), and the ignored JSON-emitting conformance runner lives in [../tests/conformance.rs](../tests/conformance.rs).
 
 Use the canonical docs for protocol behavior and the local docs for Rust-specific setup and architecture notes.

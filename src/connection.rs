@@ -13,8 +13,15 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionState {
+    Open,
+    Closed,
+}
+
 pub struct FitzConnection {
     transport: AnyTransport,
+    state: ConnectionState,
 }
 
 impl FitzConnection {
@@ -24,7 +31,10 @@ impl FitzConnection {
             crate::transport::tcp::TcpTransport::connect(host, port)
                 .map_err(|e| FitzError::Connection(e.to_string()))?,
         );
-        Ok(Self { transport })
+        Ok(Self {
+            transport,
+            state: ConnectionState::Open,
+        })
     }
 
     /// Connect via WebSocket
@@ -33,27 +43,46 @@ impl FitzConnection {
             crate::transport::websocket::WebSocketTransport::connect(url)
                 .map_err(|e| FitzError::Connection(e.to_string()))?,
         ));
-        Ok(Self { transport })
+        Ok(Self {
+            transport,
+            state: ConnectionState::Open,
+        })
     }
 
     pub fn send_frame(&mut self, frame: &[u8]) -> Result<()> {
+        self.ensure_open()?;
         self.transport
             .send_frame(frame)
             .map_err(map_transport_error)
     }
 
     pub fn recv_frame(&mut self) -> Result<Vec<u8>> {
+        self.ensure_open()?;
         self.transport.recv_frame().map_err(map_transport_error)
     }
 
     pub fn set_timeout(&mut self, timeout: Duration) -> Result<()> {
+        self.ensure_open()?;
         self.transport
             .set_timeouts(Some(timeout), Some(timeout))
             .map_err(map_transport_error)
     }
 
     pub fn close(&mut self) -> Result<()> {
+        if matches!(self.state, ConnectionState::Closed) {
+            return Ok(());
+        }
+
+        self.state = ConnectionState::Closed;
         self.transport.close().map_err(map_transport_error)
+    }
+
+    fn ensure_open(&self) -> Result<()> {
+        if matches!(self.state, ConnectionState::Closed) {
+            Err(FitzError::ConnectionClosed)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -254,6 +283,39 @@ mod tests {
         };
 
         assert!(matches!(err, FitzError::Timeout));
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn should_reject_request_after_close() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+
+            // CONNECT frame
+            read_length_prefixed_frame(&mut socket);
+            // Leave the connection open until the client closes it.
+            thread::sleep(Duration::from_millis(50));
+        });
+
+        let client = FitzClient::builder("test-realm", "secret")
+            .connect_tcp("127.0.0.1", port)
+            .unwrap();
+
+        client.close().unwrap();
+
+        let err = match client
+            .kv()
+            .begin("kv://test-realm/app/users", TransactionMode::ReadWrite)
+        {
+            Ok(_) => panic!("request unexpectedly succeeded after close"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, FitzError::ConnectionClosed));
 
         server.join().unwrap();
     }

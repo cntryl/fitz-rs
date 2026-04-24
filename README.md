@@ -8,7 +8,7 @@ A high-performance, fully type-safe Rust client library for the [Fitz](../README
 - ✅ **Multi-transport**: Supports TCP and WebSocket equally with runtime selection
 - ✅ **All 7 domains**: Full implementation for KV, Queue, Notice, RPC, Lease, Stream, and Schedule
 - ✅ **Transaction support**: Full ACID transaction semantics for KV domain
-- ✅ **Embedded authentication**: Built-in JWT token generation for testing
+- ✅ **Authentication helpers**: Built-in JWT token generation for valid auth plus anonymous connect support
 - ✅ **Synchronous API**: Blocking API over async tokio runtime (no callback hell)
 - ✅ **Focused domain helpers**: Small blocking clients for each broker subsystem
 
@@ -72,6 +72,7 @@ let tx = kv.begin("kv://my-realm/app/users", TransactionMode::ReadWrite)?;
 ## Documentation
 
 - [docs/README.md](docs/README.md)
+- [docs/GRADING.md](docs/GRADING.md)
 - [CLIENT_SPEC.md](CLIENT_SPEC.md)
 - [CLIENT_ACCEPTANCE_CRITERIA.md](CLIENT_ACCEPTANCE_CRITERIA.md)
 
@@ -136,7 +137,7 @@ tx.rollback()?;                // Discard all changes
 - Transaction isolation
 - Rollback support
 
-### Queue (Coming Soon)
+### Queue
 
 ```rust
 let queue = client.queue();
@@ -217,8 +218,6 @@ schedule.cancel(&schedule_id)?;
 cargo test --lib
 ```
 
-Tests codec/auth/connection layers plus domain decode helpers.
-
 ### Integration Tests (Requires Running Server)
 
 ```bash
@@ -228,6 +227,21 @@ cargo test --lib --tests
 # Targeted end-to-end suites
 cargo test --test integration_rpc -- --nocapture
 cargo test --test integration_stream -- --nocapture
+```
+
+### Conformance Matrix
+
+The ignored conformance runner mirrors the shared `CS-001` through `CS-015` suite and writes normalized JSON artifacts.
+
+```bash
+cargo test --test conformance -- --ignored --nocapture
+CONFORMANCE_TRANSPORT=ws CONFORMANCE_AUTH_MODE=valid_jwt cargo test --test conformance -- --ignored --nocapture
+```
+
+Default output path:
+
+```text
+./artifacts/conformance-results.json
 ```
 
 To run integration tests, start the Fitz server first:

@@ -8,7 +8,7 @@
 //! ```ignore
 //! use cntryl::FitzClient;
 //!
-//! // Connect — realm is in the JWT, not on the client struct.
+//! // Connect — realm lives in the auth handshake, not on the client struct.
 //! let client = FitzClient::connect_tcp("127.0.0.1", 4091, "my-realm", "secret")?;
 //!
 //! // Routes are opaque strings — the client never parses them.
@@ -29,19 +29,24 @@ pub mod protocol;
 pub mod transport;
 
 pub use auth::TestTokenGenerator;
-pub use error::{FitzError, Result};
+pub use error::{FitzError, FitzErrorKind, Result};
 pub use protocol::TransactionMode;
 
 use connection::{FitzConnection, SharedConnection};
 use std::time::Duration;
 
+enum ClientAuth {
+    Jwt(String),
+    Anonymous,
+}
+
 /// Builder for creating Fitz clients with flexible configuration.
 ///
-/// `realm` is embedded in the JWT during CONNECT — it is not stored
+/// `realm` is carried in the CONNECT auth handshake and is not stored
 /// on the client or passed to domain methods.
 pub struct FitzClientBuilder {
     realm: String,
-    secret: String,
+    auth: ClientAuth,
     timeout: Duration,
 }
 
@@ -49,7 +54,15 @@ impl FitzClientBuilder {
     pub fn new(realm: &str, secret: &str) -> Self {
         Self {
             realm: realm.to_string(),
-            secret: secret.to_string(),
+            auth: ClientAuth::Jwt(secret.to_string()),
+            timeout: Duration::from_secs(30),
+        }
+    }
+
+    pub fn anonymous(realm: &str) -> Self {
+        Self {
+            realm: realm.to_string(),
+            auth: ClientAuth::Anonymous,
             timeout: Duration::from_secs(30),
         }
     }
@@ -78,8 +91,12 @@ impl FitzClientBuilder {
 
         // Generate JWT and send CONNECT frame.
         // Per wire protocol: silence means success, server closes on invalid CONNECT.
-        let gen = TestTokenGenerator::new(&self.secret);
-        let token = gen.generate(&self.realm, "fitz-client")?;
+        let token = match self.auth {
+            ClientAuth::Jwt(secret) => {
+                TestTokenGenerator::new(&secret).generate(&self.realm, "fitz-client")?
+            }
+            ClientAuth::Anonymous => String::new(),
+        };
         shared.send_only(protocol::message_type::CONNECT, token.as_bytes())?;
 
         Ok(FitzClient { connection: shared })
@@ -103,14 +120,29 @@ impl FitzClient {
         FitzClientBuilder::new(realm, secret)
     }
 
+    /// Create a builder for anonymous connections.
+    pub fn builder_anonymous(realm: &str) -> FitzClientBuilder {
+        FitzClientBuilder::anonymous(realm)
+    }
+
     /// Convenient helper: connect via TCP.
     pub fn connect_tcp(host: &str, port: u16, realm: &str, secret: &str) -> Result<Self> {
         FitzClient::builder(realm, secret).connect_tcp(host, port)
     }
 
+    /// Convenient helper: connect via TCP without a JWT.
+    pub fn connect_tcp_anonymous(host: &str, port: u16, realm: &str) -> Result<Self> {
+        FitzClient::builder_anonymous(realm).connect_tcp(host, port)
+    }
+
     /// Convenient helper: connect via WebSocket.
     pub fn connect_ws(url: &str, realm: &str, secret: &str) -> Result<Self> {
         FitzClient::builder(realm, secret).connect_ws(url)
+    }
+
+    /// Convenient helper: connect via WebSocket without a JWT.
+    pub fn connect_ws_anonymous(url: &str, realm: &str) -> Result<Self> {
+        FitzClient::builder_anonymous(realm).connect_ws(url)
     }
 
     /// Get a KV domain client.
@@ -161,6 +193,12 @@ mod tests {
     #[test]
     fn should_create_client_builder() {
         let builder = FitzClient::builder("test-realm", "secret");
+        assert_eq!(builder.realm, "test-realm");
+    }
+
+    #[test]
+    fn should_create_anonymous_builder() {
+        let builder = FitzClient::builder_anonymous("test-realm");
         assert_eq!(builder.realm, "test-realm");
     }
 }

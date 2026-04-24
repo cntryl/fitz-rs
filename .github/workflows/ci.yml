@@ -1,0 +1,51 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run library tests
+        run: cargo test --lib
+
+  conformance:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        transport: [tcp, ws]
+        auth_mode: [anonymous, valid_jwt]
+    env:
+      CONFORMANCE_TRANSPORT: ${{ matrix.transport }}
+      CONFORMANCE_AUTH_MODE: ${{ matrix.auth_mode }}
+      CONFORMANCE_OUTPUT: artifacts/conformance-${{ matrix.transport }}-${{ matrix.auth_mode }}.json
+      FITZ_BROKER_ANON_TCP_ADDR: 127.0.0.1:4191
+      FITZ_BROKER_ANON_WS_ADDR: ws://127.0.0.1:4190/ws
+      FITZ_BROKER_AUTH_TCP_ADDR: 127.0.0.1:4091
+      FITZ_BROKER_AUTH_WS_ADDR: ws://127.0.0.1:4090/ws
+      FITZ_BROKER_JWT_HMAC_SECRET: test-secret-key
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run conformance suite
+        run: cargo test --test conformance -- --ignored --nocapture
+
+      - name: Upload conformance artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-${{ matrix.transport }}-${{ matrix.auth_mode }}
+          path: ${{ env.CONFORMANCE_OUTPUT }}
