@@ -184,11 +184,32 @@ impl FitzClient {
     pub fn close(&self) -> Result<()> {
         self.connection.close()
     }
+
+    /// Update the default transport timeout used by subsequent requests.
+    pub fn set_timeout(&self, timeout: Duration) -> Result<()> {
+        self.connection.set_timeout(timeout)
+    }
+
+    /// Return the current default transport timeout.
+    pub fn timeout(&self) -> Option<Duration> {
+        self.connection.timeout()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn read_length_prefixed_frame(stream: &mut std::net::TcpStream) {
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).unwrap();
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut frame = vec![0u8; len];
+        stream.read_exact(&mut frame).unwrap();
+    }
 
     #[test]
     fn should_create_client_builder() {
@@ -200,5 +221,30 @@ mod tests {
     fn should_create_anonymous_builder() {
         let builder = FitzClient::builder_anonymous("test-realm");
         assert_eq!(builder.realm, "test-realm");
+    }
+
+    #[test]
+    fn should_update_client_timeout_after_connect() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            read_length_prefixed_frame(&mut socket);
+            thread::sleep(Duration::from_millis(50));
+        });
+
+        let client = FitzClient::builder("test-realm", "secret")
+            .with_timeout(Duration::from_millis(250))
+            .connect_tcp("127.0.0.1", port)
+            .unwrap();
+
+        assert_eq!(client.timeout(), Some(Duration::from_millis(250)));
+
+        client.set_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(client.timeout(), Some(Duration::from_secs(1)));
+
+        client.close().unwrap();
+        server.join().unwrap();
     }
 }

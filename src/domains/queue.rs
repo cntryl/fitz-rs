@@ -5,6 +5,7 @@ use crate::connection::SharedConnection;
 use crate::domains::routes::{validate_fixed_route, validate_selector_route};
 use crate::error::{FitzError, Result};
 use crate::protocol::message_type;
+use std::time::Duration;
 
 #[derive(Clone)]
 pub struct QueueItem {
@@ -84,6 +85,17 @@ impl QueueClient {
         batch_size: Option<u32>,
         wait_seconds: Option<u64>,
     ) -> Result<Vec<QueueItem>> {
+        self.reserve_with_timeout(route, lease_seconds, batch_size, wait_seconds, None)
+    }
+
+    pub fn reserve_with_timeout(
+        &self,
+        route: &str,
+        lease_seconds: u64,
+        batch_size: Option<u32>,
+        wait_seconds: Option<u64>,
+        timeout: Option<Duration>,
+    ) -> Result<Vec<QueueItem>> {
         validate_selector_route(route, "queue", 3, false)?;
 
         let mut enc = PayloadEncoder::new();
@@ -104,9 +116,13 @@ impl QueueClient {
             }
         }
 
-        let resp = self
-            .conn
-            .send_request(message_type::QUEUE_RESERVE, &enc.finish())?;
+        let payload = enc.finish();
+        let resp = match timeout {
+            Some(timeout) => self
+                .conn
+                .send_request_with_timeout(message_type::QUEUE_RESERVE, &payload, timeout)?,
+            None => self.conn.send_request(message_type::QUEUE_RESERVE, &payload)?,
+        };
 
         decode_reserve_response(route, &resp, self.conn.clone())
     }
@@ -307,6 +323,10 @@ fn decode_queue_error(operation: &str, dec: &mut PayloadDecoder<'_>) -> FitzErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection::{FitzConnection, SharedConnection};
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::thread;
 
     #[test]
     fn should_decode_enqueue_response() {
@@ -342,5 +362,44 @@ mod tests {
         let notification = decode_queue_notify(&buf).unwrap();
         assert_eq!(notification.route, "queue://realm/area/x");
         assert_eq!(notification.payload, b"fire");
+    }
+
+    fn read_length_prefixed_frame(stream: &mut std::net::TcpStream) {
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).unwrap();
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut frame = vec![0u8; len];
+        stream.read_exact(&mut frame).unwrap();
+    }
+
+    #[test]
+    fn should_timeout_queue_reserve_with_scoped_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            read_length_prefixed_frame(&mut socket);
+            thread::sleep(Duration::from_millis(150));
+        });
+
+        let mut conn = FitzConnection::connect_tcp("127.0.0.1", port).unwrap();
+        conn.set_timeout(Duration::from_secs(1)).unwrap();
+        let client = QueueClient::new(SharedConnection::new(conn));
+
+        let err = match client.reserve_with_timeout(
+            "queue://test-realm/app/jobs",
+            30,
+            Some(1),
+            Some(60),
+            Some(Duration::from_millis(50)),
+        ) {
+            Ok(_) => panic!("reserve unexpectedly succeeded"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, FitzError::Timeout));
+
+        server.join().unwrap();
     }
 }

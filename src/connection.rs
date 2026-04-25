@@ -22,6 +22,7 @@ enum ConnectionState {
 pub struct FitzConnection {
     transport: AnyTransport,
     state: ConnectionState,
+    timeout: Option<Duration>,
 }
 
 impl FitzConnection {
@@ -34,6 +35,7 @@ impl FitzConnection {
         Ok(Self {
             transport,
             state: ConnectionState::Open,
+            timeout: None,
         })
     }
 
@@ -46,6 +48,7 @@ impl FitzConnection {
         Ok(Self {
             transport,
             state: ConnectionState::Open,
+            timeout: None,
         })
     }
 
@@ -65,7 +68,13 @@ impl FitzConnection {
         self.ensure_open()?;
         self.transport
             .set_timeouts(Some(timeout), Some(timeout))
-            .map_err(map_transport_error)
+            .map_err(map_transport_error)?;
+        self.timeout = Some(timeout);
+        Ok(())
+    }
+
+    pub fn timeout(&self) -> Option<Duration> {
+        self.timeout
     }
 
     pub fn close(&mut self) -> Result<()> {
@@ -121,6 +130,30 @@ impl SharedConnection {
         Ok(resp_payload)
     }
 
+    /// Send a typed request with a temporary transport timeout override.
+    ///
+    /// The original timeout is restored before returning, even when the request
+    /// fails while waiting for a response.
+    pub fn send_request_with_timeout(
+        &self,
+        msg_type: u16,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<Vec<u8>> {
+        let previous_timeout = {
+            let mut conn = self.lock();
+            let previous_timeout = conn.timeout();
+            if previous_timeout != Some(timeout) {
+                conn.set_timeout(timeout)?;
+            }
+            previous_timeout
+        };
+
+        let result = self.send_request(msg_type, payload);
+        self.restore_timeout(previous_timeout)?;
+        result
+    }
+
     /// Send a frame with no response expected (fire-and-forget, e.g. CONNECT).
     pub fn send_only(&self, msg_type: u16, payload: &[u8]) -> Result<()> {
         let frame = try_encode_message_frame(msg_type, payload)?;
@@ -131,6 +164,23 @@ impl SharedConnection {
     pub fn close(&self) -> Result<()> {
         let mut conn = self.lock();
         conn.close()
+    }
+
+    pub fn set_timeout(&self, timeout: Duration) -> Result<()> {
+        let mut conn = self.lock();
+        conn.set_timeout(timeout)
+    }
+
+    pub fn timeout(&self) -> Option<Duration> {
+        self.lock().timeout()
+    }
+
+    fn restore_timeout(&self, timeout: Option<Duration>) -> Result<()> {
+        if let Some(timeout) = timeout {
+            let mut conn = self.lock();
+            conn.set_timeout(timeout)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn recv_message_matching<F>(&self, mut matcher: F) -> Result<(u16, Vec<u8>)>
@@ -316,6 +366,33 @@ mod tests {
         };
 
         assert!(matches!(err, FitzError::ConnectionClosed));
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn should_restore_timeout_after_scoped_request_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+
+            // First request times out because the server stays silent longer than the
+            // scoped timeout.
+            read_length_prefixed_frame(&mut socket);
+            thread::sleep(Duration::from_millis(150));
+        });
+
+        let mut conn = FitzConnection::connect_tcp("127.0.0.1", port).unwrap();
+        conn.set_timeout(Duration::from_secs(1)).unwrap();
+        let shared = SharedConnection::new(conn);
+
+        let err = shared
+            .send_request_with_timeout(41, b"slow", Duration::from_millis(50))
+            .unwrap_err();
+        assert!(matches!(err, FitzError::Timeout));
+        assert_eq!(shared.lock().timeout(), Some(Duration::from_secs(1)));
 
         server.join().unwrap();
     }
