@@ -4,14 +4,18 @@
 
 use cntryl::protocol::TransactionMode;
 use cntryl::FitzClient;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+static ROUTE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 fn unique_kv_route(suffix: &str) -> String {
+    let counter = ROUTE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock drift")
         .as_nanos();
-    format!("kv://test-realm/{nonce}/{suffix}")
+    format!("kv://test-realm/{nonce}-{counter}/{suffix}")
 }
 
 /// Note: This test requires Fitz server running on 127.0.0.1:4091

@@ -1,7 +1,10 @@
 use cntryl::FitzClient;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static ROUTE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy)]
 enum Transport {
@@ -22,11 +25,12 @@ fn connect_client(transport: Transport) -> FitzClient {
 }
 
 fn unique_rpc_route(suffix: &str) -> String {
+    let counter = ROUTE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock drift")
         .as_nanos();
-    format!("rpc://test-realm/{nonce}/{suffix}")
+    format!("rpc://test-realm/{nonce}-{counter}/{suffix}")
 }
 
 fn run_single_response_rpc(transport: Transport) {
