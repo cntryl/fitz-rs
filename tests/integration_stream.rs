@@ -1,4 +1,6 @@
-use cntryl::domains::stream::StreamCommitMode;
+use cntryl::domains::stream::{
+    StreamCommitMode, StreamDiscriminator, StreamFilterClause, StreamFilterSet,
+};
 use cntryl::FitzClient;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -37,6 +39,8 @@ fn unique_stream_route(suffix: &str) -> String {
 fn run_stream_commit_and_read(transport: Transport) {
     let client = connect_client(transport);
     let route = unique_stream_route("records");
+    let alpha = StreamDiscriminator::from("proj.alpha");
+    let beta = StreamDiscriminator::from("audit.beta");
 
     let mut session = client
         .stream()
@@ -44,11 +48,11 @@ fn run_stream_commit_and_read(transport: Transport) {
         .expect("failed to begin stream session");
 
     let first_offset = session
-        .append(0, b"record-1", None)
+        .append(0, b"record-1", None, Some(&alpha))
         .expect("failed to append first record")
         .expect("missing first offset");
     let second_offset = session
-        .append(first_offset + 1, b"record-2", None)
+        .append(first_offset + 1, b"record-2", None, Some(&beta))
         .expect("failed to append second record")
         .expect("missing second offset");
 
@@ -60,12 +64,19 @@ fn run_stream_commit_and_read(transport: Transport) {
 
     let records = client
         .stream()
-        .read(&route, 0, 10, None)
+        .read(
+            &route,
+            0,
+            10,
+            None,
+            Some(&StreamFilterSet {
+                clauses: vec![StreamFilterClause::Equals("proj.alpha".to_string())],
+            }),
+        )
         .expect("failed to read stream records");
-    assert_eq!(records.len(), 2);
+    assert_eq!(records.len(), 1);
     assert_eq!(records[0].body, b"record-1");
-    assert_eq!(records[1].body, b"record-2");
-    assert!(records[1].offset >= records[0].offset);
+    assert_eq!(records[0].offset, first_offset);
 
     let last = client
         .stream()
@@ -115,7 +126,7 @@ fn run_stream_subscription(transport: Transport) {
         .begin(&route, None)
         .expect("failed to begin writer session");
     session
-        .append(0, b"notify", None)
+        .append(0, b"notify", None, None)
         .expect("failed to append notification record");
     session
         .commit(StreamCommitMode::Sync)

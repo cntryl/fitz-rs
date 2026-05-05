@@ -1,16 +1,74 @@
 //! Stream domain client.
 
+use bincode::serialize;
 use crate::codec::{PayloadDecoder, PayloadEncoder};
 use crate::connection::SharedConnection;
 use crate::domains::routes::{validate_fixed_route, validate_selector_route};
 use crate::error::{FitzError, Result};
 use crate::protocol::message_type;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamCommitMode {
     Buffered = 0,
     Sync = 1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct StreamDiscriminator(pub String);
+
+impl StreamDiscriminator {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for StreamDiscriminator {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl From<String> for StreamDiscriminator {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StreamFilterClause {
+    Equals(String),
+    NotEquals(String),
+    StartsWith(String),
+    AnyOf(Vec<String>),
+}
+
+impl StreamFilterClause {
+    fn matches(&self, discriminator: &str) -> bool {
+        match self {
+            Self::Equals(value) => discriminator == value,
+            Self::NotEquals(value) => discriminator != value,
+            Self::StartsWith(prefix) => discriminator.starts_with(prefix),
+            Self::AnyOf(values) => values.iter().any(|value| value == discriminator),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct StreamFilterSet {
+    pub clauses: Vec<StreamFilterClause>,
+}
+
+impl StreamFilterSet {
+    pub fn is_empty(&self) -> bool {
+        self.clauses.is_empty()
+    }
+
+    pub fn matches(&self, discriminator: Option<&str>) -> bool {
+        let discriminator = discriminator.unwrap_or("");
+        self.clauses.iter().all(|clause| clause.matches(discriminator))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +156,7 @@ impl StreamClient {
         start_offset: u64,
         limit: u64,
         max_bytes: Option<u64>,
+        filter: Option<&StreamFilterSet>,
     ) -> Result<Vec<StreamRecord>> {
         validate_selector_route(route, "stream", 3, true)?;
 
@@ -109,6 +168,19 @@ impl StreamClient {
             Some(value) => {
                 enc.put_u8(1);
                 enc.put_u64(value);
+            }
+            None => {
+                enc.put_u8(0);
+            }
+        }
+
+        match filter.filter(|filter| !filter.is_empty()) {
+            Some(filter) => {
+                enc.put_u8(1);
+                let filter_bytes = serialize(filter).map_err(|error| {
+                    FitzError::Protocol(format!("failed to encode stream filter: {error}"))
+                })?;
+                enc.put_bytes(&filter_bytes);
             }
             None => {
                 enc.put_u8(0);
@@ -200,6 +272,7 @@ impl StreamSession {
         expected_offset: u64,
         body: &[u8],
         metadata: Option<&[u8]>,
+        discriminator: Option<&StreamDiscriminator>,
     ) -> Result<Option<u64>> {
         self.ensure_active("APPEND")?;
 
@@ -211,6 +284,16 @@ impl StreamSession {
             Some(value) => {
                 enc.put_u8(1);
                 enc.put_bytes(value);
+            }
+            None => {
+                enc.put_u8(0);
+            }
+        }
+
+        match discriminator.filter(|value| !value.as_str().is_empty()) {
+            Some(value) => {
+                enc.put_u8(1);
+                enc.put_string(value.as_str());
             }
             None => {
                 enc.put_u8(0);
@@ -620,5 +703,32 @@ mod tests {
 
         let err = decode_stream_response("READ", &buf).unwrap_err();
         assert!(err.to_string().contains("nope"));
+    }
+
+    #[test]
+    fn should_roundtrip_stream_filter_set_with_bincode() {
+        let filter = StreamFilterSet {
+            clauses: vec![
+                StreamFilterClause::Equals("proj.alpha".to_string()),
+                StreamFilterClause::NotEquals("audit.beta".to_string()),
+                StreamFilterClause::StartsWith("proj.".to_string()),
+                StreamFilterClause::AnyOf(vec!["proj.alpha".to_string(), "proj.gamma".to_string()]),
+            ],
+        };
+
+        let encoded = serialize(&filter).unwrap();
+        let decoded: StreamFilterSet = bincode::deserialize(&encoded).unwrap();
+
+        assert_eq!(decoded, filter);
+    }
+
+    #[test]
+    fn should_match_missing_discriminator_as_empty_string() {
+        let filter = StreamFilterSet {
+            clauses: vec![StreamFilterClause::Equals(String::new())],
+        };
+
+        assert!(filter.matches(None));
+        assert!(!filter.matches(Some("proj.alpha")));
     }
 }

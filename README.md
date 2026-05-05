@@ -189,10 +189,19 @@ lease.release("lease://my-realm/locks/leader", "node-1", renewed.fencing_token)?
 ```rust
 let stream = client.stream();
 let mut session = stream.begin("stream://my-realm/orders/events", 0, None)?;
-session.append(0, b"created", None)?;
+let discriminator = cntryl::domains::stream::StreamDiscriminator::from("proj.alpha");
+session.append(0, b"created", None, Some(&discriminator))?;
 session.commit(cntryl::domains::stream::StreamCommitMode::Sync)?;
 
-let records = stream.read("stream://my-realm/orders/events", 0, 100, None)?;
+let records = stream.read(
+    "stream://my-realm/orders/events",
+    0,
+    100,
+    None,
+    Some(&cntryl::domains::stream::StreamFilterSet {
+        clauses: vec![cntryl::domains::stream::StreamFilterClause::Equals("proj.alpha".to_string())],
+    }),
+)?;
 let last = stream.peek("stream://my-realm/orders/events")?;
 let metadata = stream.metadata("stream://my-realm/orders/events")?;
 

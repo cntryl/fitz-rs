@@ -724,10 +724,10 @@ fn execute_suite(transport: Transport, auth_mode: AuthMode) -> AggregateResult {
             .begin(&route, None)
             .map_err(|err| format!("stream begin failed: {err}"))?;
         session
-            .append(0, b"record-1", None)
+            .append(0, b"record-1", None, None)
             .map_err(|err| format!("append 1 failed: {err}"))?;
         session
-            .append(1, b"record-2", None)
+            .append(1, b"record-2", None, None)
             .map_err(|err| format!("append 2 failed: {err}"))?;
         session
             .commit(StreamCommitMode::Sync)
@@ -754,11 +754,11 @@ fn execute_suite(transport: Transport, auth_mode: AuthMode) -> AggregateResult {
             .begin(&route, None)
             .map_err(|err| format!("stream begin failed: {err}"))?;
         let first_offset = session
-            .append(0, b"record-1", None)
+            .append(0, b"record-1", None, None)
             .map_err(|err| format!("append 1 failed: {err}"))?
             .ok_or_else(|| "missing first offset".to_string())?;
         let second_offset = session
-            .append(first_offset + 1, b"record-2", None)
+            .append(first_offset + 1, b"record-2", None, None)
             .map_err(|err| format!("append 2 failed: {err}"))?
             .ok_or_else(|| "missing second offset".to_string())?;
         if second_offset < first_offset {
@@ -771,7 +771,7 @@ fn execute_suite(transport: Transport, auth_mode: AuthMode) -> AggregateResult {
 
         let records = client
             .stream()
-            .read(&route, 0, 10, None)
+            .read(&route, 0, 10, None, None)
             .map_err(|err| format!("stream read failed: {err}"))?;
         let last = client
             .stream()
@@ -808,9 +808,9 @@ fn execute_suite(transport: Transport, auth_mode: AuthMode) -> AggregateResult {
             .begin(&route, None)
             .map_err(|err| format!("stream begin failed: {err}"))?;
         session
-            .append(0, b"record-1", None)
+            .append(0, b"record-1", None, None)
             .map_err(|err| format!("append 1 failed: {err}"))?;
-        let result = session.append(99, b"record-2", None);
+        let result = session.append(99, b"record-2", None, None);
         close_client(&client);
 
         match result {
