@@ -81,6 +81,42 @@ pub struct StreamRecord {
     pub timestamp: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamFilteredReason {
+    ServerFilter,
+    Permission,
+    Projection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamReadItem {
+    Event(StreamRecord),
+    Filtered {
+        offset: u64,
+        reason: Option<StreamFilteredReason>,
+    },
+    FilteredRange {
+        from_offset: u64,
+        to_offset: u64,
+        reason: Option<StreamFilteredReason>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamReadCursor {
+    pub last_resource_offset: u64,
+    pub last_area_offset: Option<u64>,
+    pub last_realm_offset: Option<u64>,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamReadPage {
+    pub items: Vec<StreamReadItem>,
+    pub cursor: StreamReadCursor,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamMetadata {
     pub first_offset: u64,
@@ -191,7 +227,51 @@ impl StreamClient {
             .conn
             .send_request(message_type::STREAM_READ, &enc.finish())?;
         let decoded = decode_stream_response("READ", &resp)?;
-        parse_stream_records(&decoded.data)
+        Ok(flatten_stream_read_items(&parse_stream_read_page(&decoded.data)?.items))
+    }
+
+    pub fn read_page(
+        &self,
+        route: &str,
+        start_offset: u64,
+        limit: u64,
+        max_bytes: Option<u64>,
+        filter: Option<&StreamFilterSet>,
+    ) -> Result<StreamReadPage> {
+        validate_selector_route(route, "stream", 3, true)?;
+
+        let mut enc = PayloadEncoder::new();
+        enc.put_string(route);
+        enc.put_u64(start_offset);
+        enc.put_u64(limit);
+        match max_bytes {
+            Some(value) => {
+                enc.put_u8(1);
+                enc.put_u64(value);
+            }
+            None => {
+                enc.put_u8(0);
+            }
+        }
+
+        match filter.filter(|filter| !filter.is_empty()) {
+            Some(filter) => {
+                enc.put_u8(1);
+                let filter_bytes = serialize(filter).map_err(|error| {
+                    FitzError::Protocol(format!("failed to encode stream filter: {error}"))
+                })?;
+                enc.put_bytes(&filter_bytes);
+            }
+            None => {
+                enc.put_u8(0);
+            }
+        }
+
+        let resp = self
+            .conn
+            .send_request(message_type::STREAM_READ, &enc.finish())?;
+        let decoded = decode_stream_response("READ", &resp)?;
+        parse_stream_read_page(&decoded.data)
     }
 
     pub fn peek(&self, route: &str) -> Result<Option<StreamRecord>> {
@@ -445,29 +525,49 @@ fn parse_stream_record(buf: &[u8]) -> Result<Option<StreamRecord>> {
     Ok(Some(decode_stream_record(&mut dec)?))
 }
 
-fn parse_stream_records(buf: &[u8]) -> Result<Vec<StreamRecord>> {
+fn parse_stream_read_page(buf: &[u8]) -> Result<StreamReadPage> {
     if buf.is_empty() {
-        return Ok(Vec::new());
+        return Ok(StreamReadPage {
+            items: Vec::new(),
+            cursor: StreamReadCursor {
+                last_resource_offset: 0,
+                last_area_offset: None,
+                last_realm_offset: None,
+                has_more: false,
+            },
+        });
     }
 
     let mut dec = PayloadDecoder::new(buf);
     let count = dec.get_u32()? as usize;
-    let mut records = Vec::with_capacity(count);
+    let mut items = Vec::with_capacity(count);
 
     for _ in 0..count {
-        records.push(decode_stream_record(&mut dec)?);
+        items.push(decode_stream_read_item(&mut dec)?);
     }
 
-    let _last_resource_offset = dec.get_u64()?;
-    let _last_area_offset = decode_optional_u64(&mut dec)?;
-    let _last_realm_offset = decode_optional_u64(&mut dec)?;
-    let _has_more = dec.get_u8()?;
+    let cursor = StreamReadCursor {
+        last_resource_offset: dec.get_u64()?,
+        last_area_offset: decode_optional_u64(&mut dec)?,
+        last_realm_offset: decode_optional_u64(&mut dec)?,
+        has_more: decode_bool_u8(&mut dec, "stream read cursor has_more")?,
+    };
 
     if !dec.is_empty() {
         return Err(FitzError::Protocol("READ response has trailing bytes".to_string()));
     }
 
-    Ok(records)
+    Ok(StreamReadPage { items, cursor })
+}
+
+fn flatten_stream_read_items(items: &[StreamReadItem]) -> Vec<StreamRecord> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            StreamReadItem::Event(record) => Some(record.clone()),
+            StreamReadItem::Filtered { .. } | StreamReadItem::FilteredRange { .. } => None,
+        })
+        .collect()
 }
 
 fn decode_stream_metadata(buf: &[u8]) -> Result<StreamMetadata> {
@@ -495,6 +595,36 @@ fn decode_stream_record(dec: &mut PayloadDecoder<'_>) -> Result<StreamRecord> {
     })
 }
 
+fn decode_stream_read_item(dec: &mut PayloadDecoder<'_>) -> Result<StreamReadItem> {
+    match dec.get_u8()? {
+        0 => Ok(StreamReadItem::Event(decode_stream_record(dec)?)),
+        1 => Ok(StreamReadItem::Filtered {
+            offset: dec.get_u64()?,
+            reason: decode_stream_filtered_reason(dec)?,
+        }),
+        2 => Ok(StreamReadItem::FilteredRange {
+            from_offset: dec.get_u64()?,
+            to_offset: dec.get_u64()?,
+            reason: decode_stream_filtered_reason(dec)?,
+        }),
+        other => Err(FitzError::Protocol(format!(
+            "unknown stream read item tag: {other}"
+        ))),
+    }
+}
+
+fn decode_stream_filtered_reason(dec: &mut PayloadDecoder<'_>) -> Result<Option<StreamFilteredReason>> {
+    match dec.get_u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(StreamFilteredReason::ServerFilter)),
+        2 => Ok(Some(StreamFilteredReason::Permission)),
+        3 => Ok(Some(StreamFilteredReason::Projection)),
+        other => Err(FitzError::Protocol(format!(
+            "invalid stream filtered reason tag: {other}"
+        ))),
+    }
+}
+
 fn decode_optional_u64(dec: &mut PayloadDecoder<'_>) -> Result<Option<u64>> {
     match dec.get_u8()? {
         0 => Ok(None),
@@ -511,6 +641,16 @@ fn decode_optional_bytes(dec: &mut PayloadDecoder<'_>) -> Result<Option<Vec<u8>>
         1 => Ok(Some(dec.get_bytes()?)),
         other => Err(FitzError::Protocol(format!(
             "invalid optional bytes flag: {other}"
+        ))),
+    }
+}
+
+fn decode_bool_u8(dec: &mut PayloadDecoder<'_>, field: &str) -> Result<bool> {
+    match dec.get_u8()? {
+        0 => Ok(false),
+        1 => Ok(true),
+        other => Err(FitzError::Protocol(format!(
+            "invalid boolean flag for {field}: {other}"
         ))),
     }
 }
@@ -591,6 +731,7 @@ mod tests {
     fn should_parse_count_prefixed_stream_records() {
         let mut buf = Vec::new();
         buf.extend_from_slice(&(2u32).to_be_bytes());
+        buf.push(0);
         buf.extend_from_slice(&1u64.to_be_bytes());
         buf.push(1);
         buf.extend_from_slice(&10u64.to_be_bytes());
@@ -602,6 +743,7 @@ mod tests {
         buf.extend_from_slice(&(2u32).to_be_bytes());
         buf.extend_from_slice(b"m1");
         buf.extend_from_slice(&111u64.to_be_bytes());
+        buf.push(0);
         buf.extend_from_slice(&2u64.to_be_bytes());
         buf.push(0);
         buf.push(1);
@@ -615,7 +757,8 @@ mod tests {
         buf.push(0);
         buf.push(0);
 
-        let records = parse_stream_records(&buf).unwrap();
+        let page = parse_stream_read_page(&buf).unwrap();
+        let records = flatten_stream_read_items(&page.items);
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].offset, 1);
         assert_eq!(records[0].area_offset, Some(10));
@@ -625,6 +768,64 @@ mod tests {
         assert_eq!(records[1].body, b"b");
         assert_eq!(records[1].offset, 2);
         assert_eq!(records[1].timestamp, 222);
+        assert_eq!(page.cursor.last_resource_offset, 2);
+        assert_eq!(page.cursor.last_area_offset, None);
+        assert_eq!(page.cursor.last_realm_offset, None);
+        assert!(!page.cursor.has_more);
+    }
+
+    #[test]
+    fn should_parse_stream_read_page_with_filtered_items_and_cursor() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(3u32).to_be_bytes());
+        buf.push(0);
+        buf.extend_from_slice(&41u64.to_be_bytes());
+        buf.push(1);
+        buf.extend_from_slice(&51u64.to_be_bytes());
+        buf.push(0);
+        buf.extend_from_slice(&(1u32).to_be_bytes());
+        buf.extend_from_slice(b"a");
+        buf.push(0);
+        buf.extend_from_slice(&111u64.to_be_bytes());
+        buf.push(1);
+        buf.extend_from_slice(&42u64.to_be_bytes());
+        buf.push(1);
+        buf.push(2);
+        buf.extend_from_slice(&43u64.to_be_bytes());
+        buf.extend_from_slice(&45u64.to_be_bytes());
+        buf.push(2);
+        buf.extend_from_slice(&45u64.to_be_bytes());
+        buf.push(1);
+        buf.extend_from_slice(&52u64.to_be_bytes());
+        buf.push(0);
+        buf.push(1);
+
+        let page = parse_stream_read_page(&buf).unwrap();
+
+        assert_eq!(page.cursor.last_resource_offset, 45);
+        assert_eq!(page.cursor.last_area_offset, Some(52));
+        assert_eq!(page.cursor.last_realm_offset, None);
+        assert!(page.cursor.has_more);
+        assert_eq!(page.items.len(), 3);
+        assert!(matches!(page.items[0], StreamReadItem::Event(_)));
+        assert_eq!(
+            page.items[1],
+            StreamReadItem::Filtered {
+                offset: 42,
+                reason: Some(StreamFilteredReason::ServerFilter),
+            }
+        );
+        assert_eq!(
+            page.items[2],
+            StreamReadItem::FilteredRange {
+                from_offset: 43,
+                to_offset: 45,
+                reason: Some(StreamFilteredReason::Permission),
+            }
+        );
+        let records = flatten_stream_read_items(&page.items);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].offset, 41);
     }
 
     #[test]

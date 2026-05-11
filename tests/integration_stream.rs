@@ -1,5 +1,6 @@
 use cntryl::domains::stream::{
     StreamCommitMode, StreamDiscriminator, StreamFilterClause, StreamFilterSet,
+    StreamFilteredReason, StreamReadItem,
 };
 use cntryl::FitzClient;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -77,6 +78,30 @@ fn run_stream_commit_and_read(transport: Transport) {
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].body, b"record-1");
     assert_eq!(records[0].offset, first_offset);
+
+    let page = client
+        .stream()
+        .read_page(
+            &route,
+            0,
+            10,
+            None,
+            Some(&StreamFilterSet {
+                clauses: vec![StreamFilterClause::Equals("proj.alpha".to_string())],
+            }),
+        )
+        .expect("failed to read stream page");
+    assert_eq!(page.cursor.last_resource_offset, second_offset);
+    assert!(!page.cursor.has_more);
+    assert_eq!(page.items.len(), 2);
+    assert!(matches!(page.items[0], StreamReadItem::Event(_)));
+    assert_eq!(
+        page.items[1],
+        StreamReadItem::Filtered {
+            offset: second_offset,
+            reason: Some(StreamFilteredReason::ServerFilter),
+        }
+    );
 
     let last = client
         .stream()

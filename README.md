@@ -202,6 +202,17 @@ let records = stream.read(
         clauses: vec![cntryl::domains::stream::StreamFilterClause::Equals("proj.alpha".to_string())],
     }),
 )?;
+let page = stream.read_page(
+    "stream://my-realm/orders/events",
+    0,
+    100,
+    None,
+    Some(&cntryl::domains::stream::StreamFilterSet {
+        clauses: vec![cntryl::domains::stream::StreamFilterClause::Equals("proj.alpha".to_string())],
+    }),
+)?;
+assert_eq!(records.len(), 1); // `read()` flattens event items only.
+assert_eq!(page.cursor.last_resource_offset, 0);
 let last = stream.peek("stream://my-realm/orders/events")?;
 let metadata = stream.metadata("stream://my-realm/orders/events")?;
 
