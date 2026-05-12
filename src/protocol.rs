@@ -69,6 +69,7 @@ pub mod message_type {
 
 /// Transaction mode for KV operations.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub enum TransactionMode {
     ReadOnly = 0,
     ReadWrite = 1,

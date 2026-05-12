@@ -7,11 +7,13 @@ use crate::error::{FitzError, Result};
 use crate::protocol::message_type;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Notice payload delivered by a subscription.
 pub struct NoticeMessage {
     pub route: String,
     pub body: Vec<u8>,
 }
 
+/// Notice domain client for publish/subscribe operations.
 pub struct NoticeClient {
     conn: SharedConnection,
 }
@@ -61,6 +63,7 @@ impl NoticeClient {
     }
 }
 
+/// Active notice subscription handle.
 pub struct NoticeSubscription {
     conn: SharedConnection,
     subscription_id: u64,

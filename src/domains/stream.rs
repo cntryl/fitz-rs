@@ -9,11 +9,13 @@ use crate::protocol::message_type;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StreamCommitMode {
     Buffered = 0,
     Sync = 1,
 }
 
+/// Opaque stream discriminator used by server-side filtering.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct StreamDiscriminator(pub String);
@@ -37,6 +39,7 @@ impl From<String> for StreamDiscriminator {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum StreamFilterClause {
     Equals(String),
     NotEquals(String),
@@ -55,6 +58,7 @@ impl StreamFilterClause {
     }
 }
 
+/// Set of discriminator filter clauses applied to stream reads.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct StreamFilterSet {
     pub clauses: Vec<StreamFilterClause>,
@@ -71,6 +75,7 @@ impl StreamFilterSet {
     }
 }
 
+/// Stream record payload returned by read and peek operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamRecord {
     pub offset: u64,
@@ -83,6 +88,7 @@ pub struct StreamRecord {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum StreamFilteredReason {
     ServerFilter,
     Permission,
@@ -90,6 +96,7 @@ pub enum StreamFilteredReason {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StreamReadItem {
     Event(StreamRecord),
     Filtered {
@@ -103,6 +110,7 @@ pub enum StreamReadItem {
     },
 }
 
+/// Cursor information describing the current stream read position.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamReadCursor {
     pub last_resource_offset: u64,
@@ -111,12 +119,14 @@ pub struct StreamReadCursor {
     pub has_more: bool,
 }
 
+/// Page of stream read items with cursor continuation state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamReadPage {
     pub items: Vec<StreamReadItem>,
     pub cursor: StreamReadCursor,
 }
 
+/// Stream metadata summary returned by the metadata API.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamMetadata {
     pub first_offset: u64,
@@ -129,6 +139,7 @@ pub struct StreamMetadata {
     pub realm_watermark: u64,
 }
 
+/// Notification payload emitted for committed stream batches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamCommitNotification {
     pub route: String,
@@ -143,6 +154,7 @@ pub struct StreamCommitNotification {
     pub payload: Vec<u8>,
 }
 
+/// Stream domain client for session lifecycle, reads, and subscriptions.
 pub struct StreamClient {
     conn: SharedConnection,
 }

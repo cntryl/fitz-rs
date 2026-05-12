@@ -6,6 +6,7 @@ use crate::error::{FitzError, Result};
 use crate::protocol::message_type;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Schedule entry returned by list operations.
 pub struct ScheduleEntry {
     pub id: String,
     pub route: String,
@@ -13,6 +14,7 @@ pub struct ScheduleEntry {
     pub payload: Vec<u8>,
 }
 
+/// Schedule domain client for create/cancel/list and subscriptions.
 pub struct ScheduleClient {
     conn: SharedConnection,
 }
@@ -136,6 +138,7 @@ impl ScheduleClient {
     }
 }
 
+/// Active schedule subscription handle.
 pub struct ScheduleSubscription {
     conn: SharedConnection,
     pattern: String,
@@ -172,6 +175,7 @@ impl ScheduleSubscription {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Notification payload emitted when a schedule fires.
 pub struct ScheduleNotification {
     pub payload: Vec<u8>,
 }

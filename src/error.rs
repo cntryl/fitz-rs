@@ -2,6 +2,7 @@ use std::io::ErrorKind;
 
 /// Fitz client error categories.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FitzErrorKind {
     Connection,
     Transport,
@@ -19,6 +20,7 @@ pub enum FitzErrorKind {
 
 /// Fitz client error types.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum FitzError {
     #[error("Connection error: {0}")]
     Connection(String),

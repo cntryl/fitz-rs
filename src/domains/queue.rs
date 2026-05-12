@@ -8,6 +8,7 @@ use crate::protocol::message_type;
 use std::time::Duration;
 
 #[derive(Clone)]
+/// Reserved queue item with helper methods for lease extension and completion.
 pub struct QueueItem {
     pub route: String,
     pub id: u64,
@@ -49,6 +50,7 @@ impl QueueItem {
     }
 }
 
+/// Queue domain client for enqueue/reserve and availability subscriptions.
 pub struct QueueClient {
     conn: SharedConnection,
 }
@@ -177,6 +179,7 @@ impl QueueClient {
     }
 }
 
+/// Active queue availability subscription handle.
 pub struct QueueSubscription {
     conn: SharedConnection,
     pattern: String,
@@ -212,6 +215,7 @@ impl QueueSubscription {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Queue availability notification delivered to subscribers.
 pub struct QueueNotification {
     pub route: String,
     pub payload: Vec<u8>,

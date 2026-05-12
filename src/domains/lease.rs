@@ -35,6 +35,7 @@ pub struct LeaseGrant {
 
 /// Result of a lease query.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LeaseStatus {
     /// Lease is currently held. The server returns the fencing token.
     Held { fencing_token: u64 },

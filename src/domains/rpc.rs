@@ -8,12 +8,14 @@ use crate::protocol::message_type;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// One response frame from an RPC call stream.
 pub struct RpcResponseFrame {
     pub body: Vec<u8>,
     pub sequence: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Inbound worker request data for a registered RPC route.
 pub struct RpcInboundRequest {
     pub correlation_id: [u8; 16],
     pub route: String,
@@ -21,6 +23,7 @@ pub struct RpcInboundRequest {
     pub body: Vec<u8>,
 }
 
+/// RPC domain client for issuing calls and registering workers.
 pub struct RpcClient {
     conn: SharedConnection,
 }
@@ -77,6 +80,7 @@ impl RpcClient {
     }
 }
 
+/// Iterator-like stream of RPC response frames for one correlation id.
 pub struct RpcResponseStream {
     conn: SharedConnection,
     correlation_id: [u8; 16],
@@ -126,6 +130,7 @@ impl RpcResponseStream {
     }
 }
 
+/// Handle for a registered RPC worker pattern.
 pub struct RpcWorkerRegistration {
     conn: SharedConnection,
     pattern: String,
@@ -163,6 +168,7 @@ impl RpcWorkerRegistration {
     }
 }
 
+/// Mutable worker request context used to send streamed responses.
 pub struct RpcWorkerRequest {
     conn: SharedConnection,
     pub correlation_id: [u8; 16],
