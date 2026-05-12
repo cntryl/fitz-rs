@@ -1,0 +1,201 @@
+{
+  "suite": "fitz-cross-language-client-conformance",
+  "version": "1.0",
+  "generated_at": "1778613167",
+  "client": "fitz-rs",
+  "transport": "tcp",
+  "auth_mode": "valid_jwt",
+  "p0_pass_rate": 0.125,
+  "p1_pass_rate": 0.0,
+  "overall_status": "fail",
+  "scenarios": [
+    {
+      "scenario_id": "CS-001",
+      "title": "connect success",
+      "priority": "P0",
+      "client": "fitz-rs",
+      "transport": "tcp",
+      "auth_mode": "valid_jwt",
+      "verdict": "fail",
+      "evidence": [],
+      "latency_ms": 1,
+      "error": "kv begin failed: Domain error: kv route \"kv://test-realm/1778613167473689100/0/res\" must be kv://{realm}/{area}/{resource}"
+    },
+    {
+      "scenario_id": "CS-002",
+      "title": "auth failure",
+      "priority": "P0",
+      "client": "fitz-rs",
+      "transport": "tcp",
+      "auth_mode": "valid_jwt",
+      "verdict": "partial",
+      "evidence": [
+        "request failed with a weaker but non-successful error: Domain error: kv route \"kv://test-realm/1778613167473991600/1/res\" must be kv://{realm}/{area}/{resource} (Domain:Domain error: kv route \"kv://test-realm/1778613167473991600/1/res\" must be kv://{realm}/{area}/{resource})"
+      ],
+      "latency_ms": 0
+    },
+    {
+      "scenario_id": "CS-003",
+      "title": "request success",
+      "priority": "P0",
+      "client": "fitz-rs",
+      "transport": "tcp",
+      "auth_mode": "valid_jwt",
+      "verdict": "fail",
+      "evidence": [],
+      "latency_ms": 0,
+      "error": "kv begin failed: Domain error: kv route \"kv://test-realm/1778613167474231300/2/res\" must be kv://{realm}/{area}/{resource}"
+    },
+    {
+      "scenario_id": "CS-004",
+      "title": "unknown route",
+      "priority": "P0",
+      "client": "fitz-rs",
+      "transport": "tcp",
+      "auth_mode": "valid_jwt",
+      "verdict": "partial",
+      "evidence": [
+        "unknown route produced a different error: Codec error: Not enough bytes (Codec:Codec error: Not enough bytes)"
+      ],
+      "latency_ms": 12
+    },
+    {
+      "scenario_id": "CS-005",
+      "title": "invalid payload",
+      "priority": "P0",
+      "client": "fitz-rs",
+      "transport": "tcp",
+      "auth_mode": "valid_jwt",
+      "verdict": "partial",
+      "evidence": [
+        "invalid payload produced a different error: Codec error: Not enough bytes (Codec:Codec error: Not enough bytes)"
+      ],
+      "latency_ms": 10
+    },
+    {
+      "scenario_id": "CS-006",
+      "title": "server error mapping",
+      "priority": "P0",
+      "client": "fitz-rs",
+      "transport": "tcp",
+      "auth_mode": "valid_jwt",
+      "verdict": "pass",
+      "evidence": [
+        "server error mapped through typed classification: Domain error: lease route \"lease://test-realm/1778613167497480900/5/res\" must be lease://{realm}/{area}/{resource} (Domain:Domain error: lease route \"lease://test-realm/1778613167497480900/5/res\" must be lease://{realm}/{area}/{resource})"
+      ],
+      "latency_ms": 0
+    },
+    {
+      "scenario_id": "CS-007",
+      "title": "timeout handling",
+      "priority": "P0",
+      "client": "fitz-rs",
+      "transport": "tcp",
+      "auth_mode": "valid_jwt",
+      "verdict": "fail",
+      "evidence": [],
+      "latency_ms": 27,
+      "error": "stub server thread panicked: Any { .. }"
+    },
+    {
+      "scenario_id": "CS-008",
+      "title": "caller cancellation",
+      "priority": "P0",
+      "client": "fitz-rs",
+      "transport": "tcp",
+      "auth_mode": "valid_jwt",
+      "verdict": "not_implemented",
+      "evidence": [
+        "the blocking Rust API currently exposes close() and timeouts rather than per-call cancellation tokens",
+        "caller cancellation is therefore represented as a documented gap instead of a simulated async abort"
+      ],
+      "latency_ms": 0
+    },
+    {
+      "scenario_id": "CS-009",
+      "title": "disconnect during request",
+      "priority": "P1",
+      "client": "fitz-rs",
+      "transport": "tcp",
+      "auth_mode": "valid_jwt",
+      "verdict": "fail",
+      "evidence": [],
+      "latency_ms": 13,
+      "error": "stub server thread panicked: Any { .. }"
+    },
+    {
+      "scenario_id": "CS-010",
+      "title": "reconnect and retry behavior",
+      "priority": "P1",
+      "client": "fitz-rs",
+      "transport": "tcp",
+      "auth_mode": "valid_jwt",
+      "verdict": "not_implemented",
+      "evidence": [
+        "this client is intentionally synchronous and single-connection; reconnect orchestration is not yet part of the Rust surface",
+        "state restoration for subscriptions/workers is therefore out of scope for the current implementation"
+      ],
+      "latency_ms": 0
+    },
+    {
+      "scenario_id": "CS-011",
+      "title": "stream receive sequence",
+      "priority": "P1",
+      "client": "fitz-rs",
+      "transport": "tcp",
+      "auth_mode": "valid_jwt",
+      "verdict": "fail",
+      "evidence": [],
+      "latency_ms": 0,
+      "error": "stream subscribe failed: Domain error: stream route \"stream://test-realm/1778613167538642800/8/res\" must be one of stream://{realm}/{area}/{resource}, stream://{realm}/{area}/*, or stream://{realm}/*/*"
+    },
+    {
+      "scenario_id": "CS-012",
+      "title": "stream completion",
+      "priority": "P1",
+      "client": "fitz-rs",
+      "transport": "tcp",
+      "auth_mode": "valid_jwt",
+      "verdict": "fail",
+      "evidence": [],
+      "latency_ms": 0,
+      "error": "stream begin failed: Domain error: stream route \"stream://test-realm/1778613167538872900/9/res\" must be stream://{realm}/{area}/{resource}"
+    },
+    {
+      "scenario_id": "CS-013",
+      "title": "stream error mid-flight",
+      "priority": "P1",
+      "client": "fitz-rs",
+      "transport": "tcp",
+      "auth_mode": "valid_jwt",
+      "verdict": "fail",
+      "evidence": [],
+      "latency_ms": 0,
+      "error": "stream begin failed: Domain error: stream route \"stream://test-realm/1778613167539057100/10/res\" must be stream://{realm}/{area}/{resource}"
+    },
+    {
+      "scenario_id": "CS-014",
+      "title": "concurrent requests",
+      "priority": "P1",
+      "client": "fitz-rs",
+      "transport": "tcp",
+      "auth_mode": "valid_jwt",
+      "verdict": "fail",
+      "evidence": [],
+      "latency_ms": 1,
+      "error": "left begin failed: Domain error: kv route \"kv://test-realm/1778613167540109800/12/res\" must be kv://{realm}/{area}/{resource}"
+    },
+    {
+      "scenario_id": "CS-015",
+      "title": "shutdown during active work",
+      "priority": "P1",
+      "client": "fitz-rs",
+      "transport": "tcp",
+      "auth_mode": "valid_jwt",
+      "verdict": "fail",
+      "evidence": [],
+      "latency_ms": 53,
+      "error": "stub server thread panicked: Any { .. }"
+    }
+  ]
+}
