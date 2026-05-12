@@ -319,7 +319,7 @@ mod tests {
             thread::sleep(Duration::from_millis(250));
         });
 
-        let client = FitzClient::builder("test-realm", "secret")
+        let client = FitzClient::builder("secret")
             .with_timeout(Duration::from_millis(50))
             .connect_tcp("127.0.0.1", port)
             .unwrap();
@@ -351,7 +351,7 @@ mod tests {
             thread::sleep(Duration::from_millis(50));
         });
 
-        let client = FitzClient::builder("test-realm", "secret")
+        let client = FitzClient::builder("secret")
             .connect_tcp("127.0.0.1", port)
             .unwrap();
 

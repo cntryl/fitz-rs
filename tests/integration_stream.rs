@@ -1,3 +1,5 @@
+mod jwt;
+
 use cntryl::domains::stream::{
     StreamCommitMode, StreamDiscriminator, StreamFilterClause, StreamFilterSet,
     StreamFilteredReason, StreamReadItem,
@@ -17,12 +19,13 @@ enum Transport {
 }
 
 fn connect_client(transport: Transport) -> FitzClient {
+    let token = jwt::make_test_jwt("test-realm", "test-secret-key");
     match transport {
         Transport::Tcp => {
-            FitzClient::connect_tcp("127.0.0.1", 4091, "test-realm", "test-secret-key")
+            FitzClient::connect_tcp("127.0.0.1", 4091, &token)
         }
         Transport::WebSocket => {
-            FitzClient::connect_ws("ws://127.0.0.1:4090/ws", "test-realm", "test-secret-key")
+            FitzClient::connect_ws("ws://127.0.0.1:4090/ws", &token)
         }
     }
     .expect("failed to connect to fitz broker")

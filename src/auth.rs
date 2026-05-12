@@ -1,5 +1,7 @@
 //! Authentication - JWT token generation for testing
 
+#![allow(dead_code)]
+
 use crate::error::{FitzError, Result};
 use jsonwebtoken::{encode, EncodingKey, Header};
 use serde::{Deserialize, Serialize};

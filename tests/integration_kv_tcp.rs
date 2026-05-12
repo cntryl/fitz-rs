@@ -2,7 +2,9 @@
 //! This test connects to a real Fitz server running on 127.0.0.1:4091
 //! and executes a complete KV transaction sequence
 
-use cntryl::protocol::TransactionMode;
+mod jwt;
+
+use cntryl::TransactionMode;
 use cntryl::FitzClient;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,7 +25,8 @@ fn unique_kv_route(suffix: &str) -> String {
 #[test]
 fn should_execute_kv_transaction_over_tcp() {
     // Arrange
-    let client = FitzClient::connect_tcp("127.0.0.1", 4091, "test-realm", "test-secret-key")
+    let token = jwt::make_test_jwt("test-realm", "test-secret-key");
+    let client = FitzClient::connect_tcp("127.0.0.1", 4091, &token)
         .expect("Failed to connect to Fitz server");
 
     let kv = client.kv();
@@ -83,7 +86,8 @@ fn should_execute_kv_transaction_over_tcp() {
 #[test]
 fn should_rollback_kv_transaction_over_tcp() {
     // Arrange
-    let client = FitzClient::connect_tcp("127.0.0.1", 4091, "test-realm", "test-secret-key")
+    let token = jwt::make_test_jwt("test-realm", "test-secret-key");
+    let client = FitzClient::connect_tcp("127.0.0.1", 4091, &token)
         .expect("Failed to connect");
 
     let kv = client.kv();
@@ -146,7 +150,8 @@ fn should_rollback_kv_transaction_over_tcp() {
 #[test]
 fn should_isolate_multiple_kv_transactions_over_tcp() {
     // Arrange
-    let client = FitzClient::connect_tcp("127.0.0.1", 4091, "test-realm", "test-secret-key")
+    let token = jwt::make_test_jwt("test-realm", "test-secret-key");
+    let client = FitzClient::connect_tcp("127.0.0.1", 4091, &token)
         .expect("Failed to connect");
 
     let kv = client.kv();

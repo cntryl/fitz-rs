@@ -1,5 +1,7 @@
+mod jwt;
+
 use cntryl::domains::stream::StreamCommitMode;
-use cntryl::protocol::TransactionMode;
+use cntryl::TransactionMode;
 use cntryl::{FitzClient, FitzError, FitzErrorKind, Result};
 use serde::Serialize;
 use std::fs;
@@ -318,44 +320,46 @@ fn spawn_stub_server(transport: Transport, behavior: StubBehavior) -> StubServer
 
 fn connect_broker_client(transport: Transport, auth_mode: AuthMode) -> Result<FitzClient> {
     let secret = broker_secret();
+    let token = jwt::make_test_jwt(REALM, &secret);
 
     match (transport, auth_mode) {
         (Transport::Tcp, AuthMode::Anonymous) => {
             let (host, port) = broker_tcp_addr(auth_mode);
-            FitzClient::connect_tcp_anonymous(&host, port, REALM)
+            FitzClient::connect_tcp_anonymous(&host, port)
         }
         (Transport::Tcp, AuthMode::ValidJwt) => {
             let (host, port) = broker_tcp_addr(auth_mode);
-            FitzClient::connect_tcp(&host, port, REALM, &secret)
+            FitzClient::connect_tcp(&host, port, &token)
         }
         (Transport::WebSocket, AuthMode::Anonymous) => {
             let url = broker_ws_url(auth_mode);
-            FitzClient::connect_ws_anonymous(&url, REALM)
+            FitzClient::connect_ws_anonymous(&url)
         }
         (Transport::WebSocket, AuthMode::ValidJwt) => {
             let url = broker_ws_url(auth_mode);
-            FitzClient::connect_ws(&url, REALM, &secret)
+            FitzClient::connect_ws(&url, &token)
         }
     }
 }
 
 fn connect_stub_client(transport: Transport, auth_mode: AuthMode, stub: &StubServer) -> Result<FitzClient> {
     let secret = DEFAULT_SECRET;
+    let token = jwt::make_test_jwt(REALM, secret);
 
     match (transport, auth_mode) {
         (Transport::Tcp, AuthMode::Anonymous) => {
             let (host, port) = stub.tcp_addr();
-            FitzClient::connect_tcp_anonymous(host, port, REALM)
+            FitzClient::connect_tcp_anonymous(host, port)
         }
         (Transport::Tcp, AuthMode::ValidJwt) => {
             let (host, port) = stub.tcp_addr();
-            FitzClient::connect_tcp(host, port, REALM, secret)
+            FitzClient::connect_tcp(host, port, &token)
         }
         (Transport::WebSocket, AuthMode::Anonymous) => {
-            FitzClient::connect_ws_anonymous(&stub.ws_url(), REALM)
+            FitzClient::connect_ws_anonymous(&stub.ws_url())
         }
         (Transport::WebSocket, AuthMode::ValidJwt) => {
-            FitzClient::connect_ws(&stub.ws_url(), REALM, secret)
+            FitzClient::connect_ws(&stub.ws_url(), &token)
         }
     }
 }
@@ -369,36 +373,41 @@ fn connect_stub_client_with_timeout(
     match (transport, auth_mode) {
         (Transport::Tcp, AuthMode::Anonymous) => {
             let (host, port) = stub.tcp_addr();
-            FitzClient::builder_anonymous(REALM)
+            FitzClient::builder_anonymous()
                 .with_timeout(timeout)
                 .connect_tcp(host, port)
         }
         (Transport::Tcp, AuthMode::ValidJwt) => {
             let (host, port) = stub.tcp_addr();
-            FitzClient::builder(REALM, DEFAULT_SECRET)
+            let token = jwt::make_test_jwt(REALM, DEFAULT_SECRET);
+            FitzClient::builder(&token)
                 .with_timeout(timeout)
                 .connect_tcp(host, port)
         }
-        (Transport::WebSocket, AuthMode::Anonymous) => FitzClient::builder_anonymous(REALM)
+        (Transport::WebSocket, AuthMode::Anonymous) => FitzClient::builder_anonymous()
             .with_timeout(timeout)
             .connect_ws(&stub.ws_url()),
-        (Transport::WebSocket, AuthMode::ValidJwt) => FitzClient::builder(REALM, DEFAULT_SECRET)
-            .with_timeout(timeout)
-            .connect_ws(&stub.ws_url()),
+        (Transport::WebSocket, AuthMode::ValidJwt) => {
+            let token = jwt::make_test_jwt(REALM, DEFAULT_SECRET);
+            FitzClient::builder(&token)
+                .with_timeout(timeout)
+                .connect_ws(&stub.ws_url())
+        }
     }
 }
 
 fn connect_invalid_auth_client(transport: Transport) -> Result<FitzClient> {
     let secret = "definitely-wrong-secret";
+    let token = jwt::make_invalid_jwt(REALM, secret);
 
     match transport {
         Transport::Tcp => {
             let (host, port) = broker_tcp_addr(AuthMode::ValidJwt);
-            FitzClient::connect_tcp(&host, port, REALM, secret)
+            FitzClient::connect_tcp(&host, port, &token)
         }
         Transport::WebSocket => {
             let url = broker_ws_url(AuthMode::ValidJwt);
-            FitzClient::connect_ws(&url, REALM, secret)
+            FitzClient::connect_ws(&url, &token)
         }
     }
 }

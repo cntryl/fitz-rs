@@ -5,7 +5,9 @@
 //!
 //! Tests can be configured to run against specific transports or both.
 
-use cntryl::protocol::TransactionMode;
+mod jwt;
+
+use cntryl::TransactionMode;
 use cntryl::{FitzClient, FitzError};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -34,9 +36,10 @@ fn connect_client(
     realm: &str,
     secret: &str,
 ) -> Result<FitzClient, FitzError> {
+    let token = jwt::make_test_jwt(realm, secret);
     match transport {
-        Transport::Tcp => FitzClient::connect_tcp("127.0.0.1", 4091, realm, secret),
-        Transport::WebSocket => FitzClient::connect_ws("ws://127.0.0.1:4090/ws", realm, secret),
+        Transport::Tcp => FitzClient::connect_tcp("127.0.0.1", 4091, &token),
+        Transport::WebSocket => FitzClient::connect_ws("ws://127.0.0.1:4090/ws", &token),
     }
 }
 

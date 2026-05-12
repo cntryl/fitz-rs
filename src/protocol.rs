@@ -1,5 +1,7 @@
 //! Wire protocol constants and types
 
+#![allow(dead_code)]
+
 pub mod message_type {
     // Control channel messages (0-99)
     pub const CONNECT: u16 = 1;

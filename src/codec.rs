@@ -3,6 +3,8 @@
 //! Matches the server's payload_codec format (not TLV; fixed-order typed fields).
 //! Frame-level encode/decode is in `encode_message_frame` / `decode_message_frame`.
 
+#![allow(dead_code)]
+
 use crate::error::{FitzError, Result};
 
 /// Encoder for message payloads (sequential typed fields).

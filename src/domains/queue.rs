@@ -11,8 +11,8 @@ use std::time::Duration;
 /// Reserved queue item with helper methods for lease extension and completion.
 pub struct QueueItem {
     pub route: String,
-    pub id: u64,
-    pub token: u64,
+    id: u64,
+    token: u64,
     pub body: Vec<u8>,
     conn: SharedConnection,
 }

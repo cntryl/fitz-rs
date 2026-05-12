@@ -17,7 +17,7 @@ pub struct RpcResponseFrame {
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Inbound worker request data for a registered RPC route.
 pub struct RpcInboundRequest {
-    pub correlation_id: [u8; 16],
+    correlation_id: [u8; 16],
     pub route: String,
     pub reply_route: String,
     pub body: Vec<u8>,
@@ -171,7 +171,7 @@ impl RpcWorkerRegistration {
 /// Mutable worker request context used to send streamed responses.
 pub struct RpcWorkerRequest {
     conn: SharedConnection,
-    pub correlation_id: [u8; 16],
+    correlation_id: [u8; 16],
     pub route: String,
     pub reply_route: String,
     pub body: Vec<u8>,
