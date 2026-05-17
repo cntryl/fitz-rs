@@ -389,7 +389,7 @@ mod tests {
 
         let mut conn = FitzConnection::connect_tcp("127.0.0.1", port).unwrap();
         conn.set_timeout(Duration::from_secs(1)).unwrap();
-        let client = QueueClient::new(SharedConnection::new(conn));
+        let client = QueueClient::new(SharedConnection::new(conn, 256));
 
         let err = match client.reserve_with_timeout(
             "queue://test-realm/app/jobs",

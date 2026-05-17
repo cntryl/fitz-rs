@@ -44,11 +44,7 @@ impl RpcClient {
         enc.put_string("");
         enc.put_bytes(body);
 
-        self.conn
-            .send_only(message_type::RPC_REQUEST, &enc.finish())?;
-        let (_, resp) = self.conn.recv_message_matching(|msg_type, _payload| {
-            msg_type == message_type::RPC_REQUEST || msg_type == message_type::RPC_ACK
-        })?;
+        let resp = self.conn.send_request(message_type::RPC_REQUEST, &enc.finish())?;
         decode_rpc_status_response("CALL", &resp)?;
 
         Ok(RpcResponseStream {

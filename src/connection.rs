@@ -8,7 +8,7 @@ use crate::codec::{decode_message_frame, try_encode_message_frame};
 use crate::error::{FitzError, Result};
 use crate::protocol::message_type;
 use crate::transport::{AnyTransport, Transport};
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::{Condvar, Mutex, MutexGuard};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
@@ -95,6 +95,52 @@ impl FitzConnection {
     }
 }
 
+struct RequestGate {
+    active: Mutex<usize>,
+    max_in_flight_requests: usize,
+    wakeup: Condvar,
+}
+
+impl RequestGate {
+    fn new(max_in_flight_requests: usize) -> Self {
+        Self {
+            active: Mutex::new(0),
+            max_in_flight_requests: max_in_flight_requests.max(1),
+            wakeup: Condvar::new(),
+        }
+    }
+
+    fn acquire(self: &Arc<Self>) -> RequestPermit {
+        let mut active = self.active.lock();
+        while *active >= self.max_in_flight_requests {
+            self.wakeup.wait(&mut active);
+        }
+
+        *active += 1;
+        RequestPermit {
+            gate: Arc::clone(self),
+        }
+    }
+
+    fn release(&self) {
+        let mut active = self.active.lock();
+        if *active > 0 {
+            *active -= 1;
+        }
+        self.wakeup.notify_one();
+    }
+}
+
+struct RequestPermit {
+    gate: Arc<RequestGate>,
+}
+
+impl Drop for RequestPermit {
+    fn drop(&mut self) {
+        self.gate.release();
+    }
+}
+
 /// Thread-safe connection handle shared across domain clients.
 ///
 /// Provides `send_request` which encapsulates the entire
@@ -104,13 +150,15 @@ impl FitzConnection {
 pub struct SharedConnection {
     inner: Arc<Mutex<FitzConnection>>,
     deferred_frames: Arc<Mutex<VecDeque<(u16, Vec<u8>)>>>,
+    request_gate: Arc<RequestGate>,
 }
 
 impl SharedConnection {
-    pub fn new(conn: FitzConnection) -> Self {
+    pub fn new(conn: FitzConnection, max_in_flight_requests: usize) -> Self {
         Self {
             inner: Arc::new(Mutex::new(conn)),
             deferred_frames: Arc::new(Mutex::new(VecDeque::new())),
+            request_gate: Arc::new(RequestGate::new(max_in_flight_requests)),
         }
     }
 
@@ -119,6 +167,7 @@ impl SharedConnection {
     /// This is the single point of encode→send→recv→decode for the entire client.
     /// Domain methods call this instead of manually locking, framing, and stripping.
     pub fn send_request(&self, msg_type: u16, payload: &[u8]) -> Result<Vec<u8>> {
+        let _permit = self.request_gate.acquire();
         let frame = try_encode_message_frame(msg_type, payload)?;
         {
             let mut conn = self.lock();
@@ -156,6 +205,7 @@ impl SharedConnection {
 
     /// Send a frame with no response expected (fire-and-forget, e.g. CONNECT).
     pub fn send_only(&self, msg_type: u16, payload: &[u8]) -> Result<()> {
+        let _permit = self.request_gate.acquire();
         let frame = try_encode_message_frame(msg_type, payload)?;
         let mut conn = self.lock();
         conn.send_frame(&frame)
@@ -386,7 +436,7 @@ mod tests {
 
         let mut conn = FitzConnection::connect_tcp("127.0.0.1", port).unwrap();
         conn.set_timeout(Duration::from_secs(1)).unwrap();
-        let shared = SharedConnection::new(conn);
+        let shared = SharedConnection::new(conn, 256);
 
         let err = shared
             .send_request_with_timeout(41, b"slow", Duration::from_millis(50))

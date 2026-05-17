@@ -43,6 +43,7 @@ enum ClientAuth {
 pub struct FitzClientBuilder {
     auth: ClientAuth,
     timeout: Duration,
+    max_in_flight_requests: usize,
 }
 
 impl FitzClientBuilder {
@@ -50,6 +51,7 @@ impl FitzClientBuilder {
         Self {
             auth: ClientAuth::Token(token.to_string()),
             timeout: Duration::from_secs(30),
+            max_in_flight_requests: 256,
         }
     }
 
@@ -57,12 +59,19 @@ impl FitzClientBuilder {
         Self {
             auth: ClientAuth::Anonymous,
             timeout: Duration::from_secs(30),
+            max_in_flight_requests: 256,
         }
     }
 
     /// Set connection timeout.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Set the maximum number of in-flight requests allowed on this client.
+    pub fn with_max_in_flight_requests(mut self, max_in_flight_requests: usize) -> Self {
+        self.max_in_flight_requests = max_in_flight_requests.max(1);
         self
     }
 
@@ -80,7 +89,7 @@ impl FitzClientBuilder {
 
     fn finish(self, mut conn: FitzConnection) -> Result<FitzClient> {
         conn.set_timeout(self.timeout)?;
-        let shared = SharedConnection::new(conn);
+        let shared = SharedConnection::new(conn, self.max_in_flight_requests);
 
         // Send the caller-provided token directly. Token generation is owned by
         // the application or tests, not the SDK.
@@ -190,16 +199,20 @@ impl FitzClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
+    use crate::codec::{decode_message_frame, encode_message_frame};
+    use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::sync::Arc;
     use std::thread;
 
-    fn read_length_prefixed_frame(stream: &mut std::net::TcpStream) {
+    fn read_length_prefixed_frame(stream: &mut std::net::TcpStream) -> Vec<u8> {
         let mut len_buf = [0u8; 4];
         stream.read_exact(&mut len_buf).unwrap();
         let len = u32::from_be_bytes(len_buf) as usize;
         let mut frame = vec![0u8; len];
         stream.read_exact(&mut frame).unwrap();
+        frame
     }
 
     #[test]
@@ -235,5 +248,83 @@ mod tests {
 
         client.close().unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn should_bound_concurrent_outbound_requests_given_max_one_when_second_request_starts() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let (first_request_seen_tx, first_request_seen_rx) = mpsc::channel();
+        let (allow_first_response_tx, allow_first_response_rx) = mpsc::channel();
+        let (second_request_seen_tx, second_request_seen_rx) = mpsc::channel();
+
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            read_length_prefixed_frame(&mut socket);
+
+            let first_frame = read_length_prefixed_frame(&mut socket);
+            let (first_msg_type, _) = decode_message_frame(&first_frame).unwrap();
+            first_request_seen_tx.send(()).unwrap();
+
+            allow_first_response_rx.recv().unwrap();
+            let mut first_payload = vec![0u8];
+            first_payload.extend_from_slice(&1u64.to_be_bytes());
+            write_length_prefixed_frame(
+                &mut socket,
+                &encode_message_frame(first_msg_type, &first_payload),
+            );
+
+            let second_frame = read_length_prefixed_frame(&mut socket);
+            let (second_msg_type, _) = decode_message_frame(&second_frame).unwrap();
+            second_request_seen_tx.send(()).unwrap();
+
+            let mut second_payload = vec![0u8];
+            second_payload.extend_from_slice(&2u64.to_be_bytes());
+            write_length_prefixed_frame(
+                &mut socket,
+                &encode_message_frame(second_msg_type, &second_payload),
+            );
+        });
+
+        let client = Arc::new(
+            FitzClient::builder("secret")
+                .with_max_in_flight_requests(1)
+                .connect_tcp("127.0.0.1", port)
+                .unwrap(),
+        );
+
+        let first_client = Arc::clone(&client);
+        let first = thread::spawn(move || {
+            let _tx = first_client
+                .kv()
+                .begin("kv://my-realm/app/users", TransactionMode::ReadWrite)
+                .unwrap();
+        });
+
+        first_request_seen_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let second_client = Arc::clone(&client);
+        let second = thread::spawn(move || {
+            let _tx = second_client
+                .kv()
+                .begin("kv://my-realm/app/users-2", TransactionMode::ReadWrite)
+                .unwrap();
+        });
+
+        assert!(second_request_seen_rx.recv_timeout(Duration::from_millis(100)).is_err());
+
+        allow_first_response_tx.send(()).unwrap();
+
+        first.join().unwrap();
+        second.join().unwrap();
+        server.join().unwrap();
+    }
+
+    fn write_length_prefixed_frame(stream: &mut std::net::TcpStream, frame: &[u8]) {
+        let len = frame.len() as u32;
+        stream.write_all(&len.to_be_bytes()).unwrap();
+        stream.write_all(frame).unwrap();
+        stream.flush().unwrap();
     }
 }
