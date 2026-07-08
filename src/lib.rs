@@ -321,6 +321,134 @@ mod tests {
         server.join().unwrap();
     }
 
+    #[test]
+    fn should_not_cross_route_same_type_responses_between_concurrent_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (first_request_seen_tx, first_request_seen_rx) = mpsc::channel();
+        let (second_request_seen_tx, second_request_seen_rx) = mpsc::channel();
+
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+
+            // CONNECT frame
+            read_length_prefixed_frame(&mut socket);
+
+            // First request (no explicit sync for payload assertions)
+            let first_request = read_length_prefixed_frame(&mut socket);
+            let (first_msg_type, _) = decode_message_frame(&first_request).unwrap();
+            first_request_seen_tx.send(()).unwrap();
+
+            // Second request before responding to exercise request queueing.
+            let second_request = read_length_prefixed_frame(&mut socket);
+            let (second_msg_type, _) = decode_message_frame(&second_request).unwrap();
+            second_request_seen_tx.send(()).unwrap();
+
+            let mut first_resp = vec![0xA];
+            first_resp[0] ^= 0;
+            write_length_prefixed_frame(
+                &mut socket,
+                &encode_message_frame(second_msg_type, &first_resp),
+            );
+
+            let mut second_resp = vec![0xB];
+            second_resp[0] ^= 0;
+            write_length_prefixed_frame(
+                &mut socket,
+                &encode_message_frame(first_msg_type, &second_resp),
+            );
+        });
+
+        let client = FitzClient::builder("secret")
+            .with_max_in_flight_requests(2)
+            .connect_tcp("127.0.0.1", port)
+            .unwrap();
+
+        let first_client = Arc::new(client);
+        let first_sender = Arc::clone(&first_client);
+        let first = thread::spawn(move || {
+            first_sender
+                .connection
+                .send_request(100, &[0x11])
+                .expect("first request failed")
+        });
+
+        first_request_seen_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let second_client = Arc::clone(&first_client);
+        let second = thread::spawn(move || {
+            second_client
+                .connection
+                .send_request(100, &[0x22])
+                .expect("second request failed")
+        });
+
+        second_request_seen_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let first_response = first.join().unwrap();
+        let second_response = second.join().unwrap();
+        server.join().unwrap();
+
+        assert_eq!(first_response, vec![0xA]);
+        assert_eq!(second_response, vec![0xB]);
+    }
+
+    #[test]
+    fn should_drop_stale_response_after_request_timeout_when_requests_are_queued() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+
+            // CONNECT frame
+            read_length_prefixed_frame(&mut socket);
+
+            // First request
+            read_length_prefixed_frame(&mut socket);
+
+            // Second request sent after first request times out and releases the permit
+            read_length_prefixed_frame(&mut socket);
+
+            // Stale response for the timed-out first request.
+            thread::sleep(Duration::from_millis(50));
+            write_length_prefixed_frame(&mut socket, &encode_message_frame(100, &[0xAA]));
+
+            // Response intended for the second request.
+            thread::sleep(Duration::from_millis(10));
+            write_length_prefixed_frame(&mut socket, &encode_message_frame(100, &[0xBB]));
+        });
+
+        let client = FitzClient::builder("secret")
+            .with_timeout(Duration::from_millis(200))
+            .with_max_in_flight_requests(1)
+            .connect_tcp("127.0.0.1", port)
+            .unwrap();
+
+        let first = thread::spawn({
+            let conn = client.connection.clone();
+            move || {
+                conn.send_request_with_timeout(100, &[0x11], Duration::from_millis(20))
+                    .expect_err("first request should timeout")
+            }
+        });
+
+        thread::sleep(Duration::from_millis(10));
+
+        let second = thread::spawn({
+            let conn = client.connection.clone();
+            move || conn.send_request(100, &[0x22])
+        });
+
+        let first_err = first.join().unwrap();
+        assert!(matches!(first_err, FitzError::Timeout));
+
+        let second_response = second.join().unwrap().unwrap();
+        assert_eq!(second_response, vec![0xBB]);
+
+        server.join().unwrap();
+    }
+
     fn write_length_prefixed_frame(stream: &mut std::net::TcpStream, frame: &[u8]) {
         let len = frame.len() as u32;
         stream.write_all(&len.to_be_bytes()).unwrap();
