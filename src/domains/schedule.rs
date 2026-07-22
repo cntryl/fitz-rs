@@ -12,7 +12,29 @@ pub struct ScheduleEntry {
     pub id: String,
     pub route: String,
     pub cron: String,
+    pub delivery_mode: ScheduleDeliveryMode,
     pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ScheduleDeliveryMode {
+    Broadcast = 0,
+    Single = 1,
+}
+
+impl TryFrom<u8> for ScheduleDeliveryMode {
+    type Error = FitzError;
+
+    fn try_from(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Broadcast),
+            1 => Ok(Self::Single),
+            _ => Err(FitzError::Protocol(format!(
+                "invalid schedule delivery mode: {value}"
+            ))),
+        }
+    }
 }
 
 /// Schedule domain client for create/cancel/list and subscriptions.
@@ -29,12 +51,19 @@ impl ScheduleClient {
     ///
     /// # Errors
     /// Returns an error when validation, encoding, transport, or broker processing fails.
-    pub fn create(&self, route: &str, cron: &str, payload: &[u8]) -> Result<String> {
+    pub fn create(
+        &self,
+        route: &str,
+        cron: &str,
+        delivery_mode: ScheduleDeliveryMode,
+        payload: &[u8],
+    ) -> Result<String> {
         validate_schedule_route(route)?;
 
         let mut enc = PayloadEncoder::new();
         enc.put_string(route);
         enc.put_string(cron);
+        enc.put_u8(delivery_mode as u8);
         enc.put_bytes(payload);
 
         let resp = self
@@ -118,11 +147,13 @@ impl ScheduleClient {
 
             let route = dec.get_string()?;
             let cron = dec.get_string()?;
+            let delivery_mode = ScheduleDeliveryMode::try_from(dec.get_u8()?)?;
             let payload = dec.get_bytes()?;
             entries.push(ScheduleEntry {
                 id: route.clone(),
                 route,
                 cron,
+                delivery_mode,
                 payload,
             });
         }
@@ -206,10 +237,12 @@ fn decode_schedule_success<'a>(operation: &str, buf: &'a [u8]) -> Result<Payload
     match status {
         0 => Ok(dec),
         1 => {
+            let code = dec.get_u32()?;
             let message = dec.get_string()?;
-            Err(FitzError::DomainError(format!(
-                "{operation} failed: {message}"
-            )))
+            Err(FitzError::Domain {
+                code,
+                message: format!("{operation} failed: {message}"),
+            })
         }
         other => Err(FitzError::Protocol(format!(
             "{operation} failed with unknown status byte: {other}"
@@ -258,6 +291,7 @@ mod tests {
         buf.extend_from_slice(b"schedule://a/b/c/d");
         buf.extend_from_slice(&(5u32).to_be_bytes());
         buf.extend_from_slice(b"* * *");
+        buf.push(ScheduleDeliveryMode::Single as u8);
         buf.extend_from_slice(&(4u32).to_be_bytes());
         buf.extend_from_slice(b"fire");
         buf.push(0);
@@ -269,6 +303,7 @@ mod tests {
         assert_eq!(dec.get_u8().unwrap(), 1);
         assert_eq!(dec.get_string().unwrap(), "schedule://a/b/c/d");
         assert_eq!(dec.get_string().unwrap(), "* * *");
+        assert_eq!(dec.get_u8().unwrap(), 1);
         assert_eq!(dec.get_bytes().unwrap(), b"fire");
         assert_eq!(dec.get_u8().unwrap(), 0);
     }
@@ -307,5 +342,22 @@ mod tests {
         let notification = decode_schedule_notify(&buf).unwrap();
         // Assert
         assert_eq!(notification.payload, b"fire");
+    }
+
+    #[test]
+    fn should_preserve_schedule_domain_error_code() {
+        // Arrange
+        let mut buf = vec![1];
+        buf.extend_from_slice(&7008u32.to_be_bytes());
+        buf.extend_from_slice(&21u32.to_be_bytes());
+        buf.extend_from_slice(b"invalid delivery mode");
+
+        // Act
+        let Err(error) = decode_schedule_success("CREATE", &buf) else {
+            panic!("expected domain error");
+        };
+
+        // Assert
+        assert!(matches!(error, FitzError::Domain { code: 7008, .. }));
     }
 }
