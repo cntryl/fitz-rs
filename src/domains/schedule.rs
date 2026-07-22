@@ -21,10 +21,14 @@ pub struct ScheduleClient {
 }
 
 impl ScheduleClient {
+    #[must_use]
     pub fn new(conn: SharedConnection) -> Self {
         Self { conn }
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn create(&self, route: &str, cron: &str, payload: &[u8]) -> Result<String> {
         validate_schedule_route(route)?;
 
@@ -50,6 +54,9 @@ impl ScheduleClient {
         }
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn cancel(&self, route: &str) -> Result<()> {
         validate_schedule_route(route)?;
 
@@ -64,6 +71,9 @@ impl ScheduleClient {
         Ok(())
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn list(
         &self,
         offset: Option<u64>,
@@ -120,6 +130,9 @@ impl ScheduleClient {
         Ok((entries, total_count))
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn subscribe(&self, pattern: &str) -> Result<ScheduleSubscription> {
         validate_schedule_route(pattern)?;
 
@@ -147,21 +160,27 @@ pub struct ScheduleSubscription {
 }
 
 impl ScheduleSubscription {
+    #[must_use]
     pub fn subscription_id(&self) -> u64 {
         self.subscription_id
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn next(&self) -> Result<ScheduleNotification> {
         let (_, payload) = self.conn.recv_message_matching(|msg_type, payload| {
             msg_type == message_type::SCHEDULE_NOTIFY
                 && decode_schedule_notify_subscription_id(payload)
-                    .map(|sub_id| sub_id == self.subscription_id)
-                    .unwrap_or(false)
+                    .is_ok_and(|sub_id| sub_id == self.subscription_id)
         })?;
 
         decode_schedule_notify(&payload)
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn unsubscribe(&self) -> Result<()> {
         let mut enc = PayloadEncoder::new();
         enc.put_string(&self.pattern);

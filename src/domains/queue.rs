@@ -18,6 +18,9 @@ pub struct QueueItem {
 }
 
 impl QueueItem {
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn extend(&self, lease_seconds: u64) -> Result<()> {
         validate_fixed_route(&self.route, "queue", 3)?;
 
@@ -34,6 +37,9 @@ impl QueueItem {
         decode_empty_ok_response("EXTEND", &resp)
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn complete(&self) -> Result<()> {
         validate_fixed_route(&self.route, "queue", 3)?;
 
@@ -56,10 +62,14 @@ pub struct QueueClient {
 }
 
 impl QueueClient {
+    #[must_use]
     pub fn new(conn: SharedConnection) -> Self {
         Self { conn }
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn enqueue(&self, route: &str, body: &[u8], delay_ms: Option<u64>) -> Result<u64> {
         validate_fixed_route(route, "queue", 3)?;
 
@@ -68,7 +78,7 @@ impl QueueClient {
         enc.put_bytes(body);
 
         let delay_seconds = delay_ms.unwrap_or(0) / 1000;
-        enc.put_u8((delay_seconds > 0) as u8);
+        enc.put_u8(u8::from(delay_seconds > 0));
         if delay_seconds > 0 {
             enc.put_u64(delay_seconds);
         }
@@ -80,6 +90,9 @@ impl QueueClient {
         decode_enqueue_response(&resp)
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn reserve(
         &self,
         route: &str,
@@ -90,6 +103,9 @@ impl QueueClient {
         self.reserve_with_timeout(route, lease_seconds, batch_size, wait_seconds, None)
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn reserve_with_timeout(
         &self,
         route: &str,
@@ -130,9 +146,12 @@ impl QueueClient {
                 .send_request(message_type::QUEUE_RESERVE, &payload)?,
         };
 
-        decode_reserve_response(route, &resp, self.conn.clone())
+        decode_reserve_response(route, &resp, &self.conn)
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn extend(&self, route: &str, id: u64, token: u64, lease_seconds: u64) -> Result<()> {
         validate_fixed_route(route, "queue", 3)?;
 
@@ -149,6 +168,9 @@ impl QueueClient {
         decode_empty_ok_response("EXTEND", &resp)
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn complete(&self, route: &str, id: u64, token: u64) -> Result<()> {
         validate_fixed_route(route, "queue", 3)?;
 
@@ -164,6 +186,9 @@ impl QueueClient {
         decode_empty_ok_response("COMPLETE", &resp)
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn subscribe(&self, pattern: &str) -> Result<QueueSubscription> {
         validate_selector_route(pattern, "queue", 3, true)?;
 
@@ -191,21 +216,27 @@ pub struct QueueSubscription {
 }
 
 impl QueueSubscription {
+    #[must_use]
     pub fn subscription_id(&self) -> u64 {
         self.subscription_id
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn next(&self) -> Result<QueueNotification> {
         let (_, payload) = self.conn.recv_message_matching(|msg_type, payload| {
             msg_type == message_type::QUEUE_NOTIFY
                 && decode_notify_subscription_id(payload)
-                    .map(|sub_id| sub_id == self.subscription_id)
-                    .unwrap_or(false)
+                    .is_ok_and(|sub_id| sub_id == self.subscription_id)
         })?;
 
         decode_queue_notify(&payload)
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn unsubscribe(&self) -> Result<()> {
         let mut enc = PayloadEncoder::new();
         enc.put_string(&self.pattern);
@@ -238,7 +269,7 @@ fn decode_enqueue_response(buf: &[u8]) -> Result<u64> {
 fn decode_reserve_response(
     route: &str,
     buf: &[u8],
-    conn: SharedConnection,
+    conn: &SharedConnection,
 ) -> Result<Vec<QueueItem>> {
     let mut dec = PayloadDecoder::new(buf);
     let status = dec.get_u8()?;
@@ -391,15 +422,14 @@ mod tests {
         conn.set_timeout(Duration::from_secs(1)).unwrap();
         let client = QueueClient::new(SharedConnection::new(conn, 256));
 
-        let err = match client.reserve_with_timeout(
+        let Err(err) = client.reserve_with_timeout(
             "queue://test-realm/app/jobs",
             30,
             Some(1),
             Some(60),
             Some(Duration::from_millis(50)),
-        ) {
-            Ok(_) => panic!("reserve unexpectedly succeeded"),
-            Err(err) => err,
+        ) else {
+            panic!("reserve unexpectedly succeeded");
         };
 
         assert!(matches!(err, FitzError::Timeout));

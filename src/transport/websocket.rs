@@ -41,10 +41,9 @@ impl WebSocketTransport {
         &mut self,
         read_timeout: Option<Duration>,
         write_timeout: Option<Duration>,
-    ) -> io::Result<()> {
+    ) {
         self.read_timeout = read_timeout;
         self.write_timeout = write_timeout;
-        Ok(())
     }
 }
 
@@ -91,7 +90,7 @@ impl Transport for WebSocketTransport {
                                 "Server closed connection",
                             ));
                         }
-                        Some(Ok(_)) => continue,
+                        Some(Ok(_)) => {}
                         Some(Err(e)) => return Err(io::Error::other(e)),
                         None => {
                             return Err(io::Error::new(
@@ -117,7 +116,8 @@ impl Transport for WebSocketTransport {
         read_timeout: Option<Duration>,
         write_timeout: Option<Duration>,
     ) -> io::Result<()> {
-        WebSocketTransport::set_timeouts(self, read_timeout, write_timeout)
+        WebSocketTransport::set_timeouts(self, read_timeout, write_timeout);
+        Ok(())
     }
 
     fn close(&mut self) -> io::Result<()> {

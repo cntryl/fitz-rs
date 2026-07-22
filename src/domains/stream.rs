@@ -20,6 +20,7 @@ pub enum StreamCommitMode {
 pub struct StreamDiscriminator(pub String);
 
 impl StreamDiscriminator {
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -64,10 +65,12 @@ pub struct StreamFilterSet {
 }
 
 impl StreamFilterSet {
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.clauses.is_empty()
     }
 
+    #[must_use]
     pub fn matches(&self, discriminator: Option<&str>) -> bool {
         let discriminator = discriminator.unwrap_or("");
         self.clauses
@@ -161,10 +164,14 @@ pub struct StreamClient {
 }
 
 impl StreamClient {
+    #[must_use]
     pub fn new(conn: SharedConnection) -> Self {
         Self { conn }
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn begin(&self, route: &str, ingest_metadata: Option<&[u8]>) -> Result<StreamSession> {
         validate_fixed_route(route, "stream", 3)?;
 
@@ -195,6 +202,9 @@ impl StreamClient {
         })
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn read(
         &self,
         route: &str,
@@ -239,6 +249,9 @@ impl StreamClient {
         ))
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn read_page(
         &self,
         route: &str,
@@ -281,6 +294,9 @@ impl StreamClient {
         parse_stream_read_page(&decoded.data)
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn peek(&self, route: &str) -> Result<Option<StreamRecord>> {
         validate_fixed_route(route, "stream", 3)?;
 
@@ -294,6 +310,9 @@ impl StreamClient {
         parse_stream_record(&decoded.data)
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn metadata(&self, route: &str) -> Result<StreamMetadata> {
         validate_fixed_route(route, "stream", 3)?;
 
@@ -321,6 +340,9 @@ impl StreamClient {
         decode_stream_metadata(&decoded.data)
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn subscribe(&self, pattern: &str) -> Result<StreamSubscription> {
         validate_selector_route(pattern, "stream", 3, true)?;
 
@@ -387,10 +409,14 @@ pub struct StreamSession {
 }
 
 impl StreamSession {
+    #[must_use]
     pub fn session_id(&self) -> u64 {
         self.session_id
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn append(
         &mut self,
         expected_offset: u64,
@@ -437,6 +463,9 @@ impl StreamSession {
         Ok(Some(dec.get_u64()?))
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn commit(mut self, mode: StreamCommitMode) -> Result<()> {
         self.ensure_active("COMMIT")?;
 
@@ -452,6 +481,9 @@ impl StreamSession {
         Ok(())
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn rollback(mut self) -> Result<()> {
         self.ensure_active("ROLLBACK")?;
 
@@ -484,21 +516,27 @@ pub struct StreamSubscription {
 }
 
 impl StreamSubscription {
+    #[must_use]
     pub fn subscription_id(&self) -> u64 {
         self.subscription_id
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn next(&self) -> Result<StreamCommitNotification> {
         let (_, payload) = self.conn.recv_message_matching(|msg_type, payload| {
             msg_type == message_type::STREAM_NOTIFY
                 && decode_stream_notify_subscription_id(payload)
-                    .map(|subscription_id| subscription_id == self.subscription_id)
-                    .unwrap_or(false)
+                    .is_ok_and(|subscription_id| subscription_id == self.subscription_id)
         })?;
 
         decode_stream_notify(&payload)
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn unsubscribe(&self) -> Result<()> {
         let mut enc = PayloadEncoder::new();
         enc.put_string(&self.pattern);
@@ -934,7 +972,7 @@ mod tests {
         buf.extend_from_slice(&42u64.to_be_bytes());
         buf.extend_from_slice(&(21u32).to_be_bytes());
         buf.extend_from_slice(b"stream://realm/area/x");
-        buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
         buf.extend_from_slice(payload);
 
         let notification = decode_stream_notify(&buf).unwrap();

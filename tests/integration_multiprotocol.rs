@@ -22,7 +22,7 @@ enum Transport {
 }
 
 impl Transport {
-    fn name(&self) -> &'static str {
+    fn name(self) -> &'static str {
         match self {
             Transport::Tcp => "TCP",
             Transport::WebSocket => "WebSocket",

@@ -13,7 +13,7 @@ pub struct TcpTransport {
 impl TcpTransport {
     /// Connect to a TCP server
     pub fn connect(host: &str, port: u16) -> std::io::Result<Self> {
-        let addr = format!("{}:{}", host, port);
+        let addr = format!("{host}:{port}");
         let stream = TcpStream::connect(&addr)?;
 
         // Set timeouts
@@ -47,7 +47,9 @@ impl TcpTransport {
 impl Transport for TcpTransport {
     fn send_frame(&mut self, frame: &[u8]) -> std::io::Result<()> {
         // TCP frame format: [u32 BE length][payload]
-        let len = frame.len() as u32;
+        let len = u32::try_from(frame.len()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "frame exceeds u32")
+        })?;
         self.stream.write_all(&len.to_be_bytes())?;
         self.stream.write_all(frame)?;
         self.stream.flush()?;

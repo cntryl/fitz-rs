@@ -15,10 +15,12 @@ struct TestTokenClaims {
     permissions: Vec<String>,
 }
 
+#[must_use]
 pub fn make_test_jwt(realm: &str, secret: &str) -> String {
     make_signed_jwt(realm, secret)
 }
 
+#[must_use]
 pub fn make_invalid_jwt(realm: &str, secret: &str) -> String {
     make_signed_jwt(realm, &format!("{secret}-invalid"))
 }

@@ -54,7 +54,10 @@ impl Transport for AnyTransport {
     ) -> io::Result<()> {
         match self {
             AnyTransport::Tcp(t) => t.set_timeouts(read_timeout, write_timeout),
-            AnyTransport::WebSocket(t) => t.set_timeouts(read_timeout, write_timeout),
+            AnyTransport::WebSocket(t) => {
+                t.set_timeouts(read_timeout, write_timeout);
+                Ok(())
+            }
         }
     }
 

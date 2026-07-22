@@ -67,7 +67,7 @@ impl TestTokenGenerator {
             &claims,
             &EncodingKey::from_secret(self.secret.as_bytes()),
         )
-        .map_err(|e| FitzError::AuthFailed(format!("JWT encode failed: {}", e)))
+        .map_err(|e| FitzError::AuthFailed(format!("JWT encode failed: {e}")))
     }
 }
 

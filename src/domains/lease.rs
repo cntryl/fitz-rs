@@ -52,6 +52,7 @@ pub struct LeaseClient {
 }
 
 impl LeaseClient {
+    #[must_use]
     pub fn new(conn: SharedConnection) -> Self {
         Self { conn }
     }
@@ -62,6 +63,9 @@ impl LeaseClient {
     /// `"lease://prod/locks/leader-election"`.
     ///
     /// Returns the fencing token on success.
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn acquire(&self, route: &str, owner_id: &str, ttl_secs: u64) -> Result<LeaseGrant> {
         validate_fixed_route(route, "lease", 3)?;
 
@@ -86,6 +90,9 @@ impl LeaseClient {
     ///
     /// `fencing_token` must match the token returned by a previous acquire/extend.
     /// Returns the (possibly new) fencing token.
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn extend(
         &self,
         route: &str,
@@ -116,6 +123,9 @@ impl LeaseClient {
     /// Release a lease.
     ///
     /// `fencing_token` must match the current token.
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn release(&self, route: &str, owner_id: &str, fencing_token: u64) -> Result<()> {
         validate_fixed_route(route, "lease", 3)?;
 
@@ -135,6 +145,9 @@ impl LeaseClient {
     /// Query lease status.
     ///
     /// Returns whether the lease is held (with fencing token) or free.
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn query(&self, route: &str) -> Result<LeaseStatus> {
         validate_fixed_route(route, "lease", 3)?;
 
@@ -189,8 +202,7 @@ fn decode_success_response(buf: &[u8]) -> Result<Option<u64>> {
             Err(FitzError::DomainError(msg))
         }
         _ => Err(FitzError::Protocol(format!(
-            "Unknown response status byte: {}",
-            status
+            "Unknown response status byte: {status}"
         ))),
     }
 }
@@ -221,7 +233,7 @@ mod tests {
         // [status=1][u32 len=9]["Not found"]
         let msg = b"Not found";
         let mut buf = vec![0x01];
-        buf.extend_from_slice(&(msg.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&u32::try_from(msg.len()).unwrap().to_be_bytes());
         buf.extend_from_slice(msg);
         let err = decode_success_response(&buf).unwrap_err();
         assert!(err.to_string().contains("Not found"));

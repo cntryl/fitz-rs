@@ -19,10 +19,14 @@ pub struct NoticeClient {
 }
 
 impl NoticeClient {
+    #[must_use]
     pub fn new(conn: SharedConnection) -> Self {
         Self { conn }
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn publish(&self, route: &str, body: &[u8]) -> Result<()> {
         validate_fixed_route(route, "notice", 3)?;
 
@@ -37,6 +41,9 @@ impl NoticeClient {
         decode_notice_response("PUBLISH", &resp)
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn subscribe(&self, pattern: &str) -> Result<NoticeSubscription> {
         validate_selector_route(pattern, "notice", 3, true)?;
 
@@ -54,6 +61,9 @@ impl NoticeClient {
         })
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn unsubscribe_all(&self) -> Result<()> {
         let resp = self
             .conn
@@ -70,21 +80,27 @@ pub struct NoticeSubscription {
 }
 
 impl NoticeSubscription {
+    #[must_use]
     pub fn subscription_id(&self) -> u64 {
         self.subscription_id
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn next(&self) -> Result<NoticeMessage> {
         let (_, payload) = self.conn.recv_message_matching(|msg_type, payload| {
             msg_type == message_type::NOTICE_NOTIFY
                 && decode_notify_subscription_id(payload)
-                    .map(|sub_id| sub_id == self.subscription_id)
-                    .unwrap_or(false)
+                    .is_ok_and(|sub_id| sub_id == self.subscription_id)
         })?;
 
         decode_notice_notify(&payload)
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn unsubscribe(&self) -> Result<()> {
         let mut enc = PayloadEncoder::new();
         enc.put_u64(self.subscription_id);

@@ -16,9 +16,9 @@
 //!
 //! ### Responses
 //!
-//! BeginOk:    `[u8 0][u64 tx_id]`
+//! `BeginOk`:    `[u8 0][u64 tx_id]`
 //! Ok (empty): `[u8 0]`
-//! GetResult:  `[u8 0][u8 found][u32 value_len][value bytes]`
+//! `GetResult`:  `[u8 0][u8 found][u32 value_len][value bytes]`
 //! Error:      `[u8 1][u32 error_len][error_msg UTF-8]`
 
 use crate::codec::{PayloadDecoder, PayloadEncoder};
@@ -36,6 +36,7 @@ pub struct KvClient {
 }
 
 impl KvClient {
+    #[must_use]
     pub fn new(conn: SharedConnection) -> Self {
         Self { conn }
     }
@@ -45,7 +46,10 @@ impl KvClient {
     /// `route` is a fully-qualified opaque route string, e.g.
     /// `"kv://prod/app/users"`.
     ///
-    /// Returns a `KvTransaction` which holds the tx_id and route internally.
+    /// Returns a `KvTransaction` which holds the `tx_id` and route internally.
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn begin(&self, route: &str, mode: TransactionMode) -> Result<KvTransaction> {
         validate_fixed_route(route, "kv", 3)?;
 
@@ -92,6 +96,9 @@ impl KvTransaction {
     /// Get a value by key.
     ///
     /// Returns `Ok(None)` when the key does not exist.
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let mut enc = PayloadEncoder::new();
         enc.put_u64(self.tx_id);
@@ -120,6 +127,9 @@ impl KvTransaction {
     }
 
     /// Put a key-value pair.
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         let mut enc = PayloadEncoder::new();
         enc.put_u64(self.tx_id);
@@ -135,6 +145,9 @@ impl KvTransaction {
     }
 
     /// Delete a key.
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn delete(&self, key: &[u8]) -> Result<()> {
         let mut enc = PayloadEncoder::new();
         enc.put_u64(self.tx_id);
@@ -149,6 +162,9 @@ impl KvTransaction {
     }
 
     /// Commit the transaction (consumes self).
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn commit(self) -> Result<()> {
         let mut enc = PayloadEncoder::new();
         enc.put_u64(self.tx_id);
@@ -162,6 +178,9 @@ impl KvTransaction {
     }
 
     /// Rollback the transaction (consumes self).
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn rollback(self) -> Result<()> {
         let mut enc = PayloadEncoder::new();
         enc.put_u64(self.tx_id);
@@ -193,8 +212,7 @@ fn decode_ok_response(buf: &[u8]) -> Result<()> {
             Err(FitzError::DomainError(msg))
         }
         _ => Err(FitzError::Protocol(format!(
-            "Unknown response status byte: {}",
-            status
+            "Unknown response status byte: {status}"
         ))),
     }
 }
@@ -226,7 +244,7 @@ mod tests {
     fn should_decode_error_response() {
         let msg = b"tx not found";
         let mut buf = vec![0x01];
-        buf.extend_from_slice(&(msg.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&u32::try_from(msg.len()).unwrap().to_be_bytes());
         buf.extend_from_slice(msg);
         let err = decode_ok_response(&buf).unwrap_err();
         assert!(err.to_string().contains("tx not found"));

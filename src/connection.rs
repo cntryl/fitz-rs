@@ -71,19 +71,21 @@ impl FitzConnection {
         self.ensure_open()?;
         self.transport
             .send_frame(frame)
-            .map_err(map_transport_error)
+            .map_err(|error| map_transport_error(&error))
     }
 
     pub fn recv_frame(&mut self) -> Result<Vec<u8>> {
         self.ensure_open()?;
-        self.transport.recv_frame().map_err(map_transport_error)
+        self.transport
+            .recv_frame()
+            .map_err(|error| map_transport_error(&error))
     }
 
     pub fn set_timeout(&mut self, timeout: Duration) -> Result<()> {
         self.ensure_open()?;
         self.transport
             .set_timeouts(Some(timeout), Some(timeout))
-            .map_err(map_transport_error)?;
+            .map_err(|error| map_transport_error(&error))?;
         self.timeout = Some(timeout);
         Ok(())
     }
@@ -98,7 +100,9 @@ impl FitzConnection {
         }
 
         self.state = ConnectionState::Closed;
-        self.transport.close().map_err(map_transport_error)
+        self.transport
+            .close()
+            .map_err(|error| map_transport_error(&error))
     }
 
     fn ensure_open(&self) -> Result<()> {
@@ -214,10 +218,10 @@ impl SharedConnection {
         // becomes the reader. The reader never holds the write lock while it
         // dispatches a decoded response.
         std::thread::yield_now();
-        self.wait_for_response(rx)
+        self.wait_for_response(&rx)
     }
 
-    fn wait_for_response(&self, rx: mpsc::Receiver<Result<Vec<u8>>>) -> Result<Vec<u8>> {
+    fn wait_for_response(&self, rx: &mpsc::Receiver<Result<Vec<u8>>>) -> Result<Vec<u8>> {
         loop {
             match rx.try_recv() {
                 Ok(result) => return result,
@@ -344,18 +348,18 @@ impl SharedConnection {
     {
         let mut deferred = self.deferred_frames.lock();
         let mut kept = VecDeque::with_capacity(deferred.len());
-        let mut matched = None;
+        let mut matching_frame = None;
 
         while let Some(frame) = deferred.pop_front() {
-            if matched.is_none() && matcher(frame.0, &frame.1) {
-                matched = Some(frame);
+            if matching_frame.is_none() && matcher(frame.0, &frame.1) {
+                matching_frame = Some(frame);
             } else {
                 kept.push_back(frame);
             }
         }
 
         *deferred = kept;
-        matched
+        matching_frame
     }
 }
 
@@ -382,7 +386,7 @@ fn is_server_notification(msg_type: u16) -> bool {
     )
 }
 
-fn map_transport_error(err: std::io::Error) -> FitzError {
+fn map_transport_error(err: &std::io::Error) -> FitzError {
     use std::io::ErrorKind;
 
     match err.kind() {
@@ -448,12 +452,11 @@ mod tests {
             .connect_tcp("127.0.0.1", port)
             .unwrap();
 
-        let err = match client
+        let Err(err) = client
             .kv()
             .begin("kv://test-realm/app/users", TransactionMode::ReadWrite)
-        {
-            Ok(_) => panic!("request unexpectedly succeeded"),
-            Err(err) => err,
+        else {
+            panic!("request unexpectedly succeeded");
         };
 
         assert!(matches!(err, FitzError::Timeout));
@@ -481,12 +484,11 @@ mod tests {
 
         client.close().unwrap();
 
-        let err = match client
+        let Err(err) = client
             .kv()
             .begin("kv://test-realm/app/users", TransactionMode::ReadWrite)
-        {
-            Ok(_) => panic!("request unexpectedly succeeded after close"),
-            Err(err) => err,
+        else {
+            panic!("request unexpectedly succeeded after close");
         };
 
         assert!(matches!(err, FitzError::ConnectionClosed));

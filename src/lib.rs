@@ -141,6 +141,9 @@ impl ClientBuilder {
         self.reconnect = policy;
         self
     }
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn build(self) -> Result<Client> {
         let (state_tx, _) = watch::channel(ConnectionState::Disconnected);
         Ok(Client {
@@ -201,9 +204,13 @@ impl Client {
     pub fn state(&self) -> ConnectionState {
         *self.inner.state_tx.borrow()
     }
+    #[must_use]
     pub fn subscribe_state(&self) -> watch::Receiver<ConnectionState> {
         self.inner.state_tx.subscribe()
     }
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub async fn connect(&self) -> Result<()> {
         if self.state() == ConnectionState::Closed {
             return Err(FitzError::Closed);
@@ -231,6 +238,9 @@ impl Client {
         tracing::info!(endpoint = %self.inner.endpoint, "fitz client authenticated");
         Ok(())
     }
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub async fn close(&self) -> Result<()> {
         let connection = self.inner.connection.lock().await.take();
         if let Some(connection) = connection {
@@ -287,6 +297,7 @@ pub struct FitzClientBuilder {
 }
 
 impl FitzClientBuilder {
+    #[must_use]
     pub fn new(token: &str) -> Self {
         Self {
             auth: ClientAuth::Token(token.to_string()),
@@ -295,6 +306,7 @@ impl FitzClientBuilder {
         }
     }
 
+    #[must_use]
     pub fn anonymous() -> Self {
         Self {
             auth: ClientAuth::Anonymous,
@@ -304,24 +316,32 @@ impl FitzClientBuilder {
     }
 
     /// Set connection timeout.
+    #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
 
     /// Set the maximum number of in-flight requests allowed on this client.
+    #[must_use]
     pub fn with_max_in_flight_requests(mut self, max_in_flight_requests: usize) -> Self {
         self.max_in_flight_requests = max_in_flight_requests.max(1);
         self
     }
 
     /// Connect via TCP.
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn connect_tcp(self, host: &str, port: u16) -> Result<FitzClient> {
         let conn = FitzConnection::connect_tcp(host, port)?;
         self.finish(conn)
     }
 
     /// Connect via WebSocket.
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn connect_ws(self, url: &str) -> Result<FitzClient> {
         let conn = FitzConnection::connect_ws(url)?;
         self.finish(conn)
@@ -356,81 +376,109 @@ pub struct FitzClient {
 
 impl FitzClient {
     /// Create a builder.
+    #[must_use]
     pub fn builder(token: &str) -> FitzClientBuilder {
         FitzClientBuilder::new(token)
     }
 
     /// Create a builder for anonymous connections.
+    #[must_use]
     pub fn builder_anonymous() -> FitzClientBuilder {
         FitzClientBuilder::anonymous()
     }
 
     /// Convenient helper: connect via TCP.
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn connect_tcp(host: &str, port: u16, token: &str) -> Result<Self> {
         FitzClient::builder(token).connect_tcp(host, port)
     }
 
     /// Convenient helper: connect via TCP without a JWT.
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn connect_tcp_anonymous(host: &str, port: u16) -> Result<Self> {
         FitzClient::builder_anonymous().connect_tcp(host, port)
     }
 
     /// Convenient helper: connect via WebSocket.
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn connect_ws(url: &str, token: &str) -> Result<Self> {
         FitzClient::builder(token).connect_ws(url)
     }
 
     /// Convenient helper: connect via WebSocket without a JWT.
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn connect_ws_anonymous(url: &str) -> Result<Self> {
         FitzClient::builder_anonymous().connect_ws(url)
     }
 
     /// Get a KV domain client.
+    #[must_use]
     pub fn kv(&self) -> domains::kv::KvClient {
         domains::kv::KvClient::new(self.connection.clone())
     }
 
     /// Get a Lease domain client.
+    #[must_use]
     pub fn lease(&self) -> domains::lease::LeaseClient {
         domains::lease::LeaseClient::new(self.connection.clone())
     }
 
     /// Get a Queue domain client.
+    #[must_use]
     pub fn queue(&self) -> domains::queue::QueueClient {
         domains::queue::QueueClient::new(self.connection.clone())
     }
 
     /// Get a Notice domain client.
+    #[must_use]
     pub fn notice(&self) -> domains::notice::NoticeClient {
         domains::notice::NoticeClient::new(self.connection.clone())
     }
 
     /// Get a Schedule domain client.
+    #[must_use]
     pub fn schedule(&self) -> domains::schedule::ScheduleClient {
         domains::schedule::ScheduleClient::new(self.connection.clone())
     }
 
     /// Get an RPC domain client.
+    #[must_use]
     pub fn rpc(&self) -> domains::rpc::RpcClient {
         domains::rpc::RpcClient::new(self.connection.clone())
     }
 
     /// Get a Stream domain client.
+    #[must_use]
     pub fn stream(&self) -> domains::stream::StreamClient {
         domains::stream::StreamClient::new(self.connection.clone())
     }
 
     /// Close the connection.
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn close(&self) -> Result<()> {
         self.connection.close()
     }
 
     /// Update the default transport timeout used by subsequent requests.
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn set_timeout(&self, timeout: Duration) -> Result<()> {
         self.connection.set_timeout(timeout)
     }
 
     /// Return the current default transport timeout.
+    #[must_use]
     pub fn timeout(&self) -> Option<Duration> {
         self.connection.timeout()
     }
@@ -700,7 +748,7 @@ mod tests {
     }
 
     fn write_length_prefixed_frame(stream: &mut std::net::TcpStream, frame: &[u8]) {
-        let len = frame.len() as u32;
+        let len = u32::try_from(frame.len()).unwrap();
         stream.write_all(&len.to_be_bytes()).unwrap();
         stream.write_all(frame).unwrap();
         stream.flush().unwrap();

@@ -29,10 +29,14 @@ pub struct RpcClient {
 }
 
 impl RpcClient {
+    #[must_use]
     pub fn new(conn: SharedConnection) -> Self {
         Self { conn }
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn call(&self, route: &str, body: &[u8]) -> Result<RpcResponseStream> {
         validate_concrete_route(route, "rpc")?;
 
@@ -53,10 +57,16 @@ impl RpcClient {
         })
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn call_all(&self, route: &str, body: &[u8]) -> Result<Vec<RpcResponseFrame>> {
         self.call(route, body)?.collect_all()
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn register_worker(&self, pattern: &str) -> Result<RpcWorkerRegistration> {
         validate_concrete_route(pattern, "rpc")?;
 
@@ -87,6 +97,9 @@ impl RpcResponseStream {
     // This blocking, fallible stream API intentionally differs from Iterator::next:
     // protocol errors are returned outside the optional end-of-stream value.
     #[allow(clippy::should_implement_trait)]
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn next(&mut self) -> Result<Option<RpcResponseFrame>> {
         if self.finished {
             return Ok(None);
@@ -95,8 +108,7 @@ impl RpcResponseStream {
         let (_, payload) = self.conn.recv_message_matching(|msg_type, payload| {
             msg_type == message_type::RPC_RESPONSE
                 && decode_rpc_response_correlation_id(payload)
-                    .map(|correlation_id| correlation_id == self.correlation_id)
-                    .unwrap_or(false)
+                    .is_ok_and(|correlation_id| correlation_id == self.correlation_id)
         })?;
 
         let response = decode_rpc_response(&payload)?;
@@ -120,6 +132,9 @@ impl RpcResponseStream {
         }))
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn collect_all(mut self) -> Result<Vec<RpcResponseFrame>> {
         let mut frames = Vec::new();
         while let Some(frame) = self.next()? {
@@ -136,12 +151,14 @@ pub struct RpcWorkerRegistration {
 }
 
 impl RpcWorkerRegistration {
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn next(&self) -> Result<RpcWorkerRequest> {
         let (_, payload) = self.conn.recv_message_matching(|msg_type, payload| {
             msg_type == message_type::RPC_REQUEST
                 && decode_rpc_request_route(payload)
-                    .map(|route| route_matches_pattern(&route, &self.pattern))
-                    .unwrap_or(false)
+                    .is_ok_and(|route| route_matches_pattern(&route, &self.pattern))
         })?;
 
         let request = decode_rpc_request(&payload)?;
@@ -156,6 +173,9 @@ impl RpcWorkerRegistration {
         })
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn unregister(&self) -> Result<()> {
         let mut enc = PayloadEncoder::new();
         enc.put_string(&self.pattern);
@@ -179,6 +199,9 @@ pub struct RpcWorkerRequest {
 }
 
 impl RpcWorkerRequest {
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn respond(&mut self, body: &[u8], is_end: bool) -> Result<()> {
         if self.finished {
             return Err(FitzError::Protocol(
@@ -189,7 +212,7 @@ impl RpcWorkerRequest {
         let mut enc = PayloadEncoder::new();
         enc.put_raw(&self.correlation_id);
         enc.put_u64(self.next_sequence);
-        enc.put_u8(is_end as u8);
+        enc.put_u8(u8::from(is_end));
         enc.put_bytes(body);
 
         self.conn
@@ -203,6 +226,9 @@ impl RpcWorkerRequest {
         Ok(())
     }
 
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn finish(self) -> Result<()> {
         if self.finished {
             return Ok(());

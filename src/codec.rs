@@ -1,6 +1,6 @@
 //! Payload codec: sequential typed fields for domain message bodies.
 //!
-//! Matches the server's payload_codec format (not TLV; fixed-order typed fields).
+//! Matches the server's `payload_codec` format (not TLV; fixed-order typed fields).
 //! Frame-level encode/decode is in `encode_message_frame` / `decode_message_frame`.
 
 #![allow(dead_code)]
@@ -38,8 +38,11 @@ impl PayloadEncoder {
     }
 
     pub fn put_bytes(&mut self, bytes: &[u8]) -> &mut Self {
-        self.buf
-            .extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        self.buf.extend_from_slice(
+            &u32::try_from(bytes.len())
+                .expect("byte field exceeds u32")
+                .to_be_bytes(),
+        );
         self.buf.extend_from_slice(bytes);
         self
     }
@@ -51,8 +54,11 @@ impl PayloadEncoder {
 
     pub fn put_string(&mut self, s: &str) -> &mut Self {
         let bytes = s.as_bytes();
-        self.buf
-            .extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        self.buf.extend_from_slice(
+            &u32::try_from(bytes.len())
+                .expect("string field exceeds u32")
+                .to_be_bytes(),
+        );
         self.buf.extend_from_slice(bytes);
         self
     }
@@ -152,10 +158,10 @@ impl<'a> PayloadDecoder<'a> {
     }
 }
 
-/// Encode a message frame: [u16 msg_type][payload]
+/// Encode a message frame: [u16 `msg_type`][payload]
 pub fn encode_message_frame(msg_type: u16, payload: &[u8]) -> Vec<u8> {
     assert!(
-        payload.len() <= u16::MAX as usize,
+        u16::try_from(payload.len()).is_ok(),
         "payload exceeds u16 frame limit"
     );
 
@@ -172,14 +178,18 @@ pub fn try_encode_message_frame(msg_type: u16, payload: &[u8]) -> Result<Vec<u8>
 
     // Encode message type (multi-byte for type ≥ 255)
     if msg_type < 255 {
-        frame.push(msg_type as u8);
+        frame.push(u8::try_from(msg_type).expect("single-byte message type"));
     } else {
         frame.push(0xFF);
         frame.extend_from_slice(&msg_type.to_be_bytes());
     }
 
     // Encode length (u16 BE)
-    frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    frame.extend_from_slice(
+        &u16::try_from(payload.len())
+            .expect("payload size checked above")
+            .to_be_bytes(),
+    );
 
     // Append payload
     frame.extend_from_slice(payload);
@@ -187,7 +197,7 @@ pub fn try_encode_message_frame(msg_type: u16, payload: &[u8]) -> Result<Vec<u8>
     Ok(frame)
 }
 
-/// Decode a message frame: returns (msg_type, payload_start)
+/// Decode a message frame: returns (`msg_type`, `payload_start`)
 pub fn decode_message_frame(buf: &[u8]) -> Result<(u16, usize)> {
     if buf.is_empty() {
         return Err(FitzError::Codec("Empty frame".to_string()));
@@ -202,7 +212,7 @@ pub fn decode_message_frame(buf: &[u8]) -> Result<(u16, usize)> {
         let msg_type = u16::from_be_bytes([buf[1], buf[2]]);
         (msg_type, 3)
     } else {
-        (buf[0] as u16, 1)
+        (u16::from(buf[0]), 1)
     };
 
     if buf.len() < header_len + 2 {
@@ -232,12 +242,12 @@ mod tests {
     #[test]
     fn should_encode_and_decode_u64() {
         let mut enc = PayloadEncoder::new();
-        enc.put_u64(0x0123456789ABCDEF);
+        enc.put_u64(0x0123_4567_89AB_CDEF);
         let buf = enc.finish();
 
         let mut dec = PayloadDecoder::new(&buf);
         let value = dec.get_u64().unwrap();
-        assert_eq!(value, 0x0123456789ABCDEF);
+        assert_eq!(value, 0x0123_4567_89AB_CDEF);
     }
 
     #[test]

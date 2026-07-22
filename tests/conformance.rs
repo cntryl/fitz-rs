@@ -141,10 +141,12 @@ impl ResultCollector {
                 return 1.0;
             }
 
-            rows.iter()
+            let passing = rows
+                .iter()
                 .filter(|result| matches!(result.verdict, Verdict::Pass))
-                .count() as f64
-                / rows.len() as f64
+                .count();
+            f64::from(u32::try_from(passing).expect("conformance row count fits u32"))
+                / f64::from(u32::try_from(rows.len()).expect("conformance row count fits u32"))
         };
 
         let has_p0_fail = p0
@@ -520,6 +522,10 @@ fn audit_error(err: &FitzError) -> String {
     format!("{:?}:{err}", err.kind())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "linear conformance scenario ledger stays auditable"
+)]
 fn execute_suite(transport: Transport, auth_mode: AuthMode) -> AggregateResult {
     let mut collector = ResultCollector::new();
 
@@ -1344,7 +1350,7 @@ fn write_results(result: &AggregateResult) -> PathBuf {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires a running Fitz broker"]
 fn conformance_suite() {
     let transport = main_transport();
     let auth_mode = main_auth_mode();

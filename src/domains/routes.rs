@@ -9,6 +9,9 @@ struct Shape {
     wildcard_suffix: bool,
 }
 
+///
+/// # Errors
+/// Returns an error when validation, encoding, transport, or broker processing fails.
 pub fn validate_concrete_route(route: &str, scheme: &str) -> Result<()> {
     let shape = scan(route, scheme)?;
     if shape.first_wildcard.is_some() {
@@ -17,6 +20,9 @@ pub fn validate_concrete_route(route: &str, scheme: &str) -> Result<()> {
     Ok(())
 }
 
+///
+/// # Errors
+/// Returns an error when validation, encoding, transport, or broker processing fails.
 pub fn validate_fixed_route(route: &str, scheme: &str, segments: usize) -> Result<()> {
     let shape = scan(route, scheme)?;
     if shape.segments != segments || shape.first_wildcard.is_some() {
@@ -25,6 +31,9 @@ pub fn validate_fixed_route(route: &str, scheme: &str, segments: usize) -> Resul
     Ok(())
 }
 
+///
+/// # Errors
+/// Returns an error when validation, encoding, transport, or broker processing fails.
 pub fn validate_selector_route(
     route: &str,
     scheme: &str,
