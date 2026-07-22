@@ -2,6 +2,7 @@
 
 use crate::codec::{PayloadDecoder, PayloadEncoder};
 use crate::connection::SharedConnection;
+use crate::domains::routes::validate_fixed_route;
 use crate::error::{FitzError, Result};
 use crate::protocol::message_type;
 
@@ -221,13 +222,7 @@ fn decode_schedule_notify(payload: &[u8]) -> Result<ScheduleNotification> {
 }
 
 fn validate_schedule_route(route: &str) -> Result<()> {
-    if route.len() > u16::MAX as usize {
-        Err(FitzError::Protocol(
-            "route exceeds the 65,535-byte TLV value limit".into(),
-        ))
-    } else {
-        Ok(())
-    }
+    validate_fixed_route(route, "schedule", 4)
 }
 
 #[cfg(test)]
@@ -257,9 +252,10 @@ mod tests {
     }
 
     #[test]
-    fn should_treat_schedule_routes_as_opaque() {
-        for route in ["schedule://realm/area/resource/op", "queue://x", "*", ""] {
-            validate_schedule_route(route).unwrap();
+    fn should_validate_schedule_route_shape() {
+        validate_schedule_route("schedule://realm/area/resource/op").unwrap();
+        for route in ["schedule://realm/area/resource", "queue://x", "*", ""] {
+            assert!(validate_schedule_route(route).is_err());
         }
     }
 

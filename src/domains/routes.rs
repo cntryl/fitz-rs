@@ -1,38 +1,116 @@
-//! Opaque route wire-size checks.
+//! Allocation-free client-side route-shape validation.
 use crate::error::{FitzError, Result};
 
-fn validate_wire_size(route: &str) -> Result<()> {
-    if route.len() > u16::MAX as usize {
-        Err(FitzError::Protocol(
-            "route exceeds the 65,535-byte TLV value limit".into(),
-        ))
-    } else {
-        Ok(())
-    }
+#[derive(Clone, Copy)]
+struct Shape {
+    segments: usize,
+    first_wildcard: Option<usize>,
+    double_wildcard: bool,
+    wildcard_suffix: bool,
 }
 
-pub fn validate_concrete_route(route: &str, _scheme: &str) -> Result<()> {
-    validate_wire_size(route)
+pub fn validate_concrete_route(route: &str, scheme: &str) -> Result<()> {
+    let shape = scan(route, scheme)?;
+    if shape.first_wildcard.is_some() {
+        return invalid("wildcards are not allowed in concrete routes");
+    }
+    Ok(())
 }
-pub fn validate_fixed_route(route: &str, _scheme: &str, _segments: usize) -> Result<()> {
-    validate_wire_size(route)
+
+pub fn validate_fixed_route(route: &str, scheme: &str, segments: usize) -> Result<()> {
+    let shape = scan(route, scheme)?;
+    if shape.segments != segments || shape.first_wildcard.is_some() {
+        return invalid("route has the wrong shape");
+    }
+    Ok(())
 }
+
 pub fn validate_selector_route(
     route: &str,
-    _scheme: &str,
-    _segments: usize,
-    _realm_wildcard: bool,
+    scheme: &str,
+    segments: usize,
+    realm_wildcard: bool,
 ) -> Result<()> {
-    validate_wire_size(route)
+    let shape = scan(route, scheme)?;
+    if shape.segments != segments || shape.first_wildcard == Some(0) {
+        return invalid("selector has the wrong shape");
+    }
+    let Some(first) = shape.first_wildcard else {
+        return Ok(());
+    };
+    if shape.double_wildcard || !shape.wildcard_suffix {
+        return invalid("selector has invalid wildcard placement");
+    }
+    if first == segments - 1 || (realm_wildcard && first == 1) {
+        return Ok(());
+    }
+    invalid("selector has invalid wildcard placement")
+}
+
+fn scan(route: &str, scheme: &str) -> Result<Shape> {
+    if route.len() > u16::MAX as usize {
+        return invalid("route exceeds the 65,535-byte TLV value limit");
+    }
+    let bytes = route.as_bytes();
+    let scheme_bytes = scheme.as_bytes();
+    let start = scheme_bytes.len() + 3;
+    if scheme_bytes.is_empty()
+        || bytes.len() <= start
+        || !bytes.starts_with(scheme_bytes)
+        || bytes.get(scheme_bytes.len()..start) != Some(b"://")
+    {
+        return invalid("route has the wrong scheme");
+    }
+
+    let mut shape = Shape {
+        segments: 0,
+        first_wildcard: None,
+        double_wildcard: false,
+        wildcard_suffix: true,
+    };
+    let mut segment_start = start;
+    for index in start..=bytes.len() {
+        if index != bytes.len() && bytes[index] != b'/' {
+            continue;
+        }
+        if index == segment_start {
+            return invalid("route contains an empty segment");
+        }
+        let segment = &bytes[segment_start..index];
+        let wildcard = segment == b"*";
+        let double_wildcard = segment == b"**";
+        if wildcard || double_wildcard {
+            shape.first_wildcard.get_or_insert(shape.segments);
+            shape.double_wildcard |= double_wildcard;
+        } else {
+            if segment.contains(&b'*') {
+                return invalid("wildcards must occupy a complete segment");
+            }
+            if shape.first_wildcard.is_some() {
+                shape.wildcard_suffix = false;
+            }
+        }
+        shape.segments += 1;
+        segment_start = index + 1;
+    }
+    Ok(shape)
+}
+
+fn invalid<T>(message: &str) -> Result<T> {
+    Err(FitzError::Protocol(message.to_owned()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn routes_are_opaque() {
-        for route in ["anything", "queue://realm/*/x", "not even a URI"] {
-            validate_fixed_route(route, "ignored", 99).unwrap();
-        }
+    fn should_validate_shapes_without_checking_permissions() {
+        validate_fixed_route("queue://realm/area/resource", "queue", 3).unwrap();
+        validate_selector_route("queue://realm/area/*", "queue", 3, true).unwrap();
+        validate_selector_route("queue://realm/*/*", "queue", 3, true).unwrap();
+        assert!(validate_fixed_route("queue://realm/area/*", "queue", 3).is_err());
+        assert!(validate_fixed_route("notice://realm/area/resource", "queue", 3).is_err());
+        assert!(validate_selector_route("queue://realm/*/resource", "queue", 3, true).is_err());
     }
 }
