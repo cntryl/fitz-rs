@@ -213,34 +213,44 @@ mod tests {
 
     #[test]
     fn should_decode_success_with_token() {
+        // Arrange
         // [status=0][has_token=1][u64 token=42]
         let mut buf = vec![0x00, 0x01];
         buf.extend_from_slice(&42u64.to_be_bytes());
+        // Act
         let result = decode_success_response(&buf).unwrap();
+        // Assert
         assert_eq!(result, Some(42));
     }
 
     #[test]
     fn should_decode_success_without_token() {
+        // Arrange
         // [status=0][has_token=0]
         let buf = vec![0x00, 0x00];
+        // Act
         let result = decode_success_response(&buf).unwrap();
+        // Assert
         assert_eq!(result, None);
     }
 
     #[test]
     fn should_decode_error_response() {
+        // Arrange
         // [status=1][u32 len=9]["Not found"]
         let msg = b"Not found";
         let mut buf = vec![0x01];
         buf.extend_from_slice(&u32::try_from(msg.len()).unwrap().to_be_bytes());
         buf.extend_from_slice(msg);
+        // Act
         let err = decode_success_response(&buf).unwrap_err();
+        // Assert
         assert!(err.to_string().contains("Not found"));
     }
 
     #[test]
     fn should_encode_acquire_request() {
+        // Arrange
         let mut enc = PayloadEncoder::new();
         enc.put_string("lease://prod/locks/leader");
         enc.put_string("node-1");
@@ -248,7 +258,9 @@ mod tests {
         let payload = enc.finish();
 
         // Verify round-trip
+        // Act
         let mut dec = PayloadDecoder::new(&payload);
+        // Assert
         assert_eq!(dec.get_string().unwrap(), "lease://prod/locks/leader");
         assert_eq!(dec.get_string().unwrap(), "node-1");
         assert_eq!(dec.get_u64().unwrap(), 30);
@@ -257,6 +269,7 @@ mod tests {
 
     #[test]
     fn should_encode_renew_request() {
+        // Arrange
         let mut enc = PayloadEncoder::new();
         enc.put_string("lease://prod/locks/leader");
         enc.put_string("node-1");
@@ -264,7 +277,9 @@ mod tests {
         enc.put_u64(60); // ttl
         let payload = enc.finish();
 
+        // Act
         let mut dec = PayloadDecoder::new(&payload);
+        // Assert
         assert_eq!(dec.get_string().unwrap(), "lease://prod/locks/leader");
         assert_eq!(dec.get_string().unwrap(), "node-1");
         assert_eq!(dec.get_u64().unwrap(), 12345);
@@ -274,13 +289,16 @@ mod tests {
 
     #[test]
     fn should_encode_release_request() {
+        // Arrange
         let mut enc = PayloadEncoder::new();
         enc.put_string("lease://prod/locks/leader");
         enc.put_string("node-1");
         enc.put_u64(12345);
         let payload = enc.finish();
 
+        // Act
         let mut dec = PayloadDecoder::new(&payload);
+        // Assert
         assert_eq!(dec.get_string().unwrap(), "lease://prod/locks/leader");
         assert_eq!(dec.get_string().unwrap(), "node-1");
         assert_eq!(dec.get_u64().unwrap(), 12345);
@@ -289,11 +307,14 @@ mod tests {
 
     #[test]
     fn should_encode_query_request() {
+        // Arrange
         let mut enc = PayloadEncoder::new();
         enc.put_string("lease://prod/locks/leader");
         let payload = enc.finish();
 
+        // Act
         let mut dec = PayloadDecoder::new(&payload);
+        // Assert
         assert_eq!(dec.get_string().unwrap(), "lease://prod/locks/leader");
         assert!(dec.is_empty());
     }

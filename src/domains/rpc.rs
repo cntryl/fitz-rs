@@ -336,6 +336,7 @@ mod tests {
 
     #[test]
     fn should_decode_rpc_response_payload() {
+        // Arrange
         let correlation_id = [7u8; 16];
         let mut buf = Vec::new();
         buf.extend_from_slice(&correlation_id);
@@ -344,7 +345,9 @@ mod tests {
         buf.extend_from_slice(&(4u32).to_be_bytes());
         buf.extend_from_slice(b"pong");
 
+        // Act
         let response = decode_rpc_response(&buf).unwrap();
+        // Assert
         assert_eq!(response.correlation_id, correlation_id);
         assert_eq!(response.sequence, 3);
         assert_eq!(response.body, b"pong");
@@ -353,6 +356,7 @@ mod tests {
 
     #[test]
     fn should_decode_rpc_request_payload() {
+        // Arrange
         let correlation_id = [9u8; 16];
         let mut buf = Vec::new();
         buf.extend_from_slice(&correlation_id);
@@ -361,7 +365,9 @@ mod tests {
         buf.extend_from_slice(&(4u32).to_be_bytes());
         buf.extend_from_slice(b"ping");
 
+        // Act
         let request = decode_rpc_request(&buf).unwrap();
+        // Assert
         assert_eq!(request.correlation_id, correlation_id);
         assert_eq!(request.route, "rpc://realm/area/op");
         assert_eq!(request.reply_route, "");
@@ -370,6 +376,9 @@ mod tests {
 
     #[test]
     fn should_match_rpc_route_patterns() {
+        // Arrange
+        // Act
+        // Assert
         assert!(route_matches_pattern(
             "rpc://realm/app/echo",
             "rpc://realm/app/echo"
@@ -390,11 +399,14 @@ mod tests {
 
     #[test]
     fn should_decode_rpc_status_error_response() {
+        // Arrange
         let mut buf = vec![1];
         buf.extend_from_slice(&(4u32).to_be_bytes());
         buf.extend_from_slice(b"nope");
 
+        // Act
         let err = decode_rpc_status_response("CALL", &buf).unwrap_err();
+        // Assert
         assert!(err.to_string().contains("nope"));
     }
 }

@@ -37,12 +37,12 @@ fn should_execute_kv_transaction_over_websocket() {
         .begin(&route, TransactionMode::ReadWrite)
         .expect("Failed to begin transaction");
 
-    // Act - Put a value
+    // Continue workflow - Put a value
     let key = b"username:bob";
     let value = b"Bob Smith";
     tx.put(key, value).expect("Failed to put value");
 
-    // Act - Get the value back
+    // Continue workflow - Get the value back
     let retrieved = tx
         .get(key)
         .expect("Failed to get value")
@@ -51,7 +51,7 @@ fn should_execute_kv_transaction_over_websocket() {
     // Assert
     assert_eq!(retrieved, value, "Retrieved value should match put value");
 
-    // Act - Delete the key
+    // Continue workflow - Delete the key
     tx.delete(key).expect("Failed to delete key");
 
     // Assert - Key should not exist after delete
@@ -62,10 +62,10 @@ fn should_execute_kv_transaction_over_websocket() {
         "Value should not exist after delete"
     );
 
-    // Act - Commit transaction
+    // Continue workflow - Commit transaction
     tx.commit().expect("Failed to commit transaction");
 
-    // Act - Verify in new transaction that changes persisted
+    // Continue workflow - Verify in new transaction that changes persisted
     let verify_tx = kv
         .begin(&route, TransactionMode::ReadOnly)
         .expect("Failed to begin verify transaction");
@@ -123,7 +123,7 @@ fn should_rollback_kv_transaction_over_websocket() {
         "Should see updated value in same transaction"
     );
 
-    // Act - Rollback instead of commit
+    // Continue workflow - Rollback instead of commit
     tx.rollback().expect("Failed to rollback");
 
     // Assert - New transaction should see original value

@@ -365,9 +365,12 @@ mod tests {
 
     #[test]
     fn should_decode_enqueue_response() {
+        // Arrange
         let mut buf = vec![0];
         buf.extend_from_slice(&7u64.to_be_bytes());
+        // Act
         let id = decode_enqueue_response(&buf).unwrap();
+        // Assert
         assert_eq!(id, 7);
     }
 
@@ -379,14 +382,18 @@ mod tests {
 
     #[test]
     fn should_decode_queue_subscription_response() {
+        // Arrange
         let mut buf = vec![0, 1];
         buf.extend_from_slice(&42u64.to_be_bytes());
+        // Act
         let sub_id = decode_subscription_response("SUBSCRIBE", &buf).unwrap();
+        // Assert
         assert_eq!(sub_id, 42);
     }
 
     #[test]
     fn should_decode_queue_notify_payload() {
+        // Arrange
         let mut buf = Vec::new();
         buf.extend_from_slice(&7u64.to_be_bytes());
         buf.extend_from_slice(&(20u32).to_be_bytes());
@@ -394,7 +401,9 @@ mod tests {
         buf.extend_from_slice(&(4u32).to_be_bytes());
         buf.extend_from_slice(b"fire");
 
+        // Act
         let notification = decode_queue_notify(&buf).unwrap();
+        // Assert
         assert_eq!(notification.route, "queue://realm/area/x");
         assert_eq!(notification.payload, b"fire");
     }
@@ -409,6 +418,7 @@ mod tests {
 
     #[test]
     fn should_timeout_queue_reserve_with_scoped_timeout() {
+        // Arrange
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
 
@@ -430,8 +440,10 @@ mod tests {
             Some(Duration::from_millis(50)),
         ) else {
             panic!("reserve unexpectedly succeeded");
+            // Act
         };
 
+        // Assert
         assert!(matches!(err, FitzError::Timeout));
 
         server.join().unwrap();

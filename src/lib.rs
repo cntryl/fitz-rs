@@ -515,6 +515,7 @@ mod tests {
 
     #[test]
     fn should_update_client_timeout_after_connect() {
+        // Arrange
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
 
@@ -524,11 +525,13 @@ mod tests {
             thread::sleep(Duration::from_millis(50));
         });
 
+        // Act
         let client = FitzClient::builder("secret")
             .with_timeout(Duration::from_millis(250))
             .connect_tcp("127.0.0.1", port)
             .unwrap();
 
+        // Assert
         assert_eq!(client.timeout(), Some(Duration::from_millis(250)));
 
         client.set_timeout(Duration::from_secs(1)).unwrap();
@@ -540,6 +543,7 @@ mod tests {
 
     #[test]
     fn should_bound_concurrent_outbound_requests_given_max_one_when_second_request_starts() {
+        // Arrange
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
 
@@ -600,8 +604,10 @@ mod tests {
                 .kv()
                 .begin("kv://my-realm/app/users-2", TransactionMode::ReadWrite)
                 .unwrap();
+            // Act
         });
 
+        // Assert
         assert!(
             second_request_seen_rx
                 .recv_timeout(Duration::from_millis(100))
@@ -617,6 +623,7 @@ mod tests {
 
     #[test]
     fn should_not_cross_route_same_type_responses_between_concurrent_requests() {
+        // Arrange
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let (first_request_seen_tx, first_request_seen_rx) = mpsc::channel();
@@ -685,14 +692,17 @@ mod tests {
 
         let first_response = first.join().unwrap();
         let second_response = second.join().unwrap();
+        // Act
         server.join().unwrap();
 
+        // Assert
         assert_eq!(first_response, vec![0xA]);
         assert_eq!(second_response, vec![0xB]);
     }
 
     #[test]
     fn should_drop_stale_response_after_request_timeout_when_requests_are_queued() {
+        // Arrange
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
 
@@ -738,7 +748,9 @@ mod tests {
             move || conn.send_request(100, &[0x22])
         });
 
+        // Act
         let first_err = first.join().unwrap();
+        // Assert
         assert!(matches!(first_err, FitzError::Timeout));
 
         let second_response = second.join().unwrap().unwrap();

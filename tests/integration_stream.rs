@@ -171,12 +171,12 @@ fn run_stream_subscription(transport: Transport) {
 }
 
 #[test]
-fn should_commit_and_read_stream_over_tcp() {
+fn should_replay_committed_stream_over_tcp() {
     run_stream_commit_and_read(Transport::Tcp);
 }
 
 #[test]
-fn should_commit_and_read_stream_over_websocket() {
+fn should_replay_committed_stream_over_websocket() {
     run_stream_commit_and_read(Transport::WebSocket);
 }
 

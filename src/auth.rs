@@ -84,11 +84,14 @@ mod tests {
 
     #[test]
     fn should_create_valid_jwt_structure() {
+        // Arrange
         let generator = TestTokenGenerator::new("test-secret");
         let token = generator.generate("test-realm", "test-user").unwrap();
 
         // JWT is 3 parts separated by dots
+        // Act
         let parts: Vec<&str> = token.split('.').collect();
+        // Assert
         assert_eq!(parts.len(), 3);
     }
 }

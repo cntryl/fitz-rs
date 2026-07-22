@@ -37,12 +37,12 @@ fn should_execute_kv_transaction_over_tcp() {
         .begin(&route, TransactionMode::ReadWrite)
         .expect("Failed to begin transaction");
 
-    // Act - Put a value
+    // Continue workflow - Put a value
     let key = b"username:alice";
     let value = b"Alice Johnson";
     tx.put(key, value).expect("Failed to put value");
 
-    // Act - Get the value back
+    // Continue workflow - Get the value back
     let retrieved = tx
         .get(key)
         .expect("Failed to get value")
@@ -51,7 +51,7 @@ fn should_execute_kv_transaction_over_tcp() {
     // Assert
     assert_eq!(retrieved, value, "Retrieved value should match put value");
 
-    // Act - Delete the key
+    // Continue workflow - Delete the key
     tx.delete(key).expect("Failed to delete key");
 
     // Assert - Key should not exist after delete
@@ -62,10 +62,10 @@ fn should_execute_kv_transaction_over_tcp() {
         "Value should not exist after delete"
     );
 
-    // Act - Commit transaction
+    // Continue workflow - Commit transaction
     tx.commit().expect("Failed to commit transaction");
 
-    // Act - Verify in new transaction that changes persisted
+    // Continue workflow - Verify in new transaction that changes persisted
     let verify_tx = kv
         .begin(&route, TransactionMode::ReadOnly)
         .expect("Failed to begin verify transaction");
@@ -122,7 +122,7 @@ fn should_rollback_kv_transaction_over_tcp() {
         "Should see updated value in same transaction"
     );
 
-    // Act - Rollback instead of commit
+    // Continue workflow - Rollback instead of commit
     tx.rollback().expect("Failed to rollback");
 
     // Assert - New transaction should see original value
@@ -170,7 +170,7 @@ fn should_isolate_multiple_kv_transactions_over_tcp() {
 
     tx1.put(b"key1", b"value1").expect("Failed to put in tx1");
 
-    // Act - Begin second transaction (should not see tx1's changes)
+    // Continue workflow - Begin second transaction (should not see tx1's changes)
     let tx2 = kv
         .begin(&route, TransactionMode::ReadOnly)
         .expect("Failed to begin tx2");
@@ -180,15 +180,16 @@ fn should_isolate_multiple_kv_transactions_over_tcp() {
         .expect("Failed to get in tx2")
         .expect("Setup value should exist");
 
+    // Assert
     assert_eq!(
         tx2_view, b"initial",
         "tx2 should not see tx1's uncommitted write"
     );
 
-    // Act - Commit tx1
+    // Continue workflow - Commit tx1
     tx1.commit().expect("Failed to commit tx1");
 
-    // Act - Begin new transaction and verify changes visible
+    // Continue workflow - Begin new transaction and verify changes visible
     let tx3 = kv
         .begin(&route, TransactionMode::ReadOnly)
         .expect("Failed to begin tx3");

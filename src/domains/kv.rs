@@ -223,12 +223,15 @@ mod tests {
 
     #[test]
     fn should_decode_begin_ok_response() {
+        // Arrange
         // [status=0][u64 tx_id=7]
         let mut buf = vec![0x00];
         buf.extend_from_slice(&7u64.to_be_bytes());
 
         let mut dec = PayloadDecoder::new(&buf);
+        // Act
         let status = dec.get_u8().unwrap();
+        // Assert
         assert_eq!(status, 0);
         let tx_id = dec.get_u64().unwrap();
         assert_eq!(tx_id, 7);
@@ -242,23 +245,29 @@ mod tests {
 
     #[test]
     fn should_decode_error_response() {
+        // Arrange
         let msg = b"tx not found";
         let mut buf = vec![0x01];
         buf.extend_from_slice(&u32::try_from(msg.len()).unwrap().to_be_bytes());
         buf.extend_from_slice(msg);
+        // Act
         let err = decode_ok_response(&buf).unwrap_err();
+        // Assert
         assert!(err.to_string().contains("tx not found"));
     }
 
     #[test]
     fn should_decode_get_result_found() {
+        // Arrange
         // [status=0][found=1][u32 len=5][value bytes]
         let mut buf = vec![0x00, 0x01];
         buf.extend_from_slice(&(5u32).to_be_bytes());
         buf.extend_from_slice(b"alice");
 
         let mut dec = PayloadDecoder::new(&buf);
+        // Act
         let status = dec.get_u8().unwrap();
+        // Assert
         assert_eq!(status, 0);
         let found = dec.get_u8().unwrap();
         assert_eq!(found, 1);
@@ -268,12 +277,15 @@ mod tests {
 
     #[test]
     fn should_decode_get_result_not_found() {
+        // Arrange
         // [status=0][found=0][u32 len=0]
         let mut buf = vec![0x00, 0x00];
         buf.extend_from_slice(&(0u32).to_be_bytes());
 
         let mut dec = PayloadDecoder::new(&buf);
+        // Act
         let status = dec.get_u8().unwrap();
+        // Assert
         assert_eq!(status, 0);
         let found = dec.get_u8().unwrap();
         assert_eq!(found, 0);
@@ -283,13 +295,16 @@ mod tests {
 
     #[test]
     fn should_encode_begin_request() {
+        // Arrange
         let mut enc = PayloadEncoder::new();
         enc.put_string("kv://prod/app/users");
         enc.put_u8(TransactionMode::ReadWrite as u8);
         enc.put_u8(0);
         let payload = enc.finish();
 
+        // Act
         let mut dec = PayloadDecoder::new(&payload);
+        // Assert
         assert_eq!(dec.get_string().unwrap(), "kv://prod/app/users");
         assert_eq!(dec.get_u8().unwrap(), 1); // ReadWrite
         assert_eq!(dec.get_u8().unwrap(), 0); // durable
@@ -298,13 +313,16 @@ mod tests {
 
     #[test]
     fn should_encode_get_request() {
+        // Arrange
         let mut enc = PayloadEncoder::new();
         enc.put_u64(42); // tx_id
         enc.put_string("kv://prod/app/users");
         enc.put_bytes(b"user:1");
         let payload = enc.finish();
 
+        // Act
         let mut dec = PayloadDecoder::new(&payload);
+        // Assert
         assert_eq!(dec.get_u64().unwrap(), 42);
         assert_eq!(dec.get_string().unwrap(), "kv://prod/app/users");
         assert_eq!(dec.get_bytes().unwrap(), b"user:1");

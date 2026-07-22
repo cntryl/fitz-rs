@@ -433,6 +433,7 @@ mod tests {
 
     #[test]
     fn should_apply_builder_timeout_to_request_path() {
+        // Arrange
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
 
@@ -457,8 +458,10 @@ mod tests {
             .begin("kv://test-realm/app/users", TransactionMode::ReadWrite)
         else {
             panic!("request unexpectedly succeeded");
+            // Act
         };
 
+        // Assert
         assert!(matches!(err, FitzError::Timeout));
 
         server.join().unwrap();
@@ -466,6 +469,7 @@ mod tests {
 
     #[test]
     fn should_reject_request_after_close() {
+        // Arrange
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
 
@@ -489,8 +493,10 @@ mod tests {
             .begin("kv://test-realm/app/users", TransactionMode::ReadWrite)
         else {
             panic!("request unexpectedly succeeded after close");
+            // Act
         };
 
+        // Assert
         assert!(matches!(err, FitzError::ConnectionClosed));
 
         server.join().unwrap();
@@ -498,6 +504,7 @@ mod tests {
 
     #[test]
     fn should_restore_timeout_after_scoped_request_timeout() {
+        // Arrange
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
 
@@ -514,9 +521,11 @@ mod tests {
         conn.set_timeout(Duration::from_secs(1)).unwrap();
         let shared = SharedConnection::new(conn, 256);
 
+        // Act
         let err = shared
             .send_request_with_timeout(41, b"slow", Duration::from_millis(50))
             .unwrap_err();
+        // Assert
         assert!(matches!(err, FitzError::Timeout));
         assert_eq!(shared.lock().timeout(), Some(Duration::from_secs(1)));
 

@@ -250,6 +250,7 @@ mod tests {
 
     #[test]
     fn should_decode_schedule_list_response() {
+        // Arrange
         let mut buf = vec![0];
         buf.extend_from_slice(&2u64.to_be_bytes());
         buf.push(1);
@@ -261,7 +262,9 @@ mod tests {
         buf.extend_from_slice(b"fire");
         buf.push(0);
 
+        // Act
         let mut dec = decode_schedule_success("LIST", &buf).unwrap();
+        // Assert
         assert_eq!(dec.get_u64().unwrap(), 2);
         assert_eq!(dec.get_u8().unwrap(), 1);
         assert_eq!(dec.get_string().unwrap(), "schedule://a/b/c/d");
@@ -272,28 +275,37 @@ mod tests {
 
     #[test]
     fn should_validate_schedule_route_shape() {
+        // Arrange
         validate_schedule_route("schedule://realm/area/resource/op").unwrap();
+        // Act
         for route in ["schedule://realm/area/resource", "queue://x", "*", ""] {
+            // Assert
             assert!(validate_schedule_route(route).is_err());
         }
     }
 
     #[test]
     fn should_decode_schedule_subscription_response() {
+        // Arrange
         let mut buf = vec![0, 1];
         buf.extend_from_slice(&42u64.to_be_bytes());
+        // Act
         let sub_id = decode_schedule_subscription("SUBSCRIBE", &buf).unwrap();
+        // Assert
         assert_eq!(sub_id, 42);
     }
 
     #[test]
     fn should_decode_schedule_notify_payload() {
+        // Arrange
         let mut buf = Vec::new();
         buf.extend_from_slice(&42u64.to_be_bytes());
         buf.extend_from_slice(&(4u32).to_be_bytes());
         buf.extend_from_slice(b"fire");
 
+        // Act
         let notification = decode_schedule_notify(&buf).unwrap();
+        // Assert
         assert_eq!(notification.payload, b"fire");
     }
 }

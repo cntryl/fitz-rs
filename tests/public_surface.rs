@@ -6,6 +6,7 @@ fn read_source(path: &str) -> String {
 
 #[test]
 fn should_keep_root_public_surface_narrow() {
+    // Arrange
     let source = read_source("src/lib.rs");
 
     for forbidden in [
@@ -15,7 +16,9 @@ fn should_keep_root_public_surface_narrow() {
         "pub mod protocol;",
         "pub mod transport;",
         "pub use auth::TestTokenGenerator;",
+        // Act
     ] {
+        // Assert
         assert!(
             !source.contains(forbidden),
             "unexpected public root surface fragment present: {forbidden}"
@@ -48,7 +51,10 @@ fn should_keep_rpc_correlation_ids_private() {
 
 #[test]
 fn should_keep_queue_reservation_tokens_private() {
+    // Arrange
+    // Act
     let source = read_source("src/domains/queue.rs");
+    // Assert
     assert!(source.contains("id: u64,"));
     assert!(source.contains("token: u64,"));
     assert!(!source.contains("pub id: u64,"));

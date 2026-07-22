@@ -1366,7 +1366,8 @@ fn conformance_suite() {
 }
 
 #[test]
-fn conformance_result_schema_is_serializable() {
+fn should_serialize_conformance_result_schema() {
+    // Arrange
     let aggregate = AggregateResult {
         suite: "fitz-cross-language-client-conformance".to_string(),
         version: "1.0".to_string(),
@@ -1391,6 +1392,8 @@ fn conformance_result_schema_is_serializable() {
         }],
     };
 
+    // Act
     let serialized = serde_json::to_string(&aggregate).expect("aggregate should serialize");
+    // Assert
     assert!(serialized.contains("fitz-cross-language-client-conformance"));
 }

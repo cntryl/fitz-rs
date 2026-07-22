@@ -179,23 +179,30 @@ mod tests {
 
     #[test]
     fn should_decode_notice_error_response() {
+        // Arrange
         let mut buf = vec![1];
         buf.extend_from_slice(&(4u32).to_be_bytes());
         buf.extend_from_slice(b"nope");
+        // Act
         let err = decode_notice_response("PUBLISH", &buf).unwrap_err();
+        // Assert
         assert!(err.to_string().contains("nope"));
     }
 
     #[test]
     fn should_decode_notice_subscription_response() {
+        // Arrange
         let mut buf = vec![0, 1];
         buf.extend_from_slice(&11u64.to_be_bytes());
+        // Act
         let sub_id = decode_subscription_response("SUBSCRIBE", &buf).unwrap();
+        // Assert
         assert_eq!(sub_id, 11);
     }
 
     #[test]
     fn should_decode_notice_notify_payload() {
+        // Arrange
         let mut buf = Vec::new();
         buf.extend_from_slice(&11u64.to_be_bytes());
         buf.extend_from_slice(&(21u32).to_be_bytes());
@@ -203,7 +210,9 @@ mod tests {
         buf.extend_from_slice(&(4u32).to_be_bytes());
         buf.extend_from_slice(b"ping");
 
+        // Act
         let message = decode_notice_notify(&buf).unwrap();
+        // Assert
         assert_eq!(message.route, "notice://realm/area/x");
         assert_eq!(message.body, b"ping");
     }
