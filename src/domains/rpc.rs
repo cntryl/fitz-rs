@@ -84,6 +84,9 @@ pub struct RpcResponseStream {
 }
 
 impl RpcResponseStream {
+    // This blocking, fallible stream API intentionally differs from Iterator::next:
+    // protocol errors are returned outside the optional end-of-stream value.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<Option<RpcResponseFrame>> {
         if self.finished {
             return Ok(None);

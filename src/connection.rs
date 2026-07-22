@@ -13,6 +13,9 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
+type DeferredFrame = (u16, Vec<u8>);
+type DeferredFrames = Arc<Mutex<VecDeque<DeferredFrame>>>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConnectionState {
     Open,
@@ -149,7 +152,7 @@ impl Drop for RequestPermit {
 #[derive(Clone)]
 pub struct SharedConnection {
     inner: Arc<Mutex<FitzConnection>>,
-    deferred_frames: Arc<Mutex<VecDeque<(u16, Vec<u8>)>>>,
+    deferred_frames: DeferredFrames,
     request_gate: Arc<RequestGate>,
 }
 
@@ -312,7 +315,7 @@ fn map_transport_error(err: std::io::Error) -> FitzError {
     use std::io::ErrorKind;
 
     match err.kind() {
-        ErrorKind::TimedOut => FitzError::Timeout,
+        ErrorKind::TimedOut | ErrorKind::WouldBlock => FitzError::Timeout,
         ErrorKind::ConnectionAborted
         | ErrorKind::ConnectionReset
         | ErrorKind::BrokenPipe
