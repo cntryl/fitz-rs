@@ -7,8 +7,8 @@
 
 mod jwt;
 
-use cntryl::TransactionMode;
-use cntryl::{FitzClient, FitzError};
+use cntryl_fitz::TransactionMode;
+use cntryl_fitz::{FitzClient, FitzError};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -57,7 +57,7 @@ fn run_kv_crud_operations(transport: Transport) {
     println!("Running KV CRUD test over {}", transport.name());
 
     let client =
-        connect_client(transport, "test-realm", "test-secret-key").expect("Failed to connect");
+        connect_client(transport, "test-realm", "dev-test-secret").expect("Failed to connect");
 
     let kv = client.kv();
     let route = unique_route("kv", "crud");
@@ -106,7 +106,7 @@ fn run_transaction_isolation(transport: Transport) {
     );
 
     let client =
-        connect_client(transport, "test-realm", "test-secret-key").expect("Failed to connect");
+        connect_client(transport, "test-realm", "dev-test-secret").expect("Failed to connect");
 
     let kv = client.kv();
     let route = unique_route("kv", "isolation");
@@ -174,7 +174,7 @@ fn run_rollback_behavior(transport: Transport) {
     println!("Running rollback test over {}", transport.name());
 
     let client =
-        connect_client(transport, "test-realm", "test-secret-key").expect("Failed to connect");
+        connect_client(transport, "test-realm", "dev-test-secret").expect("Failed to connect");
 
     let kv = client.kv();
     let route = unique_route("kv", "rollback");
@@ -235,7 +235,7 @@ fn run_large_values(transport: Transport) {
     println!("Running large value test over {}", transport.name());
 
     let client =
-        connect_client(transport, "test-realm", "test-secret-key").expect("Failed to connect");
+        connect_client(transport, "test-realm", "dev-test-secret").expect("Failed to connect");
 
     let kv = client.kv();
     let route = unique_route("kv", "large");

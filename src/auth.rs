@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 use crate::error::{FitzError, Result};
-use jsonwebtoken::{encode, EncodingKey, Header};
+use jsonwebtoken::{EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -77,15 +77,15 @@ mod tests {
 
     #[test]
     fn should_generate_test_token() {
-        let gen = TestTokenGenerator::new("test-secret");
-        let token = gen.generate("test-realm", "test-user").unwrap();
+        let generator = TestTokenGenerator::new("test-secret");
+        let token = generator.generate("test-realm", "test-user").unwrap();
         assert!(!token.is_empty());
     }
 
     #[test]
     fn should_create_valid_jwt_structure() {
-        let gen = TestTokenGenerator::new("test-secret");
-        let token = gen.generate("test-realm", "test-user").unwrap();
+        let generator = TestTokenGenerator::new("test-secret");
+        let token = generator.generate("test-realm", "test-user").unwrap();
 
         // JWT is 3 parts separated by dots
         let parts: Vec<&str> = token.split('.').collect();

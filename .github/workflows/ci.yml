@@ -5,49 +5,32 @@ on:
   pull_request:
 
 jobs:
-  unit:
+  verify:
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        toolchain: [1.85.0, stable]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-targets
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+      - run: cargo package
+
+  security:
     timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Run library tests
-        run: cargo test --lib
-
-  conformance:
-    timeout-minutes: 15
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        transport: [tcp, ws]
-        auth_mode: [anonymous, valid_jwt]
-    env:
-      CONFORMANCE_TRANSPORT: ${{ matrix.transport }}
-      CONFORMANCE_AUTH_MODE: ${{ matrix.auth_mode }}
-      CONFORMANCE_OUTPUT: artifacts/conformance-${{ matrix.transport }}-${{ matrix.auth_mode }}.json
-      FITZ_BROKER_ANON_TCP_ADDR: 127.0.0.1:4191
-      FITZ_BROKER_ANON_WS_ADDR: ws://127.0.0.1:4190/ws
-      FITZ_BROKER_AUTH_TCP_ADDR: 127.0.0.1:4091
-      FITZ_BROKER_AUTH_WS_ADDR: ws://127.0.0.1:4090/ws
-      FITZ_BROKER_JWT_HMAC_SECRET: test-secret-key
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Run conformance suite
-        run: cargo test --test conformance -- --ignored --nocapture
-
-      - name: Upload conformance artifact
-        if: always()
-        uses: actions/upload-artifact@v4
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
         with:
-          name: conformance-${{ matrix.transport }}-${{ matrix.auth_mode }}
-          path: ${{ env.CONFORMANCE_OUTPUT }}
+          tool: cargo-audit,cargo-deny
+      - run: cargo audit
+      - run: cargo deny check

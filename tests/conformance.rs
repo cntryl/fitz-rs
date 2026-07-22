@@ -1,22 +1,22 @@
 mod jwt;
 
-use cntryl::domains::stream::StreamCommitMode;
-use cntryl::TransactionMode;
-use cntryl::{FitzClient, FitzError, FitzErrorKind, Result};
+use cntryl_fitz::TransactionMode;
+use cntryl_fitz::domains::stream::StreamCommitMode;
+use cntryl_fitz::{FitzClient, FitzError, FitzErrorKind, Result};
 use serde::Serialize;
 use std::fs;
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CLIENT_NAME: &str = "fitz-rs";
 const REALM: &str = "test-realm";
-const DEFAULT_SECRET: &str = "test-secret-key";
+const DEFAULT_SECRET: &str = "dev-test-secret";
 static ROUTE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug)]
@@ -115,7 +115,9 @@ struct ResultCollector {
 
 impl ResultCollector {
     fn new() -> Self {
-        Self { results: Vec::new() }
+        Self {
+            results: Vec::new(),
+        }
     }
 
     fn record(&mut self, result: ScenarioResult) {
@@ -123,19 +125,31 @@ impl ResultCollector {
     }
 
     fn aggregate(&self, transport: Transport, auth_mode: AuthMode) -> AggregateResult {
-        let p0: Vec<&ScenarioResult> = self.results.iter().filter(|result| result.priority == "P0").collect();
-        let p1: Vec<&ScenarioResult> = self.results.iter().filter(|result| result.priority == "P1").collect();
+        let p0: Vec<&ScenarioResult> = self
+            .results
+            .iter()
+            .filter(|result| result.priority == "P0")
+            .collect();
+        let p1: Vec<&ScenarioResult> = self
+            .results
+            .iter()
+            .filter(|result| result.priority == "P1")
+            .collect();
 
         let rate = |rows: &[&ScenarioResult]| -> f64 {
             if rows.is_empty() {
                 return 1.0;
             }
 
-            rows.iter().filter(|result| matches!(result.verdict, Verdict::Pass)).count() as f64
+            rows.iter()
+                .filter(|result| matches!(result.verdict, Verdict::Pass))
+                .count() as f64
                 / rows.len() as f64
         };
 
-        let has_p0_fail = p0.iter().any(|result| matches!(result.verdict, Verdict::Fail));
+        let has_p0_fail = p0
+            .iter()
+            .any(|result| matches!(result.verdict, Verdict::Fail));
         let has_any_non_pass = self
             .results
             .iter()
@@ -199,16 +213,21 @@ enum StubBehavior {
 }
 
 fn main_auth_mode() -> AuthMode {
-    AuthMode::from_env(&std::env::var("CONFORMANCE_AUTH_MODE").unwrap_or_else(|_| "anonymous".to_string()))
+    AuthMode::from_env(
+        &std::env::var("CONFORMANCE_AUTH_MODE").unwrap_or_else(|_| "anonymous".to_string()),
+    )
 }
 
 fn main_transport() -> Transport {
-    Transport::from_env(&std::env::var("CONFORMANCE_TRANSPORT").unwrap_or_else(|_| "tcp".to_string()))
+    Transport::from_env(
+        &std::env::var("CONFORMANCE_TRANSPORT").unwrap_or_else(|_| "tcp".to_string()),
+    )
 }
 
 fn main_output_path() -> PathBuf {
     PathBuf::from(
-        std::env::var("CONFORMANCE_OUTPUT").unwrap_or_else(|_| "./artifacts/conformance-results.json".to_string()),
+        std::env::var("CONFORMANCE_OUTPUT")
+            .unwrap_or_else(|_| "./artifacts/conformance-results.json".to_string()),
     )
 }
 
@@ -241,9 +260,7 @@ fn broker_secret() -> String {
 }
 
 fn parse_tcp_addr(value: &str) -> (String, u16) {
-    let (host, port) = value
-        .rsplit_once(':')
-        .unwrap_or(("127.0.0.1", "0"));
+    let (host, port) = value.rsplit_once(':').unwrap_or(("127.0.0.1", "0"));
     let port = port.parse().unwrap_or(0);
     (host.to_string(), port)
 }
@@ -292,19 +309,33 @@ fn spawn_stub_server(transport: Transport, behavior: StubBehavior) -> StubServer
             }
         }),
         Transport::WebSocket => thread::spawn(move || {
+            listener
+                .set_nonblocking(true)
+                .expect("failed to make websocket listener nonblocking");
             let runtime = tokio::runtime::Runtime::new().expect("failed to create runtime");
             runtime.block_on(async move {
                 use futures_util::StreamExt;
 
                 let listener = tokio::net::TcpListener::from_std(listener)
                     .expect("failed to convert listener");
-                let (stream, _) = listener.accept().await.expect("failed to accept websocket client");
+                let (stream, _) = listener
+                    .accept()
+                    .await
+                    .expect("failed to accept websocket client");
                 let mut websocket = tokio_tungstenite::accept_async(stream)
                     .await
                     .expect("failed to accept websocket");
 
-                let _ = websocket.next().await.expect("missing connect frame").expect("invalid connect frame");
-                let _ = websocket.next().await.expect("missing request frame").expect("invalid request frame");
+                let _ = websocket
+                    .next()
+                    .await
+                    .expect("missing connect frame")
+                    .expect("invalid connect frame");
+                let _ = websocket
+                    .next()
+                    .await
+                    .expect("missing request frame")
+                    .expect("invalid request frame");
 
                 match behavior {
                     StubBehavior::Stall => thread::sleep(Duration::from_millis(500)),
@@ -347,7 +378,11 @@ fn connect_broker_client(transport: Transport, auth_mode: AuthMode) -> Result<Fi
     }
 }
 
-fn connect_stub_client(transport: Transport, auth_mode: AuthMode, stub: &StubServer) -> Result<FitzClient> {
+fn connect_stub_client(
+    transport: Transport,
+    auth_mode: AuthMode,
+    stub: &StubServer,
+) -> Result<FitzClient> {
     let secret = DEFAULT_SECRET;
     let token = jwt::make_test_jwt(REALM, secret);
 
@@ -417,7 +452,14 @@ fn connect_invalid_auth_client(transport: Transport) -> Result<FitzClient> {
     }
 }
 
-fn run_scenario<F>(scenario_id: &str, title: &str, priority: &str, transport: Transport, auth_mode: AuthMode, f: F) -> ScenarioResult
+fn run_scenario<F>(
+    scenario_id: &str,
+    title: &str,
+    priority: &str,
+    transport: Transport,
+    auth_mode: AuthMode,
+    f: F,
+) -> ScenarioResult
 where
     F: FnOnce() -> std::result::Result<ScenarioOutcome, String>,
 {
@@ -481,221 +523,348 @@ fn audit_error(err: &FitzError) -> String {
 fn execute_suite(transport: Transport, auth_mode: AuthMode) -> AggregateResult {
     let mut collector = ResultCollector::new();
 
-    collector.record(run_scenario("CS-001", "connect success", "P0", transport, auth_mode, || {
-        let client = connect_broker_client(transport, auth_mode).map_err(|err| format!("connect failed: {err}"))?;
-        let mut evidence = vec!["connect returned successfully".to_string()];
+    collector.record(run_scenario(
+        "CS-001",
+        "connect success",
+        "P0",
+        transport,
+        auth_mode,
+        || {
+            let client = connect_broker_client(transport, auth_mode)
+                .map_err(|err| format!("connect failed: {err}"))?;
+            let mut evidence = vec!["connect returned successfully".to_string()];
 
-        let route = unique_route("kv");
-        let tx = client
-            .kv()
-            .begin(&route, TransactionMode::ReadWrite)
-            .map_err(|err| format!("kv begin failed: {err}"))?;
-        tx.put(b"cs001-key", b"cs001-value")
-            .map_err(|err| format!("kv put failed: {err}"))?;
-        let value = tx
-            .get(b"cs001-key")
-            .map_err(|err| format!("kv get failed: {err}"))?
-            .ok_or_else(|| "kv get returned no value".to_string())?;
-        if value != b"cs001-value" {
-            return Err("kv round trip mismatch".to_string());
-        }
-        tx.commit().map_err(|err| format!("kv commit failed: {err}"))?;
-        evidence.push("first domain request (kv) succeeded".to_string());
-        close_client(&client);
-
-        Ok(ScenarioOutcome {
-            verdict: Verdict::Pass,
-            evidence,
-        })
-    }));
-
-    collector.record(run_scenario("CS-002", "auth failure", "P0", transport, auth_mode, || {
-        let mut evidence = Vec::new();
-        match connect_invalid_auth_client(transport) {
-            Err(err) => {
-                evidence.push(format!("connect failed as expected: {} ({})", err, audit_error(&err)));
-                Ok(ScenarioOutcome {
-                    verdict: Verdict::Pass,
-                    evidence,
-                })
+            let route = unique_route("kv");
+            let tx = client
+                .kv()
+                .begin(&route, TransactionMode::ReadWrite)
+                .map_err(|err| format!("kv begin failed: {err}"))?;
+            tx.put(b"cs001-key", b"cs001-value")
+                .map_err(|err| format!("kv put failed: {err}"))?;
+            let value = tx
+                .get(b"cs001-key")
+                .map_err(|err| format!("kv get failed: {err}"))?
+                .ok_or_else(|| "kv get returned no value".to_string())?;
+            if value != b"cs001-value" {
+                return Err("kv round trip mismatch".to_string());
             }
-            Ok(client) => {
-                let route = unique_route("kv");
-                let result = client.kv().begin(&route, TransactionMode::ReadWrite);
-                close_client(&client);
+            tx.commit()
+                .map_err(|err| format!("kv commit failed: {err}"))?;
+            evidence.push("first domain request (kv) succeeded".to_string());
+            close_client(&client);
 
-                match result {
-                    Err(err) if err.is_auth_failure() || matches!(err.kind(), FitzErrorKind::ConnectionClosed | FitzErrorKind::Transport) => {
-                        evidence.push(format!("request failed after auth rejection: {} ({})", err, audit_error(&err)));
-                        Ok(ScenarioOutcome { verdict: Verdict::Pass, evidence })
+            Ok(ScenarioOutcome {
+                verdict: Verdict::Pass,
+                evidence,
+            })
+        },
+    ));
+
+    collector.record(run_scenario(
+        "CS-002",
+        "auth failure",
+        "P0",
+        transport,
+        auth_mode,
+        || {
+            let mut evidence = Vec::new();
+            match connect_invalid_auth_client(transport) {
+                Err(err) => {
+                    evidence.push(format!(
+                        "connect failed as expected: {} ({})",
+                        err,
+                        audit_error(&err)
+                    ));
+                    Ok(ScenarioOutcome {
+                        verdict: Verdict::Pass,
+                        evidence,
+                    })
+                }
+                Ok(client) => {
+                    let route = unique_route("kv");
+                    let result = client.kv().begin(&route, TransactionMode::ReadWrite);
+                    close_client(&client);
+
+                    match result {
+                        Err(err)
+                            if err.is_auth_failure()
+                                || matches!(
+                                    err.kind(),
+                                    FitzErrorKind::ConnectionClosed | FitzErrorKind::Transport
+                                ) =>
+                        {
+                            evidence.push(format!(
+                                "request failed after auth rejection: {} ({})",
+                                err,
+                                audit_error(&err)
+                            ));
+                            Ok(ScenarioOutcome {
+                                verdict: Verdict::Pass,
+                                evidence,
+                            })
+                        }
+                        Err(err) => {
+                            evidence.push(format!(
+                                "request failed with a weaker but non-successful error: {} ({})",
+                                err,
+                                audit_error(&err)
+                            ));
+                            Ok(ScenarioOutcome {
+                                verdict: Verdict::Partial,
+                                evidence,
+                            })
+                        }
+                        Ok(_) => Ok(ScenarioOutcome {
+                            verdict: Verdict::Partial,
+                            evidence: vec![
+                                "invalid credentials did not fail the first request".to_string(),
+                            ],
+                        }),
                     }
-                    Err(err) => {
-                        evidence.push(format!("request failed with a weaker but non-successful error: {} ({})", err, audit_error(&err)));
-                        Ok(ScenarioOutcome { verdict: Verdict::Partial, evidence })
-                    }
-                    Ok(_) => Ok(ScenarioOutcome {
-                        verdict: Verdict::Partial,
-                        evidence: vec!["invalid credentials did not fail the first request".to_string()],
-                    }),
                 }
             }
-        }
-    }));
+        },
+    ));
 
-    collector.record(run_scenario("CS-003", "request success", "P0", transport, auth_mode, || {
-        let client = connect_broker_client(transport, auth_mode).map_err(|err| format!("connect failed: {err}"))?;
-        let route = unique_route("kv");
-        let tx = client
-            .kv()
-            .begin(&route, TransactionMode::ReadWrite)
-            .map_err(|err| format!("kv begin failed: {err}"))?;
-        tx.put(b"cs003-key", b"cs003-value")
-            .map_err(|err| format!("kv put failed: {err}"))?;
-        let value = tx
-            .get(b"cs003-key")
-            .map_err(|err| format!("kv get failed: {err}"))?
-            .ok_or_else(|| "kv get returned no value".to_string())?;
-        if value != b"cs003-value" {
-            return Err("kv round trip mismatch".to_string());
-        }
-        tx.commit().map_err(|err| format!("kv commit failed: {err}"))?;
-        close_client(&client);
-
-        Ok(ScenarioOutcome {
-            verdict: Verdict::Pass,
-            evidence: vec!["read-after-write succeeded".to_string()],
-        })
-    }));
-
-    collector.record(run_scenario("CS-004", "unknown route", "P0", transport, auth_mode, || {
-        // Any error when calling a route with no registered worker is acceptable —
-        // the server correctly rejects the unserviced request.  The verdict is Pass as
-        // long as the call does NOT silently succeed.  Client must remain usable afterward.
-        let client = connect_broker_client(transport, auth_mode).map_err(|err| format!("connect failed: {err}"))?;
-        let route = unique_route("rpc");
-        let result = client.rpc().call(&route, b"ping");
-
-        let (verdict, mut evidence) = match result {
-            Err(err) => (
-                Verdict::Pass,
-                vec![format!("unknown route rejected with error: {} ({})", err, audit_error(&err))],
-            ),
-            Ok(_) => (
-                Verdict::Partial,
-                vec!["rpc call unexpectedly succeeded for an unbound route".to_string()],
-            ),
-        };
-
-        // Verify client remains usable after the error.
-        let follow_route = unique_route("kv");
-        match client.kv().begin(&follow_route, TransactionMode::ReadWrite) {
-            Ok(tx) => {
-                let _ = tx.put(b"cs004-k", b"v");
-                let _ = tx.commit();
-                evidence.push("client remains usable after unknown-route error".to_string());
+    collector.record(run_scenario(
+        "CS-003",
+        "request success",
+        "P0",
+        transport,
+        auth_mode,
+        || {
+            let client = connect_broker_client(transport, auth_mode)
+                .map_err(|err| format!("connect failed: {err}"))?;
+            let route = unique_route("kv");
+            let tx = client
+                .kv()
+                .begin(&route, TransactionMode::ReadWrite)
+                .map_err(|err| format!("kv begin failed: {err}"))?;
+            tx.put(b"cs003-key", b"cs003-value")
+                .map_err(|err| format!("kv put failed: {err}"))?;
+            let value = tx
+                .get(b"cs003-key")
+                .map_err(|err| format!("kv get failed: {err}"))?
+                .ok_or_else(|| "kv get returned no value".to_string())?;
+            if value != b"cs003-value" {
+                return Err("kv round trip mismatch".to_string());
             }
-            Err(err) => {
-                evidence.push(format!("client not reusable after error: {} ({})", err, audit_error(&err)));
+            tx.commit()
+                .map_err(|err| format!("kv commit failed: {err}"))?;
+            close_client(&client);
+
+            Ok(ScenarioOutcome {
+                verdict: Verdict::Pass,
+                evidence: vec!["read-after-write succeeded".to_string()],
+            })
+        },
+    ));
+
+    collector.record(run_scenario(
+        "CS-004",
+        "unknown route",
+        "P0",
+        transport,
+        auth_mode,
+        || {
+            // Any error when calling a route with no registered worker is acceptable —
+            // the server correctly rejects the unserviced request.  The verdict is Pass as
+            // long as the call does NOT silently succeed.  Client must remain usable afterward.
+            let client = connect_broker_client(transport, auth_mode)
+                .map_err(|err| format!("connect failed: {err}"))?;
+            let route = unique_route("rpc");
+            let result = client.rpc().call(&route, b"ping");
+
+            let (verdict, mut evidence) = match result {
+                Err(err) => (
+                    Verdict::Pass,
+                    vec![format!(
+                        "unknown route rejected with error: {} ({})",
+                        err,
+                        audit_error(&err)
+                    )],
+                ),
+                Ok(_) => (
+                    Verdict::Partial,
+                    vec!["rpc call unexpectedly succeeded for an unbound route".to_string()],
+                ),
+            };
+
+            // Verify client remains usable after the error.
+            let follow_route = unique_route("kv");
+            match client.kv().begin(&follow_route, TransactionMode::ReadWrite) {
+                Ok(tx) => {
+                    let _ = tx.put(b"cs004-k", b"v");
+                    let _ = tx.commit();
+                    evidence.push("client remains usable after unknown-route error".to_string());
+                }
+                Err(err) => {
+                    evidence.push(format!(
+                        "client not reusable after error: {} ({})",
+                        err,
+                        audit_error(&err)
+                    ));
+                }
             }
-        }
-        close_client(&client);
+            close_client(&client);
 
-        Ok(ScenarioOutcome { verdict, evidence })
-    }));
+            Ok(ScenarioOutcome { verdict, evidence })
+        },
+    ));
 
-    collector.record(run_scenario("CS-005", "invalid payload", "P0", transport, auth_mode, || {
-        // Trigger a server-side domain error using a stream append with a stale
-        // offset — the same mechanism CS-013 uses.  This reliably produces a
-        // Domain or Protocol error and verifies the client surfaces it correctly.
-        let client = connect_broker_client(transport, auth_mode).map_err(|err| format!("connect failed: {err}"))?;
-        let route = unique_route("stream");
-        let mut session = client
-            .stream()
-            .begin(&route, None)
-            .map_err(|err| format!("stream begin failed: {err}"))?;
-        session
-            .append(0, b"record-1", None, None)
-            .map_err(|err| format!("append failed: {err}"))?;
-        let result = session.append(99, b"record-2", None, None);
-        close_client(&client);
+    collector.record(run_scenario(
+        "CS-005",
+        "invalid payload",
+        "P0",
+        transport,
+        auth_mode,
+        || {
+            // Trigger a server-side domain error using a stream append with a stale
+            // offset — the same mechanism CS-013 uses.  This reliably produces a
+            // Domain or Protocol error and verifies the client surfaces it correctly.
+            let client = connect_broker_client(transport, auth_mode)
+                .map_err(|err| format!("connect failed: {err}"))?;
+            let route = unique_route("stream");
+            let mut session = client
+                .stream()
+                .begin(&route, None)
+                .map_err(|err| format!("stream begin failed: {err}"))?;
+            session
+                .append(0, b"record-1", None, None)
+                .map_err(|err| format!("append failed: {err}"))?;
+            let result = session.append(99, b"record-2", None, None);
+            close_client(&client);
 
-        match result {
-            Err(err) if matches!(err.kind(), FitzErrorKind::Domain | FitzErrorKind::Protocol) => Ok(ScenarioOutcome {
-                verdict: Verdict::Pass,
-                evidence: vec![format!("invalid payload rejected with typed domain error: {} ({})", err, audit_error(&err))],
-            }),
-            Err(err) => Ok(ScenarioOutcome {
-                verdict: Verdict::Partial,
-                evidence: vec![format!("invalid payload produced a different error: {} ({})", err, audit_error(&err))],
-            }),
-            Ok(_) => Ok(ScenarioOutcome {
-                verdict: Verdict::Partial,
-                evidence: vec!["stale-offset append unexpectedly succeeded".to_string()],
-            }),
-        }
-    }));
-
-    collector.record(run_scenario("CS-006", "server error mapping", "P0", transport, auth_mode, || {
-        // Verify that a stream concurrency conflict (stale-offset append) is surfaced
-        // as a properly typed FitzError with Domain or Protocol kind.
-        let client = connect_broker_client(transport, auth_mode).map_err(|err| format!("connect failed: {err}"))?;
-        let route = unique_route("stream");
-        let mut session = client
-            .stream()
-            .begin(&route, None)
-            .map_err(|err| format!("stream begin failed: {err}"))?;
-        session
-            .append(0, b"first", None, None)
-            .map_err(|err| format!("append failed: {err}"))?;
-        let result = session.append(99, b"second", None, None);
-        close_client(&client);
-
-        match result {
-            Err(err) if matches!(err.kind(), FitzErrorKind::Domain | FitzErrorKind::Protocol) => Ok(ScenarioOutcome {
-                verdict: Verdict::Pass,
-                evidence: vec![format!("server error mapped through typed classification: {} ({})", err, audit_error(&err))],
-            }),
-            Err(err) => Ok(ScenarioOutcome {
-                verdict: Verdict::Partial,
-                evidence: vec![format!("server error mapped but classification was weaker: {} ({})", err, audit_error(&err))],
-            }),
-            Ok(_) => Ok(ScenarioOutcome {
-                verdict: Verdict::Partial,
-                evidence: vec!["stale-offset append unexpectedly succeeded".to_string()],
-            }),
-        }
-    }));
-
-    collector.record(run_scenario("CS-007", "timeout handling", "P0", transport, auth_mode, || {
-        let stub = spawn_stub_server(transport, StubBehavior::Stall);
-        let client = match connect_stub_client_with_timeout(transport, auth_mode, &stub, Duration::from_millis(50)) {
-            Ok(client) => client,
-            Err(err) => {
-                stub.join();
-                return Err(format!("timeout scenario connect failed: {err}"));
+            match result {
+                Err(err)
+                    if matches!(err.kind(), FitzErrorKind::Domain | FitzErrorKind::Protocol) =>
+                {
+                    Ok(ScenarioOutcome {
+                        verdict: Verdict::Pass,
+                        evidence: vec![format!(
+                            "invalid payload rejected with typed domain error: {} ({})",
+                            err,
+                            audit_error(&err)
+                        )],
+                    })
+                }
+                Err(err) => Ok(ScenarioOutcome {
+                    verdict: Verdict::Partial,
+                    evidence: vec![format!(
+                        "invalid payload produced a different error: {} ({})",
+                        err,
+                        audit_error(&err)
+                    )],
+                }),
+                Ok(_) => Ok(ScenarioOutcome {
+                    verdict: Verdict::Partial,
+                    evidence: vec!["stale-offset append unexpectedly succeeded".to_string()],
+                }),
             }
-        };
+        },
+    ));
 
-        let route = unique_route("kv");
-        let result = client.kv().begin(&route, TransactionMode::ReadWrite);
-        close_client(&client);
-        stub.join();
+    collector.record(run_scenario(
+        "CS-006",
+        "server error mapping",
+        "P0",
+        transport,
+        auth_mode,
+        || {
+            // Verify that a stream concurrency conflict (stale-offset append) is surfaced
+            // as a properly typed FitzError with Domain or Protocol kind.
+            let client = connect_broker_client(transport, auth_mode)
+                .map_err(|err| format!("connect failed: {err}"))?;
+            let route = unique_route("stream");
+            let mut session = client
+                .stream()
+                .begin(&route, None)
+                .map_err(|err| format!("stream begin failed: {err}"))?;
+            session
+                .append(0, b"first", None, None)
+                .map_err(|err| format!("append failed: {err}"))?;
+            let result = session.append(99, b"second", None, None);
+            close_client(&client);
 
-        match result {
-            Err(err) if matches!(err.kind(), FitzErrorKind::Timeout) => Ok(ScenarioOutcome {
-                verdict: Verdict::Pass,
-                evidence: vec![format!("request timed out as expected: {} ({})", err, audit_error(&err))],
-            }),
-            Err(err) => Ok(ScenarioOutcome {
-                verdict: Verdict::Partial,
-                evidence: vec![format!("request failed with a different error: {} ({})", err, audit_error(&err))],
-            }),
-            Ok(_) => Ok(ScenarioOutcome {
-                verdict: Verdict::Partial,
-                evidence: vec!["timeout scenario unexpectedly completed".to_string()],
-            }),
-        }
-    }));
+            match result {
+                Err(err)
+                    if matches!(err.kind(), FitzErrorKind::Domain | FitzErrorKind::Protocol) =>
+                {
+                    Ok(ScenarioOutcome {
+                        verdict: Verdict::Pass,
+                        evidence: vec![format!(
+                            "server error mapped through typed classification: {} ({})",
+                            err,
+                            audit_error(&err)
+                        )],
+                    })
+                }
+                Err(err) => Ok(ScenarioOutcome {
+                    verdict: Verdict::Partial,
+                    evidence: vec![format!(
+                        "server error mapped but classification was weaker: {} ({})",
+                        err,
+                        audit_error(&err)
+                    )],
+                }),
+                Ok(_) => Ok(ScenarioOutcome {
+                    verdict: Verdict::Partial,
+                    evidence: vec!["stale-offset append unexpectedly succeeded".to_string()],
+                }),
+            }
+        },
+    ));
+
+    collector.record(run_scenario(
+        "CS-007",
+        "timeout handling",
+        "P0",
+        transport,
+        auth_mode,
+        || {
+            let stub = spawn_stub_server(transport, StubBehavior::Stall);
+            let client = match connect_stub_client_with_timeout(
+                transport,
+                auth_mode,
+                &stub,
+                Duration::from_millis(50),
+            ) {
+                Ok(client) => client,
+                Err(err) => {
+                    stub.join();
+                    return Err(format!("timeout scenario connect failed: {err}"));
+                }
+            };
+
+            let route = unique_route("kv");
+            let result = client.kv().begin(&route, TransactionMode::ReadWrite);
+            close_client(&client);
+            stub.join();
+
+            match result {
+                Err(err) if matches!(err.kind(), FitzErrorKind::Timeout) => Ok(ScenarioOutcome {
+                    verdict: Verdict::Pass,
+                    evidence: vec![format!(
+                        "request timed out as expected: {} ({})",
+                        err,
+                        audit_error(&err)
+                    )],
+                }),
+                Err(err) => Ok(ScenarioOutcome {
+                    verdict: Verdict::Partial,
+                    evidence: vec![format!(
+                        "request failed with a different error: {} ({})",
+                        err,
+                        audit_error(&err)
+                    )],
+                }),
+                Ok(_) => Ok(ScenarioOutcome {
+                    verdict: Verdict::Partial,
+                    evidence: vec!["timeout scenario unexpectedly completed".to_string()],
+                }),
+            }
+        },
+    ));
 
     collector.record(run_scenario("CS-008", "caller cancellation", "P0", transport, auth_mode, || {
         // For a synchronous blocking client, close() is the caller cancellation primitive.
@@ -760,214 +929,292 @@ fn execute_suite(transport: Transport, auth_mode: AuthMode) -> AggregateResult {
         })
     }));
 
-    collector.record(run_scenario("CS-009", "disconnect during request", "P1", transport, auth_mode, || {
-        let stub = spawn_stub_server(transport, StubBehavior::Close);
-        let client = match connect_stub_client(transport, auth_mode, &stub) {
-            Ok(client) => client,
-            Err(err) => {
-                stub.join();
-                return Err(format!("connect to stub failed: {err}"));
+    collector.record(run_scenario(
+        "CS-009",
+        "disconnect during request",
+        "P1",
+        transport,
+        auth_mode,
+        || {
+            let stub = spawn_stub_server(transport, StubBehavior::Close);
+            let client = match connect_stub_client(transport, auth_mode, &stub) {
+                Ok(client) => client,
+                Err(err) => {
+                    stub.join();
+                    return Err(format!("connect to stub failed: {err}"));
+                }
+            };
+
+            let route = unique_route("kv");
+            let result = client.kv().begin(&route, TransactionMode::ReadWrite);
+            close_client(&client);
+            stub.join();
+
+            match result {
+                Err(err) if matches!(err.kind(), FitzErrorKind::ConnectionClosed) => {
+                    Ok(ScenarioOutcome {
+                        verdict: Verdict::Pass,
+                        evidence: vec![format!(
+                            "request observed connection close: {} ({})",
+                            err,
+                            audit_error(&err)
+                        )],
+                    })
+                }
+                Err(err) => Ok(ScenarioOutcome {
+                    verdict: Verdict::Partial,
+                    evidence: vec![format!(
+                        "disconnect surfaced differently: {} ({})",
+                        err,
+                        audit_error(&err)
+                    )],
+                }),
+                Ok(_) => Ok(ScenarioOutcome {
+                    verdict: Verdict::Partial,
+                    evidence: vec![
+                        "request unexpectedly completed after server disconnect".to_string(),
+                    ],
+                }),
             }
-        };
+        },
+    ));
 
-        let route = unique_route("kv");
-        let result = client.kv().begin(&route, TransactionMode::ReadWrite);
-        close_client(&client);
-        stub.join();
+    collector.record(run_scenario(
+        "CS-010",
+        "reconnect and retry behavior",
+        "P1",
+        transport,
+        auth_mode,
+        || {
+            // For a synchronous blocking client, reconnect is expressed as creating a new
+            // FitzClient after a connection loss.  This scenario verifies that workflow:
+            // 1. Connect, confirm a request works.
+            // 2. Close the client (simulates connection loss / explicit teardown).
+            // 3. Create a new client (the "reconnect").
+            // 4. Confirm new requests succeed on the fresh connection.
+            let client = connect_broker_client(transport, auth_mode)
+                .map_err(|err| format!("initial connect failed: {err}"))?;
+            let route = unique_route("kv");
+            let tx = client
+                .kv()
+                .begin(&route, TransactionMode::ReadWrite)
+                .map_err(|err| format!("pre-reconnect kv begin failed: {err}"))?;
+            tx.put(b"pre-reconnect", b"ok")
+                .map_err(|err| format!("pre-reconnect kv put failed: {err}"))?;
+            tx.commit()
+                .map_err(|err| format!("pre-reconnect kv commit failed: {err}"))?;
+            close_client(&client);
 
-        match result {
-            Err(err) if matches!(err.kind(), FitzErrorKind::ConnectionClosed) => Ok(ScenarioOutcome {
+            // Reconnect: create a new client.
+            let reconnected = connect_broker_client(transport, auth_mode)
+                .map_err(|err| format!("reconnect (new client) failed: {err}"))?;
+            let post_route = unique_route("kv");
+            let post_tx = reconnected
+                .kv()
+                .begin(&post_route, TransactionMode::ReadWrite)
+                .map_err(|err| format!("post-reconnect kv begin failed: {err}"))?;
+            post_tx
+                .put(b"post-reconnect", b"ok")
+                .map_err(|err| format!("post-reconnect kv put failed: {err}"))?;
+            post_tx
+                .commit()
+                .map_err(|err| format!("post-reconnect kv commit failed: {err}"))?;
+            close_client(&reconnected);
+
+            Ok(ScenarioOutcome {
                 verdict: Verdict::Pass,
-                evidence: vec![format!("request observed connection close: {} ({})", err, audit_error(&err))],
-            }),
-            Err(err) => Ok(ScenarioOutcome {
-                verdict: Verdict::Partial,
-                evidence: vec![format!("disconnect surfaced differently: {} ({})", err, audit_error(&err))],
-            }),
-            Ok(_) => Ok(ScenarioOutcome {
-                verdict: Verdict::Partial,
-                evidence: vec!["request unexpectedly completed after server disconnect".to_string()],
-            }),
-        }
-    }));
+                evidence: vec![
+                    "initial request succeeded before close".to_string(),
+                    "new FitzClient created after close (manual reconnect for blocking API)"
+                        .to_string(),
+                    "new requests succeeded on the reconnected client".to_string(),
+                ],
+            })
+        },
+    ));
 
-    collector.record(run_scenario("CS-010", "reconnect and retry behavior", "P1", transport, auth_mode, || {
-        // For a synchronous blocking client, reconnect is expressed as creating a new
-        // FitzClient after a connection loss.  This scenario verifies that workflow:
-        // 1. Connect, confirm a request works.
-        // 2. Close the client (simulates connection loss / explicit teardown).
-        // 3. Create a new client (the "reconnect").
-        // 4. Confirm new requests succeed on the fresh connection.
-        let client = connect_broker_client(transport, auth_mode)
-            .map_err(|err| format!("initial connect failed: {err}"))?;
-        let route = unique_route("kv");
-        let tx = client
-            .kv()
-            .begin(&route, TransactionMode::ReadWrite)
-            .map_err(|err| format!("pre-reconnect kv begin failed: {err}"))?;
-        tx.put(b"pre-reconnect", b"ok")
-            .map_err(|err| format!("pre-reconnect kv put failed: {err}"))?;
-        tx.commit()
-            .map_err(|err| format!("pre-reconnect kv commit failed: {err}"))?;
-        close_client(&client);
+    collector.record(run_scenario(
+        "CS-011",
+        "stream receive sequence",
+        "P1",
+        transport,
+        auth_mode,
+        || {
+            // Use separate clients for subscriber and publisher.  A shared blocking
+            // connection cannot serve both roles concurrently: the subscriber's
+            // recv_message_matching loop holds the connection lock, preventing the
+            // publisher from sending its commit frame.
+            let sub_client = connect_broker_client(transport, auth_mode)
+                .map_err(|err| format!("sub client connect failed: {err}"))?;
+            let pub_client = connect_broker_client(transport, auth_mode)
+                .map_err(|err| format!("pub client connect failed: {err}"))?;
+            let route = unique_route("stream");
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let subscription = sub_client
+                .stream()
+                .subscribe(&route)
+                .map_err(|err| format!("stream subscribe failed: {err}"))?;
+            let notification_route = route.clone();
 
-        // Reconnect: create a new client.
-        let reconnected = connect_broker_client(transport, auth_mode)
-            .map_err(|err| format!("reconnect (new client) failed: {err}"))?;
-        let post_route = unique_route("kv");
-        let post_tx = reconnected
-            .kv()
-            .begin(&post_route, TransactionMode::ReadWrite)
-            .map_err(|err| format!("post-reconnect kv begin failed: {err}"))?;
-        post_tx.put(b"post-reconnect", b"ok")
-            .map_err(|err| format!("post-reconnect kv put failed: {err}"))?;
-        post_tx.commit()
-            .map_err(|err| format!("post-reconnect kv commit failed: {err}"))?;
-        close_client(&reconnected);
+            let listener = thread::spawn(move || {
+                ready_tx
+                    .send(())
+                    .expect("failed to signal listener readiness");
+                let notification = subscription
+                    .next()
+                    .expect("failed to receive stream notification");
+                subscription
+                    .unsubscribe()
+                    .expect("failed to unsubscribe stream subscription");
+                close_client(&sub_client);
+                notification
+            });
 
-        Ok(ScenarioOutcome {
-            verdict: Verdict::Pass,
-            evidence: vec![
-                "initial request succeeded before close".to_string(),
-                "new FitzClient created after close (manual reconnect for blocking API)".to_string(),
-                "new requests succeeded on the reconnected client".to_string(),
-            ],
-        })
-    }));
+            ready_rx.recv().expect("listener did not become ready");
+            let mut session = pub_client
+                .stream()
+                .begin(&route, None)
+                .map_err(|err| format!("stream begin failed: {err}"))?;
+            session
+                .append(0, b"record-1", None, None)
+                .map_err(|err| format!("append 1 failed: {err}"))?;
+            session
+                .append(1, b"record-2", None, None)
+                .map_err(|err| format!("append 2 failed: {err}"))?;
+            session
+                .commit(StreamCommitMode::Sync)
+                .map_err(|err| format!("stream commit failed: {err}"))?;
+            close_client(&pub_client);
 
-    collector.record(run_scenario("CS-011", "stream receive sequence", "P1", transport, auth_mode, || {
-        // Use separate clients for subscriber and publisher.  A shared blocking
-        // connection cannot serve both roles concurrently: the subscriber's
-        // recv_message_matching loop holds the connection lock, preventing the
-        // publisher from sending its commit frame.
-        let sub_client = connect_broker_client(transport, auth_mode).map_err(|err| format!("sub client connect failed: {err}"))?;
-        let pub_client = connect_broker_client(transport, auth_mode).map_err(|err| format!("pub client connect failed: {err}"))?;
-        let route = unique_route("stream");
-        let (ready_tx, ready_rx) = mpsc::channel();
-        let subscription = sub_client
-            .stream()
-            .subscribe(&route)
-            .map_err(|err| format!("stream subscribe failed: {err}"))?;
-        let notification_route = route.clone();
+            let notification = listener
+                .join()
+                .map_err(|_| "listener thread panicked".to_string())?;
 
-        let listener = thread::spawn(move || {
-            ready_tx.send(()).expect("failed to signal listener readiness");
-            let notification = subscription.next().expect("failed to receive stream notification");
-            subscription.unsubscribe().expect("failed to unsubscribe stream subscription");
-            close_client(&sub_client);
-            notification
-        });
+            if notification.route != notification_route {
+                return Err("stream notification route mismatch".to_string());
+            }
 
-        ready_rx.recv().expect("listener did not become ready");
-        let mut session = pub_client
-            .stream()
-            .begin(&route, None)
-            .map_err(|err| format!("stream begin failed: {err}"))?;
-        session
-            .append(0, b"record-1", None, None)
-            .map_err(|err| format!("append 1 failed: {err}"))?;
-        session
-            .append(1, b"record-2", None, None)
-            .map_err(|err| format!("append 2 failed: {err}"))?;
-        session
-            .commit(StreamCommitMode::Sync)
-            .map_err(|err| format!("stream commit failed: {err}"))?;
-        close_client(&pub_client);
-
-        let notification = listener.join().map_err(|_| "listener thread panicked".to_string())?;
-
-        if notification.route != notification_route {
-            return Err("stream notification route mismatch".to_string());
-        }
-
-        Ok(ScenarioOutcome {
-            verdict: Verdict::Pass,
-            evidence: vec![format!("received stream notification for {notification_route}")],
-        })
-    }));
-
-    collector.record(run_scenario("CS-012", "stream completion", "P1", transport, auth_mode, || {
-        let client = connect_broker_client(transport, auth_mode).map_err(|err| format!("connect failed: {err}"))?;
-        let route = unique_route("stream");
-        let mut session = client
-            .stream()
-            .begin(&route, None)
-            .map_err(|err| format!("stream begin failed: {err}"))?;
-        let first_offset = session
-            .append(0, b"record-1", None, None)
-            .map_err(|err| format!("append 1 failed: {err}"))?
-            .ok_or_else(|| "missing first offset".to_string())?;
-        let second_offset = session
-            .append(first_offset + 1, b"record-2", None, None)
-            .map_err(|err| format!("append 2 failed: {err}"))?
-            .ok_or_else(|| "missing second offset".to_string())?;
-        if second_offset < first_offset {
-            return Err("stream offsets regressed".to_string());
-        }
-
-        session
-            .commit(StreamCommitMode::Sync)
-            .map_err(|err| format!("stream commit failed: {err}"))?;
-
-        let records = client
-            .stream()
-            .read(&route, 0, 10, None, None)
-            .map_err(|err| format!("stream read failed: {err}"))?;
-        let last = client
-            .stream()
-            .peek(&route)
-            .map_err(|err| format!("stream peek failed: {err}"))?
-            .ok_or_else(|| "missing last record".to_string())?;
-        let metadata = client
-            .stream()
-            .metadata(&route)
-            .map_err(|err| format!("stream metadata failed: {err}"))?;
-        close_client(&client);
-
-        if records.len() != 2 {
-            return Err("stream read did not return both records".to_string());
-        }
-        if last.body != b"record-2" {
-            return Err("stream last record mismatch".to_string());
-        }
-        if metadata.record_count < 2 {
-            return Err("stream metadata record count too small".to_string());
-        }
-
-        Ok(ScenarioOutcome {
-            verdict: Verdict::Pass,
-            evidence: vec!["stream commit, read, peek, and metadata all succeeded".to_string()],
-        })
-    }));
-
-    collector.record(run_scenario("CS-013", "stream error mid-flight", "P1", transport, auth_mode, || {
-        let client = connect_broker_client(transport, auth_mode).map_err(|err| format!("connect failed: {err}"))?;
-        let route = unique_route("stream");
-        let mut session = client
-            .stream()
-            .begin(&route, None)
-            .map_err(|err| format!("stream begin failed: {err}"))?;
-        session
-            .append(0, b"record-1", None, None)
-            .map_err(|err| format!("append 1 failed: {err}"))?;
-        let result = session.append(99, b"record-2", None, None);
-        close_client(&client);
-
-        match result {
-            Err(err) if matches!(err.kind(), FitzErrorKind::Domain | FitzErrorKind::Protocol) => Ok(ScenarioOutcome {
+            Ok(ScenarioOutcome {
                 verdict: Verdict::Pass,
-                evidence: vec![format!("stream mid-flight error mapped correctly: {} ({})", err, audit_error(&err))],
-            }),
-            Err(err) => Ok(ScenarioOutcome {
-                verdict: Verdict::Partial,
-                evidence: vec![format!("stream mid-flight error mapped differently: {} ({})", err, audit_error(&err))],
-            }),
-            Ok(_) => Ok(ScenarioOutcome {
-                verdict: Verdict::Partial,
-                evidence: vec!["stream append unexpectedly succeeded with a stale offset".to_string()],
-            }),
-        }
-    }));
+                evidence: vec![format!(
+                    "received stream notification for {notification_route}"
+                )],
+            })
+        },
+    ));
+
+    collector.record(run_scenario(
+        "CS-012",
+        "stream completion",
+        "P1",
+        transport,
+        auth_mode,
+        || {
+            let client = connect_broker_client(transport, auth_mode)
+                .map_err(|err| format!("connect failed: {err}"))?;
+            let route = unique_route("stream");
+            let mut session = client
+                .stream()
+                .begin(&route, None)
+                .map_err(|err| format!("stream begin failed: {err}"))?;
+            let first_offset = session
+                .append(0, b"record-1", None, None)
+                .map_err(|err| format!("append 1 failed: {err}"))?
+                .ok_or_else(|| "missing first offset".to_string())?;
+            let second_offset = session
+                .append(first_offset + 1, b"record-2", None, None)
+                .map_err(|err| format!("append 2 failed: {err}"))?
+                .ok_or_else(|| "missing second offset".to_string())?;
+            if second_offset < first_offset {
+                return Err("stream offsets regressed".to_string());
+            }
+
+            session
+                .commit(StreamCommitMode::Sync)
+                .map_err(|err| format!("stream commit failed: {err}"))?;
+
+            let records = client
+                .stream()
+                .read(&route, 0, 10, None, None)
+                .map_err(|err| format!("stream read failed: {err}"))?;
+            let last = client
+                .stream()
+                .peek(&route)
+                .map_err(|err| format!("stream peek failed: {err}"))?
+                .ok_or_else(|| "missing last record".to_string())?;
+            let metadata = client
+                .stream()
+                .metadata(&route)
+                .map_err(|err| format!("stream metadata failed: {err}"))?;
+            close_client(&client);
+
+            if records.len() != 2 {
+                return Err("stream read did not return both records".to_string());
+            }
+            if last.body != b"record-2" {
+                return Err("stream last record mismatch".to_string());
+            }
+            if metadata.record_count < 2 {
+                return Err("stream metadata record count too small".to_string());
+            }
+
+            Ok(ScenarioOutcome {
+                verdict: Verdict::Pass,
+                evidence: vec!["stream commit, read, peek, and metadata all succeeded".to_string()],
+            })
+        },
+    ));
+
+    collector.record(run_scenario(
+        "CS-013",
+        "stream error mid-flight",
+        "P1",
+        transport,
+        auth_mode,
+        || {
+            let client = connect_broker_client(transport, auth_mode)
+                .map_err(|err| format!("connect failed: {err}"))?;
+            let route = unique_route("stream");
+            let mut session = client
+                .stream()
+                .begin(&route, None)
+                .map_err(|err| format!("stream begin failed: {err}"))?;
+            session
+                .append(0, b"record-1", None, None)
+                .map_err(|err| format!("append 1 failed: {err}"))?;
+            let result = session.append(99, b"record-2", None, None);
+            close_client(&client);
+
+            match result {
+                Err(err)
+                    if matches!(err.kind(), FitzErrorKind::Domain | FitzErrorKind::Protocol) =>
+                {
+                    Ok(ScenarioOutcome {
+                        verdict: Verdict::Pass,
+                        evidence: vec![format!(
+                            "stream mid-flight error mapped correctly: {} ({})",
+                            err,
+                            audit_error(&err)
+                        )],
+                    })
+                }
+                Err(err) => Ok(ScenarioOutcome {
+                    verdict: Verdict::Partial,
+                    evidence: vec![format!(
+                        "stream mid-flight error mapped differently: {} ({})",
+                        err,
+                        audit_error(&err)
+                    )],
+                }),
+                Ok(_) => Ok(ScenarioOutcome {
+                    verdict: Verdict::Partial,
+                    evidence: vec![
+                        "stream append unexpectedly succeeded with a stale offset".to_string(),
+                    ],
+                }),
+            }
+        },
+    ));
 
     collector.record(run_scenario("CS-014", "concurrent requests", "P1", transport, auth_mode, || {
         // For a blocking synchronous client, requests on a shared connection are
@@ -1014,41 +1261,71 @@ fn execute_suite(transport: Transport, auth_mode: AuthMode) -> AggregateResult {
         })
     }));
 
-    collector.record(run_scenario("CS-015", "shutdown during active work", "P1", transport, auth_mode, || {
-        let stub = spawn_stub_server(transport, StubBehavior::Stall);
-        let client = match connect_stub_client(transport, auth_mode, &stub) {
-            Ok(client) => client,
-            Err(err) => {
-                stub.join();
-                return Err(format!("connect to stub failed: {err}"));
+    collector.record(run_scenario(
+        "CS-015",
+        "shutdown during active work",
+        "P1",
+        transport,
+        auth_mode,
+        || {
+            let stub = spawn_stub_server(transport, StubBehavior::Stall);
+            let client = match connect_stub_client(transport, auth_mode, &stub) {
+                Ok(client) => client,
+                Err(err) => {
+                    stub.join();
+                    return Err(format!("connect to stub failed: {err}"));
+                }
+            };
+
+            let request_client = Arc::new(client);
+            let request_route = unique_route("kv");
+            let worker_client = Arc::clone(&request_client);
+            let worker = thread::spawn(move || {
+                worker_client
+                    .kv()
+                    .begin(&request_route, TransactionMode::ReadWrite)
+            });
+
+            thread::sleep(Duration::from_millis(50));
+            close_client(&request_client);
+            let result = worker
+                .join()
+                .map_err(|_| "request thread panicked".to_string())?;
+            stub.join();
+
+            match result {
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        FitzErrorKind::ConnectionClosed | FitzErrorKind::Transport
+                    ) =>
+                {
+                    Ok(ScenarioOutcome {
+                        verdict: Verdict::Pass,
+                        evidence: vec![format!(
+                            "shutdown interrupted the active request: {} ({})",
+                            err,
+                            audit_error(&err)
+                        )],
+                    })
+                }
+                Err(err) => Ok(ScenarioOutcome {
+                    verdict: Verdict::Partial,
+                    evidence: vec![format!(
+                        "shutdown produced a different error: {} ({})",
+                        err,
+                        audit_error(&err)
+                    )],
+                }),
+                Ok(_) => Ok(ScenarioOutcome {
+                    verdict: Verdict::Partial,
+                    evidence: vec![
+                        "active request completed before shutdown could interrupt it".to_string(),
+                    ],
+                }),
             }
-        };
-
-        let request_client = Arc::new(client);
-        let request_route = unique_route("kv");
-        let worker_client = Arc::clone(&request_client);
-        let worker = thread::spawn(move || worker_client.kv().begin(&request_route, TransactionMode::ReadWrite));
-
-        thread::sleep(Duration::from_millis(50));
-        close_client(&request_client);
-        let result = worker.join().map_err(|_| "request thread panicked".to_string())?;
-        stub.join();
-
-        match result {
-            Err(err) if matches!(err.kind(), FitzErrorKind::ConnectionClosed | FitzErrorKind::Transport) => Ok(ScenarioOutcome {
-                verdict: Verdict::Pass,
-                evidence: vec![format!("shutdown interrupted the active request: {} ({})", err, audit_error(&err))],
-            }),
-            Err(err) => Ok(ScenarioOutcome {
-                verdict: Verdict::Partial,
-                evidence: vec![format!("shutdown produced a different error: {} ({})", err, audit_error(&err))],
-            }),
-            Ok(_) => Ok(ScenarioOutcome {
-                verdict: Verdict::Partial,
-                evidence: vec!["active request completed before shutdown could interrupt it".to_string()],
-            }),
-        }
-    }));
+        },
+    ));
 
     collector.aggregate(transport, auth_mode)
 }
@@ -1058,8 +1335,11 @@ fn write_results(result: &AggregateResult) -> PathBuf {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).expect("failed to create conformance output directory");
     }
-    fs::write(&path, serde_json::to_vec_pretty(result).expect("failed to serialize conformance result"))
-        .expect("failed to write conformance output");
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(result).expect("failed to serialize conformance result"),
+    )
+    .expect("failed to write conformance output");
     path
 }
 
@@ -1071,7 +1351,12 @@ fn conformance_suite() {
     let result = execute_suite(transport, auth_mode);
     let output_path = write_results(&result);
 
-    assert_ne!(result.overall_status, "fail", "conformance recorded a failing P0 scenario; see {}", output_path.display());
+    assert_ne!(
+        result.overall_status,
+        "fail",
+        "conformance recorded a failing P0 scenario; see {}",
+        output_path.display()
+    );
 }
 
 #[test]

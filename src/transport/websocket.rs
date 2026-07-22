@@ -7,8 +7,8 @@ use std::io;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time;
-use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::MaybeTlsStream;
+use tokio_tungstenite::tungstenite::Message;
 
 pub struct WebSocketTransport {
     ws: tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>,
@@ -55,15 +55,17 @@ impl Transport for WebSocketTransport {
         self.rt.block_on(async {
             // WebSocket: send as binary message (no length prefix)
             match timeout {
-                Some(duration) => time::timeout(duration, self.ws.send(Message::Binary(payload)))
-                    .await
-                    .map_err(|_| {
-                        io::Error::new(io::ErrorKind::TimedOut, "WebSocket send timed out")
-                    })?
-                    .map_err(io::Error::other),
+                Some(duration) => {
+                    time::timeout(duration, self.ws.send(Message::Binary(payload.into())))
+                        .await
+                        .map_err(|_| {
+                            io::Error::new(io::ErrorKind::TimedOut, "WebSocket send timed out")
+                        })?
+                        .map_err(io::Error::other)
+                }
                 None => self
                     .ws
-                    .send(Message::Binary(payload))
+                    .send(Message::Binary(payload.into()))
                     .await
                     .map_err(io::Error::other),
             }
@@ -76,18 +78,18 @@ impl Transport for WebSocketTransport {
             let next_message = async {
                 loop {
                     match self.ws.next().await {
-                        Some(Ok(Message::Binary(data))) => return Ok(data),
+                        Some(Ok(Message::Binary(data))) => return Ok(data.to_vec()),
                         Some(Ok(Message::Text(_))) => {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 "Text frames not supported",
-                            ))
+                            ));
                         }
                         Some(Ok(Message::Close(_))) => {
                             return Err(io::Error::new(
                                 io::ErrorKind::ConnectionAborted,
                                 "Server closed connection",
-                            ))
+                            ));
                         }
                         Some(Ok(_)) => continue,
                         Some(Err(e)) => return Err(io::Error::other(e)),
@@ -95,7 +97,7 @@ impl Transport for WebSocketTransport {
                             return Err(io::Error::new(
                                 io::ErrorKind::ConnectionReset,
                                 "Connection closed",
-                            ))
+                            ));
                         }
                     }
                 }

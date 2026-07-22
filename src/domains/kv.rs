@@ -25,7 +25,7 @@ use crate::codec::{PayloadDecoder, PayloadEncoder};
 use crate::connection::SharedConnection;
 use crate::domains::routes::validate_fixed_route;
 use crate::error::{FitzError, Result};
-use crate::protocol::{message_type, TransactionMode};
+use crate::protocol::{TransactionMode, message_type};
 
 /// KV domain client.
 ///

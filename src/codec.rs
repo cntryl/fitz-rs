@@ -44,6 +44,11 @@ impl PayloadEncoder {
         self
     }
 
+    pub fn put_raw(&mut self, bytes: &[u8]) -> &mut Self {
+        self.buf.extend_from_slice(bytes);
+        self
+    }
+
     pub fn put_string(&mut self, s: &str) -> &mut Self {
         let bytes = s.as_bytes();
         self.buf
@@ -117,6 +122,14 @@ impl<'a> PayloadDecoder<'a> {
         let bytes = self.buf[self.pos..self.pos + len].to_vec();
         self.pos += len;
         Ok(bytes)
+    }
+
+    pub fn get_fixed<const N: usize>(&mut self) -> Result<[u8; N]> {
+        self.check_len(N)?;
+        let mut value = [0_u8; N];
+        value.copy_from_slice(&self.buf[self.pos..self.pos + N]);
+        self.pos += N;
+        Ok(value)
     }
 
     pub fn get_string(&mut self) -> Result<String> {

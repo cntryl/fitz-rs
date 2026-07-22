@@ -1,6 +1,6 @@
 mod jwt;
 
-use cntryl::FitzClient;
+use cntryl_fitz::FitzClient;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
@@ -15,14 +15,10 @@ enum Transport {
 }
 
 fn connect_client(transport: Transport) -> FitzClient {
-    let token = jwt::make_test_jwt("test-realm", "test-secret-key");
+    let token = jwt::make_test_jwt("test-realm", "dev-test-secret");
     match transport {
-        Transport::Tcp => {
-            FitzClient::connect_tcp("127.0.0.1", 4091, &token)
-        }
-        Transport::WebSocket => {
-            FitzClient::connect_ws("ws://127.0.0.1:4090/ws", &token)
-        }
+        Transport::Tcp => FitzClient::connect_tcp("127.0.0.1", 4091, &token),
+        Transport::WebSocket => FitzClient::connect_ws("ws://127.0.0.1:4090/ws", &token),
     }
     .expect("failed to connect to fitz broker")
 }
@@ -81,10 +77,12 @@ fn run_single_response_rpc(transport: Transport) {
         .expect("missing first rpc response");
     assert_eq!(first.sequence, 0);
     assert_eq!(first.body, b"pong");
-    assert!(response_stream
-        .next()
-        .expect("failed to read terminal rpc frame")
-        .is_none());
+    assert!(
+        response_stream
+            .next()
+            .expect("failed to read terminal rpc frame")
+            .is_none()
+    );
 
     caller_client
         .close()

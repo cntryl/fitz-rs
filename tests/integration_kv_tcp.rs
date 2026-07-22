@@ -4,8 +4,8 @@
 
 mod jwt;
 
-use cntryl::TransactionMode;
-use cntryl::FitzClient;
+use cntryl_fitz::FitzClient;
+use cntryl_fitz::TransactionMode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -25,7 +25,7 @@ fn unique_kv_route(suffix: &str) -> String {
 #[test]
 fn should_execute_kv_transaction_over_tcp() {
     // Arrange
-    let token = jwt::make_test_jwt("test-realm", "test-secret-key");
+    let token = jwt::make_test_jwt("test-realm", "dev-test-secret");
     let client = FitzClient::connect_tcp("127.0.0.1", 4091, &token)
         .expect("Failed to connect to Fitz server");
 
@@ -86,9 +86,8 @@ fn should_execute_kv_transaction_over_tcp() {
 #[test]
 fn should_rollback_kv_transaction_over_tcp() {
     // Arrange
-    let token = jwt::make_test_jwt("test-realm", "test-secret-key");
-    let client = FitzClient::connect_tcp("127.0.0.1", 4091, &token)
-        .expect("Failed to connect");
+    let token = jwt::make_test_jwt("test-realm", "dev-test-secret");
+    let client = FitzClient::connect_tcp("127.0.0.1", 4091, &token).expect("Failed to connect");
 
     let kv = client.kv();
     let route = unique_kv_route("rollback");
@@ -150,9 +149,8 @@ fn should_rollback_kv_transaction_over_tcp() {
 #[test]
 fn should_isolate_multiple_kv_transactions_over_tcp() {
     // Arrange
-    let token = jwt::make_test_jwt("test-realm", "test-secret-key");
-    let client = FitzClient::connect_tcp("127.0.0.1", 4091, &token)
-        .expect("Failed to connect");
+    let token = jwt::make_test_jwt("test-realm", "dev-test-secret");
+    let client = FitzClient::connect_tcp("127.0.0.1", 4091, &token).expect("Failed to connect");
 
     let kv = client.kv();
     let route = unique_kv_route("isolation");

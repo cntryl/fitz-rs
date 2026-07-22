@@ -35,6 +35,13 @@ impl TcpTransport {
         self.stream.set_write_timeout(write_timeout)?;
         Ok(())
     }
+
+    pub fn try_clone(&self) -> std::io::Result<Self> {
+        Ok(Self {
+            stream: self.stream.try_clone()?,
+            read_buf: vec![0_u8; self.read_buf.len()],
+        })
+    }
 }
 
 impl Transport for TcpTransport {

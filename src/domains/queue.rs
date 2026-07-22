@@ -120,10 +120,14 @@ impl QueueClient {
 
         let payload = enc.finish();
         let resp = match timeout {
-            Some(timeout) => self
+            Some(timeout) => self.conn.send_request_with_timeout(
+                message_type::QUEUE_RESERVE,
+                &payload,
+                timeout,
+            )?,
+            None => self
                 .conn
-                .send_request_with_timeout(message_type::QUEUE_RESERVE, &payload, timeout)?,
-            None => self.conn.send_request(message_type::QUEUE_RESERVE, &payload)?,
+                .send_request(message_type::QUEUE_RESERVE, &payload)?,
         };
 
         decode_reserve_response(route, &resp, self.conn.clone())
@@ -228,11 +232,7 @@ fn decode_enqueue_response(buf: &[u8]) -> Result<u64> {
         return Err(decode_queue_error("ENQUEUE", &mut dec));
     }
 
-    if dec.is_empty() {
-        Ok(0)
-    } else {
-        dec.get_u64()
-    }
+    if dec.is_empty() { Ok(0) } else { dec.get_u64() }
 }
 
 fn decode_reserve_response(

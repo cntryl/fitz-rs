@@ -39,13 +39,12 @@ impl RpcClient {
         let correlation_id = *Uuid::new_v4().as_bytes();
 
         let mut enc = PayloadEncoder::new();
-        enc.put_bytes(&correlation_id);
+        enc.put_raw(&correlation_id);
         enc.put_string(route);
-        enc.put_string("");
         enc.put_bytes(body);
 
-        let resp = self.conn.send_request(message_type::RPC_REQUEST, &enc.finish())?;
-        decode_rpc_status_response("CALL", &resp)?;
+        self.conn
+            .send_only(message_type::RPC_REQUEST, &enc.finish())?;
 
         Ok(RpcResponseStream {
             conn: self.conn.clone(),
@@ -63,6 +62,7 @@ impl RpcClient {
 
         let mut enc = PayloadEncoder::new();
         enc.put_string(pattern);
+        enc.put_u32(1);
 
         let resp = self
             .conn
@@ -187,20 +187,13 @@ impl RpcWorkerRequest {
         }
 
         let mut enc = PayloadEncoder::new();
-        enc.put_bytes(&self.correlation_id);
+        enc.put_raw(&self.correlation_id);
         enc.put_u64(self.next_sequence);
-        enc.put_bytes(body);
         enc.put_u8(is_end as u8);
+        enc.put_bytes(body);
 
         self.conn
             .send_only(message_type::RPC_RESPONSE, &enc.finish())?;
-
-        let _ = self.conn.recv_message_matching(|msg_type, payload| {
-            msg_type == message_type::RPC_ACK
-                && decode_rpc_ack(payload)
-                    .map(|correlation_id| correlation_id == self.correlation_id)
-                    .unwrap_or(false)
-        })?;
 
         self.next_sequence += 1;
         if is_end {
@@ -246,41 +239,34 @@ fn decode_rpc_status_response(operation: &str, buf: &[u8]) -> Result<()> {
 
 fn decode_rpc_request_route(payload: &[u8]) -> Result<String> {
     let mut dec = PayloadDecoder::new(payload);
-    let correlation_id = dec.get_bytes()?;
-    if correlation_id.len() != 16 {
-        return Err(FitzError::Protocol(
-            "RPC request correlation id must be 16 bytes".to_string(),
-        ));
-    }
+    let _correlation_id = dec.get_fixed::<16>()?;
     dec.get_string()
 }
 
 fn decode_rpc_request(payload: &[u8]) -> Result<RpcInboundRequest> {
     let mut dec = PayloadDecoder::new(payload);
-    let correlation_id = decode_uuid_bytes(dec.get_bytes()?, "RPC request correlation id")?;
+    let correlation_id = dec.get_fixed::<16>()?;
     let route = dec.get_string()?;
-    let reply_route = dec.get_string()?;
     let body = dec.get_bytes()?;
 
     Ok(RpcInboundRequest {
         correlation_id,
         route,
-        reply_route,
+        reply_route: String::new(),
         body,
     })
 }
 
 fn decode_rpc_response_correlation_id(payload: &[u8]) -> Result<[u8; 16]> {
-    let mut dec = PayloadDecoder::new(payload);
-    decode_uuid_bytes(dec.get_bytes()?, "RPC response correlation id")
+    PayloadDecoder::new(payload).get_fixed::<16>()
 }
 
 fn decode_rpc_response(payload: &[u8]) -> Result<DecodedRpcResponse> {
     let mut dec = PayloadDecoder::new(payload);
-    let correlation_id = decode_uuid_bytes(dec.get_bytes()?, "RPC response correlation id")?;
+    let correlation_id = dec.get_fixed::<16>()?;
     let sequence = dec.get_u64()?;
-    let body = dec.get_bytes()?;
     let stream_end = dec.get_u8()? != 0;
+    let body = dec.get_bytes()?;
 
     Ok(DecodedRpcResponse {
         correlation_id,
@@ -288,23 +274,6 @@ fn decode_rpc_response(payload: &[u8]) -> Result<DecodedRpcResponse> {
         body,
         stream_end,
     })
-}
-
-fn decode_rpc_ack(payload: &[u8]) -> Result<[u8; 16]> {
-    let mut dec = PayloadDecoder::new(payload);
-    decode_uuid_bytes(dec.get_bytes()?, "RPC ack correlation id")
-}
-
-fn decode_uuid_bytes(bytes: Vec<u8>, field_name: &str) -> Result<[u8; 16]> {
-    if bytes.len() != 16 {
-        return Err(FitzError::Protocol(format!(
-            "{field_name} must be 16 bytes"
-        )));
-    }
-
-    let mut correlation_id = [0u8; 16];
-    correlation_id.copy_from_slice(&bytes);
-    Ok(correlation_id)
 }
 
 fn route_matches_pattern(route: &str, pattern: &str) -> bool {
@@ -343,12 +312,11 @@ mod tests {
     fn should_decode_rpc_response_payload() {
         let correlation_id = [7u8; 16];
         let mut buf = Vec::new();
-        buf.extend_from_slice(&(16u32).to_be_bytes());
         buf.extend_from_slice(&correlation_id);
         buf.extend_from_slice(&3u64.to_be_bytes());
+        buf.push(1);
         buf.extend_from_slice(&(4u32).to_be_bytes());
         buf.extend_from_slice(b"pong");
-        buf.push(1);
 
         let response = decode_rpc_response(&buf).unwrap();
         assert_eq!(response.correlation_id, correlation_id);
@@ -361,11 +329,9 @@ mod tests {
     fn should_decode_rpc_request_payload() {
         let correlation_id = [9u8; 16];
         let mut buf = Vec::new();
-        buf.extend_from_slice(&(16u32).to_be_bytes());
         buf.extend_from_slice(&correlation_id);
         buf.extend_from_slice(&(19u32).to_be_bytes());
         buf.extend_from_slice(b"rpc://realm/area/op");
-        buf.extend_from_slice(&(0u32).to_be_bytes());
         buf.extend_from_slice(&(4u32).to_be_bytes());
         buf.extend_from_slice(b"ping");
 

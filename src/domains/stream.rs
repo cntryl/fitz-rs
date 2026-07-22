@@ -1,6 +1,5 @@
 //! Stream domain client.
 
-use bincode::serialize;
 use crate::codec::{PayloadDecoder, PayloadEncoder};
 use crate::connection::SharedConnection;
 use crate::domains::routes::{validate_fixed_route, validate_selector_route};
@@ -71,7 +70,9 @@ impl StreamFilterSet {
 
     pub fn matches(&self, discriminator: Option<&str>) -> bool {
         let discriminator = discriminator.unwrap_or("");
-        self.clauses.iter().all(|clause| clause.matches(discriminator))
+        self.clauses
+            .iter()
+            .all(|clause| clause.matches(discriminator))
     }
 }
 
@@ -164,11 +165,7 @@ impl StreamClient {
         Self { conn }
     }
 
-    pub fn begin(
-        &self,
-        route: &str,
-        ingest_metadata: Option<&[u8]>,
-    ) -> Result<StreamSession> {
+    pub fn begin(&self, route: &str, ingest_metadata: Option<&[u8]>) -> Result<StreamSession> {
         validate_fixed_route(route, "stream", 3)?;
 
         let mut enc = PayloadEncoder::new();
@@ -225,9 +222,7 @@ impl StreamClient {
         match filter.filter(|filter| !filter.is_empty()) {
             Some(filter) => {
                 enc.put_u8(1);
-                let filter_bytes = serialize(filter).map_err(|error| {
-                    FitzError::Protocol(format!("failed to encode stream filter: {error}"))
-                })?;
+                let filter_bytes = encode_stream_filter_set(filter)?;
                 enc.put_bytes(&filter_bytes);
             }
             None => {
@@ -239,7 +234,9 @@ impl StreamClient {
             .conn
             .send_request(message_type::STREAM_READ, &enc.finish())?;
         let decoded = decode_stream_response("READ", &resp)?;
-        Ok(flatten_stream_read_items(&parse_stream_read_page(&decoded.data)?.items))
+        Ok(flatten_stream_read_items(
+            &parse_stream_read_page(&decoded.data)?.items,
+        ))
     }
 
     pub fn read_page(
@@ -269,9 +266,7 @@ impl StreamClient {
         match filter.filter(|filter| !filter.is_empty()) {
             Some(filter) => {
                 enc.put_u8(1);
-                let filter_bytes = serialize(filter).map_err(|error| {
-                    FitzError::Protocol(format!("failed to encode stream filter: {error}"))
-                })?;
+                let filter_bytes = encode_stream_filter_set(filter)?;
                 enc.put_bytes(&filter_bytes);
             }
             None => {
@@ -346,6 +341,43 @@ impl StreamClient {
             subscription_id,
         })
     }
+}
+
+fn encode_stream_filter_set(filter: &StreamFilterSet) -> Result<Vec<u8>> {
+    let mut enc = PayloadEncoder::new();
+    enc.put_u8(0);
+    enc.put_u8(0xF1);
+    enc.put_u32(
+        u32::try_from(filter.clauses.len())
+            .map_err(|_| FitzError::Protocol("too many stream filter clauses".into()))?,
+    );
+    for clause in &filter.clauses {
+        match clause {
+            StreamFilterClause::Equals(value) => {
+                enc.put_u8(0);
+                enc.put_string(value);
+            }
+            StreamFilterClause::NotEquals(value) => {
+                enc.put_u8(1);
+                enc.put_string(value);
+            }
+            StreamFilterClause::StartsWith(value) => {
+                enc.put_u8(2);
+                enc.put_string(value);
+            }
+            StreamFilterClause::AnyOf(values) => {
+                enc.put_u8(3);
+                enc.put_u32(
+                    u32::try_from(values.len())
+                        .map_err(|_| FitzError::Protocol("too many AnyOf values".into()))?,
+                );
+                for value in values {
+                    enc.put_string(value);
+                }
+            }
+        }
+    }
+    Ok(enc.finish())
 }
 
 pub struct StreamSession {
@@ -566,7 +598,9 @@ fn parse_stream_read_page(buf: &[u8]) -> Result<StreamReadPage> {
     };
 
     if !dec.is_empty() {
-        return Err(FitzError::Protocol("READ response has trailing bytes".to_string()));
+        return Err(FitzError::Protocol(
+            "READ response has trailing bytes".to_string(),
+        ));
     }
 
     Ok(StreamReadPage { items, cursor })
@@ -625,7 +659,9 @@ fn decode_stream_read_item(dec: &mut PayloadDecoder<'_>) -> Result<StreamReadIte
     }
 }
 
-fn decode_stream_filtered_reason(dec: &mut PayloadDecoder<'_>) -> Result<Option<StreamFilteredReason>> {
+fn decode_stream_filtered_reason(
+    dec: &mut PayloadDecoder<'_>,
+) -> Result<Option<StreamFilteredReason>> {
     match dec.get_u8()? {
         0 => Ok(None),
         1 => Ok(Some(StreamFilteredReason::ServerFilter)),
@@ -919,7 +955,7 @@ mod tests {
     }
 
     #[test]
-    fn should_roundtrip_stream_filter_set_with_bincode() {
+    fn should_encode_canonical_stream_filter_set() {
         let filter = StreamFilterSet {
             clauses: vec![
                 StreamFilterClause::Equals("proj.alpha".to_string()),
@@ -929,10 +965,9 @@ mod tests {
             ],
         };
 
-        let encoded = serialize(&filter).unwrap();
-        let decoded: StreamFilterSet = bincode::deserialize(&encoded).unwrap();
-
-        assert_eq!(decoded, filter);
+        let encoded = encode_stream_filter_set(&filter).unwrap();
+        assert_eq!(&encoded[..2], &[0, 0xF1]);
+        assert_eq!(&encoded[2..6], &4_u32.to_be_bytes());
     }
 
     #[test]

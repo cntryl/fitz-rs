@@ -20,6 +20,7 @@
 //! let grant = client.lease().acquire("lease://my-realm/locks/leader", "node-1", 30)?;
 //! ```
 
+#[cfg(test)]
 mod auth;
 mod codec;
 mod connection;
@@ -31,8 +32,247 @@ mod transport;
 pub use error::{FitzError, FitzErrorKind, Result};
 pub use protocol::TransactionMode;
 
+use async_trait::async_trait;
 use connection::{FitzConnection, SharedConnection};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::{Mutex as AsyncMutex, watch};
+use tokio_util::sync::CancellationToken;
+
+/// Options shared by every domain operation.
+#[derive(Debug, Clone)]
+pub struct OperationOptions {
+    pub timeout: Duration,
+    pub cancellation: CancellationToken,
+}
+
+impl Default for OperationOptions {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(30),
+            cancellation: CancellationToken::new(),
+        }
+    }
+}
+
+/// Observable client lifecycle state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ConnectionState {
+    Disconnected,
+    Connecting,
+    Connected,
+    Authenticating,
+    Authenticated,
+    Reconnecting,
+    Closed,
+}
+
+/// Exponential reconnect configuration.
+#[derive(Debug, Clone)]
+pub struct ReconnectPolicy {
+    pub enabled: bool,
+    pub base_delay: Duration,
+    pub multiplier: f64,
+    pub maximum_delay: Duration,
+    pub maximum_attempts: usize,
+}
+
+impl Default for ReconnectPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            base_delay: Duration::from_millis(100),
+            multiplier: 2.0,
+            maximum_delay: Duration::from_secs(30),
+            maximum_attempts: 10,
+        }
+    }
+}
+
+/// Supplies an opaque token for every initial connection and reconnect.
+#[async_trait]
+pub trait TokenProvider: Send + Sync + 'static {
+    async fn token(&self) -> Result<String>;
+}
+
+#[async_trait]
+impl<F, Fut> TokenProvider for F
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<String>> + Send,
+{
+    async fn token(&self) -> Result<String> {
+        (self)().await
+    }
+}
+
+struct AnonymousTokenProvider;
+
+#[async_trait]
+impl TokenProvider for AnonymousTokenProvider {
+    async fn token(&self) -> Result<String> {
+        Ok(String::new())
+    }
+}
+
+/// Builder for the async-first [`Client`].
+pub struct ClientBuilder {
+    endpoint: String,
+    token_provider: Arc<dyn TokenProvider>,
+    timeout: Duration,
+    max_in_flight: usize,
+    reconnect: ReconnectPolicy,
+}
+
+impl ClientBuilder {
+    #[must_use]
+    pub fn request_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+    #[must_use]
+    pub fn max_in_flight_requests(mut self, limit: usize) -> Self {
+        self.max_in_flight = limit.max(1);
+        self
+    }
+    #[must_use]
+    pub fn reconnect_policy(mut self, policy: ReconnectPolicy) -> Self {
+        self.reconnect = policy;
+        self
+    }
+    pub fn build(self) -> Result<Client> {
+        let (state_tx, _) = watch::channel(ConnectionState::Disconnected);
+        Ok(Client {
+            inner: Arc::new(ClientInner {
+                endpoint: self.endpoint,
+                token_provider: self.token_provider,
+                timeout: self.timeout,
+                max_in_flight: self.max_in_flight,
+                reconnect: self.reconnect,
+                state_tx,
+                connection: AsyncMutex::new(None),
+            }),
+        })
+    }
+}
+
+struct ClientInner {
+    endpoint: String,
+    token_provider: Arc<dyn TokenProvider>,
+    timeout: Duration,
+    max_in_flight: usize,
+    reconnect: ReconnectPolicy,
+    state_tx: watch::Sender<ConnectionState>,
+    connection: AsyncMutex<Option<FitzClient>>,
+}
+
+/// Async Fitz client entry point.
+#[derive(Clone)]
+pub struct Client {
+    inner: Arc<ClientInner>,
+}
+
+impl Client {
+    #[must_use]
+    pub fn builder(
+        endpoint: impl Into<String>,
+        token_provider: impl TokenProvider,
+    ) -> ClientBuilder {
+        ClientBuilder {
+            endpoint: endpoint.into(),
+            token_provider: Arc::new(token_provider),
+            timeout: Duration::from_secs(30),
+            max_in_flight: 256,
+            reconnect: ReconnectPolicy::default(),
+        }
+    }
+    #[must_use]
+    pub fn anonymous(endpoint: impl Into<String>) -> ClientBuilder {
+        ClientBuilder {
+            endpoint: endpoint.into(),
+            token_provider: Arc::new(AnonymousTokenProvider),
+            timeout: Duration::from_secs(30),
+            max_in_flight: 256,
+            reconnect: ReconnectPolicy::default(),
+        }
+    }
+    #[must_use]
+    pub fn state(&self) -> ConnectionState {
+        *self.inner.state_tx.borrow()
+    }
+    pub fn subscribe_state(&self) -> watch::Receiver<ConnectionState> {
+        self.inner.state_tx.subscribe()
+    }
+    pub async fn connect(&self) -> Result<()> {
+        if self.state() == ConnectionState::Closed {
+            return Err(FitzError::Closed);
+        }
+        self.inner
+            .state_tx
+            .send_replace(ConnectionState::Connecting);
+        let token = self.inner.token_provider.token().await?;
+        self.inner.state_tx.send_replace(ConnectionState::Connected);
+        self.inner
+            .state_tx
+            .send_replace(ConnectionState::Authenticating);
+        let endpoint = self.inner.endpoint.clone();
+        let timeout = self.inner.timeout;
+        let max_in_flight = self.inner.max_in_flight;
+        let client = tokio::task::spawn_blocking(move || {
+            connect_endpoint(&endpoint, &token, timeout, max_in_flight)
+        })
+        .await
+        .map_err(|error| FitzError::Connection(error.to_string()))??;
+        *self.inner.connection.lock().await = Some(client);
+        self.inner
+            .state_tx
+            .send_replace(ConnectionState::Authenticated);
+        tracing::info!(endpoint = %self.inner.endpoint, "fitz client authenticated");
+        Ok(())
+    }
+    pub async fn close(&self) -> Result<()> {
+        let connection = self.inner.connection.lock().await.take();
+        if let Some(connection) = connection {
+            tokio::task::spawn_blocking(move || connection.close())
+                .await
+                .map_err(|error| FitzError::Connection(error.to_string()))??;
+        }
+        self.inner.state_tx.send_replace(ConnectionState::Closed);
+        Ok(())
+    }
+    #[must_use]
+    pub fn reconnect_policy(&self) -> &ReconnectPolicy {
+        &self.inner.reconnect
+    }
+}
+
+fn connect_endpoint(
+    endpoint: &str,
+    token: &str,
+    timeout: Duration,
+    max_in_flight: usize,
+) -> Result<FitzClient> {
+    let builder = FitzClient::builder(token)
+        .with_timeout(timeout)
+        .with_max_in_flight_requests(max_in_flight);
+    if let Some(address) = endpoint.strip_prefix("tcp://") {
+        let (host, port) = address
+            .rsplit_once(':')
+            .ok_or_else(|| FitzError::Connection("TCP endpoint must include a port".into()))?;
+        return builder.connect_tcp(
+            host,
+            port.parse()
+                .map_err(|_| FitzError::Connection("invalid TCP port".into()))?,
+        );
+    }
+    if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
+        return builder.connect_ws(endpoint);
+    }
+    Err(FitzError::Connection(
+        "endpoint must use tcp://, ws://, or wss://".into(),
+    ))
+}
 
 enum ClientAuth {
     Token(String),
@@ -202,8 +442,8 @@ mod tests {
     use crate::codec::{decode_message_frame, encode_message_frame};
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::mpsc;
     use std::sync::Arc;
+    use std::sync::mpsc;
     use std::thread;
 
     fn read_length_prefixed_frame(stream: &mut std::net::TcpStream) -> Vec<u8> {
@@ -302,7 +542,9 @@ mod tests {
                 .unwrap();
         });
 
-        first_request_seen_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        first_request_seen_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
 
         let second_client = Arc::clone(&client);
         let second = thread::spawn(move || {
@@ -312,7 +554,11 @@ mod tests {
                 .unwrap();
         });
 
-        assert!(second_request_seen_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        assert!(
+            second_request_seen_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err()
+        );
 
         allow_first_response_tx.send(()).unwrap();
 
@@ -373,7 +619,9 @@ mod tests {
                 .expect("first request failed")
         });
 
-        first_request_seen_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        first_request_seen_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
 
         let second_client = Arc::clone(&first_client);
         let second = thread::spawn(move || {
@@ -383,7 +631,9 @@ mod tests {
                 .expect("second request failed")
         });
 
-        second_request_seen_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        second_request_seen_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
 
         let first_response = first.join().unwrap();
         let second_response = second.join().unwrap();

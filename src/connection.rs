@@ -9,12 +9,14 @@ use crate::error::{FitzError, Result};
 use crate::protocol::message_type;
 use crate::transport::{AnyTransport, Transport};
 use parking_lot::{Condvar, Mutex, MutexGuard};
-use std::collections::VecDeque;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 type DeferredFrame = (u16, Vec<u8>);
 type DeferredFrames = Arc<Mutex<VecDeque<DeferredFrame>>>;
+type ResponseSender = mpsc::Sender<Result<Vec<u8>>>;
+type PendingResponses = Arc<Mutex<HashMap<u16, VecDeque<ResponseSender>>>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConnectionState {
@@ -29,6 +31,16 @@ pub struct FitzConnection {
 }
 
 impl FitzConnection {
+    fn try_clone_tcp(&self) -> Option<Self> {
+        let AnyTransport::Tcp(transport) = &self.transport else {
+            return None;
+        };
+        Some(Self {
+            transport: AnyTransport::Tcp(transport.try_clone().ok()?),
+            state: self.state,
+            timeout: self.timeout,
+        })
+    }
     /// Connect via TCP
     pub fn connect_tcp(host: &str, port: u16) -> Result<Self> {
         let transport = AnyTransport::Tcp(
@@ -152,16 +164,25 @@ impl Drop for RequestPermit {
 #[derive(Clone)]
 pub struct SharedConnection {
     inner: Arc<Mutex<FitzConnection>>,
+    reader_inner: Arc<Mutex<FitzConnection>>,
     deferred_frames: DeferredFrames,
     request_gate: Arc<RequestGate>,
+    pending: PendingResponses,
+    reader: Arc<Mutex<()>>,
 }
 
 impl SharedConnection {
     pub fn new(conn: FitzConnection, max_in_flight_requests: usize) -> Self {
+        let reader_conn = conn.try_clone_tcp();
+        let inner = Arc::new(Mutex::new(conn));
         Self {
-            inner: Arc::new(Mutex::new(conn)),
+            reader_inner: reader_conn
+                .map_or_else(|| Arc::clone(&inner), |conn| Arc::new(Mutex::new(conn))),
+            inner,
             deferred_frames: Arc::new(Mutex::new(VecDeque::new())),
             request_gate: Arc::new(RequestGate::new(max_in_flight_requests)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            reader: Arc::new(Mutex::new(())),
         }
     }
 
@@ -172,14 +193,64 @@ impl SharedConnection {
     pub fn send_request(&self, msg_type: u16, payload: &[u8]) -> Result<Vec<u8>> {
         let _permit = self.request_gate.acquire();
         let frame = try_encode_message_frame(msg_type, payload)?;
+        let (tx, rx) = mpsc::channel();
+        self.pending
+            .lock()
+            .entry(msg_type)
+            .or_default()
+            .push_back(tx);
         {
             let mut conn = self.lock();
-            conn.send_frame(&frame)?;
+            if let Err(error) = conn.send_frame(&frame) {
+                let _ = self
+                    .pending
+                    .lock()
+                    .get_mut(&msg_type)
+                    .and_then(VecDeque::pop_back);
+                return Err(error);
+            }
         }
+        // Give already-admitted writers a chance to enqueue before one caller
+        // becomes the reader. The reader never holds the write lock while it
+        // dispatches a decoded response.
+        std::thread::yield_now();
+        self.wait_for_response(rx)
+    }
 
-        let (_, resp_payload) =
-            self.recv_message_matching(|received_type, _| !is_server_notification(received_type))?;
-        Ok(resp_payload)
+    fn wait_for_response(&self, rx: mpsc::Receiver<Result<Vec<u8>>>) -> Result<Vec<u8>> {
+        loop {
+            match rx.try_recv() {
+                Ok(result) => return result,
+                Err(mpsc::TryRecvError::Disconnected) => return Err(FitzError::ConnectionClosed),
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+
+            if let Some(_reader) = self.reader.try_lock() {
+                let (message_type, payload) = self.read_next_message()?;
+                if is_server_notification(message_type) {
+                    self.deferred_frames
+                        .lock()
+                        .push_back((message_type, payload));
+                    continue;
+                }
+                let waiter = self
+                    .pending
+                    .lock()
+                    .get_mut(&message_type)
+                    .and_then(VecDeque::pop_front);
+                if let Some(waiter) = waiter {
+                    // A failed send is an intentional timeout/cancellation tombstone.
+                    let _ = waiter.send(Ok(payload));
+                } else {
+                    tracing::warn!(
+                        message_type,
+                        "discarding response without a pending request"
+                    );
+                }
+            } else {
+                std::thread::yield_now();
+            }
+        }
     }
 
     /// Send a typed request with a temporary transport timeout override.
@@ -259,7 +330,7 @@ impl SharedConnection {
 
     fn read_next_message(&self) -> Result<(u16, Vec<u8>)> {
         let frame = {
-            let mut conn = self.lock();
+            let mut conn = self.reader_inner.lock();
             conn.recv_frame()?
         };
 
@@ -303,8 +374,8 @@ fn is_server_notification(msg_type: u16) -> bool {
         msg_type,
         message_type::RPC_REQUEST
             | message_type::RPC_RESPONSE
-            | message_type::RPC_ACK
             | message_type::QUEUE_NOTIFY
+            | message_type::LEASE_NOTIFY
             | message_type::NOTICE_NOTIFY
             | message_type::STREAM_NOTIFY
             | message_type::SCHEDULE_NOTIFY
@@ -328,8 +399,8 @@ fn map_transport_error(err: std::io::Error) -> FitzError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::TransactionMode;
     use crate::FitzClient;
+    use crate::protocol::TransactionMode;
     use std::io::Read;
     use std::net::TcpListener;
     use std::thread;
