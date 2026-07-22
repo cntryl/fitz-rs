@@ -240,41 +240,59 @@ mod tests {
     use super::*;
 
     #[test]
-    fn should_encode_and_decode_u64() {
+    fn should_round_trip_u64() {
+        // Arrange
         let mut enc = PayloadEncoder::new();
         enc.put_u64(0x0123_4567_89AB_CDEF);
         let buf = enc.finish();
 
+        // Act
         let mut dec = PayloadDecoder::new(&buf);
         let value = dec.get_u64().unwrap();
+
+        // Assert
         assert_eq!(value, 0x0123_4567_89AB_CDEF);
     }
 
     #[test]
-    fn should_encode_and_decode_string() {
+    fn should_round_trip_string() {
+        // Arrange
         let mut enc = PayloadEncoder::new();
         enc.put_string("hello");
         let buf = enc.finish();
 
+        // Act
         let mut dec = PayloadDecoder::new(&buf);
         let value = dec.get_string().unwrap();
+
+        // Assert
         assert_eq!(value, "hello");
     }
 
     #[test]
-    fn should_encode_and_decode_bytes() {
+    fn should_round_trip_bytes() {
+        // Arrange
         let mut enc = PayloadEncoder::new();
         enc.put_bytes(b"data");
         let buf = enc.finish();
 
+        // Act
         let mut dec = PayloadDecoder::new(&buf);
         let value = dec.get_bytes().unwrap();
+
+        // Assert
         assert_eq!(value, b"data");
     }
 
     #[test]
     fn should_encode_message_frame_single_byte_type() {
-        let frame = encode_message_frame(100, b"hello");
+        // Arrange
+        let payload = b"hello";
+
+        // Act
+        let frame = encode_message_frame(100, payload);
+
+        // Assert
         assert_eq!(frame[0], 100);
         assert_eq!(frame[1], 0);
         assert_eq!(frame[2], 5); // length
@@ -282,8 +300,13 @@ mod tests {
 
     #[test]
     fn should_decode_message_frame() {
+        // Arrange
         let frame = encode_message_frame(100, b"hello");
+
+        // Act
         let (msg_type, payload_start) = decode_message_frame(&frame).unwrap();
+
+        // Assert
         assert_eq!(msg_type, 100);
         assert_eq!(&frame[payload_start..], b"hello");
     }
@@ -297,7 +320,13 @@ mod tests {
 
     #[test]
     fn should_encode_message_type_255_with_escape_prefix() {
-        let frame = encode_message_frame(255, b"ok");
+        // Arrange
+        let payload = b"ok";
+
+        // Act
+        let frame = encode_message_frame(255, payload);
+
+        // Assert
         assert_eq!(frame[0], 0xFF);
         assert_eq!(&frame[1..3], &255u16.to_be_bytes());
         assert_eq!(&frame[3..5], &[0, 2]);

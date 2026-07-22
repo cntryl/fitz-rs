@@ -114,12 +114,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn should_validate_shapes_without_checking_permissions() {
-        validate_fixed_route("queue://realm/area/resource", "queue", 3).unwrap();
-        validate_selector_route("queue://realm/area/*", "queue", 3, true).unwrap();
-        validate_selector_route("queue://realm/*/*", "queue", 3, true).unwrap();
-        assert!(validate_fixed_route("queue://realm/area/*", "queue", 3).is_err());
-        assert!(validate_fixed_route("notice://realm/area/resource", "queue", 3).is_err());
-        assert!(validate_selector_route("queue://realm/*/resource", "queue", 3, true).is_err());
+    fn should_accept_valid_fixed_shape() {
+        // Arrange
+        let route = "queue://realm/area/resource";
+
+        // Act
+        let result = validate_fixed_route(route, "queue", 3);
+
+        // Assert
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn should_accept_valid_selector_shapes() {
+        // Arrange
+        let selectors = ["queue://realm/area/*", "queue://realm/*/*"];
+
+        // Act
+        let results = selectors.map(|route| validate_selector_route(route, "queue", 3, true));
+
+        // Assert
+        assert!(results.iter().all(Result::is_ok));
+    }
+
+    #[test]
+    fn should_reject_invalid_shapes() {
+        // Arrange
+        let invalid = [
+            validate_fixed_route("queue://realm/area/*", "queue", 3),
+            validate_fixed_route("notice://realm/area/resource", "queue", 3),
+            validate_selector_route("queue://realm/*/resource", "queue", 3, true),
+        ];
+
+        // Act
+        let all_rejected = invalid.iter().all(Result::is_err);
+
+        // Assert
+        assert!(all_rejected);
     }
 }
