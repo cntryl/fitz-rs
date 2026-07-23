@@ -35,6 +35,13 @@ The canonical protocol, acceptance criteria, and cross-language scenarios live
 in the Fitz server repository under `docs/clients`. Production code in this
 crate never creates or inspects JWTs.
 
+## Managed leases
+
+`LeaseClient::with_lease` and `with_lease_with_options` supervise acquisition, renewal,
+callback cancellation, and release without blocking Tokio executor threads. The low-level
+API remains deliberately stateless: callers must replace the fencing token after every
+successful `extend`, and must treat any uncertain renewal as ownership loss.
+
 ## Development
 
 ```console

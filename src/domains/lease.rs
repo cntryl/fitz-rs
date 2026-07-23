@@ -25,6 +25,11 @@ use crate::connection::SharedConnection;
 use crate::domains::routes::validate_fixed_route;
 use crate::error::{FitzError, Result};
 use crate::protocol::message_type;
+use futures_util::FutureExt;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 /// Result of a lease acquire or renew operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,20 +38,39 @@ pub struct LeaseGrant {
     pub fencing_token: u64,
 }
 
-/// Result of a lease query.
+/// Contract-correct result of a lease query.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum LeaseStatus {
-    /// Lease is currently held. The server returns the fencing token.
-    Held { fencing_token: u64 },
-    /// Lease is free (no holder).
-    Free,
+pub struct LeaseInfo {
+    pub held: bool,
+    pub owner_id: Option<String>,
+    pub ttl_remaining_secs: Option<u64>,
+    pub pending_waiters: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LeaseExecutionOptions {
+    pub wait_for_availability: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LeaseExecutionError<E> {
+    #[error("lease acquisition failed: {0}")]
+    Acquisition(FitzError),
+    #[error("lease callback failed")]
+    Callback(E),
+    #[error("lease ownership lost: {0}")]
+    OwnershipLost(FitzError),
+    #[error("lease release failed: {0}")]
+    Release(FitzError),
+    #[error("lease lifecycle and callback both failed")]
+    Combined { lifecycle: FitzError, callback: E },
 }
 
 /// Lease domain client.
 ///
 /// Stateless handle — all route context is passed per-call so a single
 /// `LeaseClient` can operate across any realm/area/resource.
+#[derive(Clone)]
 pub struct LeaseClient {
     conn: SharedConnection,
 }
@@ -78,8 +102,25 @@ impl LeaseClient {
             .conn
             .send_request(message_type::LEASE_ACQUIRE, &enc.finish())?;
 
-        let token = decode_success_response(&resp)?
-            .ok_or_else(|| FitzError::Protocol("ACQUIRE response missing fencing token".into()))?;
+        let mut dec = decode_lease_success("ACQUIRE", &resp)?;
+        let response_type = dec.get_u8()?;
+        if response_type >= 2 {
+            return Err(FitzError::Domain {
+                code: 5001,
+                message: if response_type == 2 {
+                    "lease acquisition queued"
+                } else {
+                    "lease acquisition already queued"
+                }
+                .into(),
+            });
+        }
+        if response_type > 1 {
+            return Err(FitzError::Protocol(format!(
+                "unknown ACQUIRE response type: {response_type}"
+            )));
+        }
+        let token = dec.get_u64()?;
 
         Ok(LeaseGrant {
             fencing_token: token,
@@ -112,8 +153,8 @@ impl LeaseClient {
             .conn
             .send_request(message_type::LEASE_RENEW, &enc.finish())?;
 
-        let token = decode_success_response(&resp)?
-            .ok_or_else(|| FitzError::Protocol("EXTEND response missing fencing token".into()))?;
+        let mut dec = decode_lease_success("EXTEND", &resp)?;
+        let token = dec.get_u64()?;
 
         Ok(LeaseGrant {
             fencing_token: token,
@@ -138,7 +179,12 @@ impl LeaseClient {
             .conn
             .send_request(message_type::LEASE_RELEASE, &enc.finish())?;
 
-        decode_success_response(&resp)?;
+        let dec = decode_lease_success("RELEASE", &resp)?;
+        if !dec.is_empty() {
+            return Err(FitzError::Protocol(
+                "RELEASE response has trailing bytes".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -148,7 +194,7 @@ impl LeaseClient {
     ///
     /// # Errors
     /// Returns an error when validation, encoding, transport, or broker processing fails.
-    pub fn query(&self, route: &str) -> Result<LeaseStatus> {
+    pub fn query(&self, route: &str) -> Result<LeaseInfo> {
         validate_fixed_route(route, "lease", 3)?;
 
         let mut enc = PayloadEncoder::new();
@@ -158,11 +204,160 @@ impl LeaseClient {
             .conn
             .send_request(message_type::LEASE_QUERY, &enc.finish())?;
 
-        match decode_success_response(&resp)? {
-            Some(token) => Ok(LeaseStatus::Held {
-                fencing_token: token,
-            }),
-            None => Ok(LeaseStatus::Free),
+        let mut dec = decode_lease_success("QUERY", &resp)?;
+        let held = dec.get_u8()? == 1;
+        if !held {
+            return Ok(LeaseInfo {
+                held,
+                owner_id: None,
+                ttl_remaining_secs: None,
+                pending_waiters: dec.get_u32()?,
+            });
+        }
+        Ok(LeaseInfo {
+            held,
+            owner_id: Some(dec.get_string()?),
+            ttl_remaining_secs: Some(dec.get_u64()?),
+            pending_waiters: dec.get_u32()?,
+        })
+    }
+
+    /// Runs a callback while this client owns the lease.
+    ///
+    /// # Errors
+    /// Returns the typed acquisition, callback, ownership-loss, or cleanup failure.
+    pub async fn with_lease<F, Fut, T, E>(
+        &self,
+        route: &str,
+        owner_id: &str,
+        ttl_secs: u64,
+        callback: F,
+    ) -> std::result::Result<T, LeaseExecutionError<E>>
+    where
+        F: FnOnce(CancellationToken) -> Fut + Send + 'static,
+        Fut: Future<Output = std::result::Result<T, E>> + Send + 'static,
+        T: Send + 'static,
+        E: Send + 'static,
+    {
+        self.with_lease_with_options(
+            route,
+            owner_id,
+            ttl_secs,
+            callback,
+            LeaseExecutionOptions::default(),
+        )
+        .await
+    }
+
+    /// Runs a callback while owning the lease with explicit execution options.
+    ///
+    /// # Errors
+    /// Returns the typed acquisition, callback, ownership-loss, or cleanup failure.
+    pub async fn with_lease_with_options<F, Fut, T, E>(
+        &self,
+        route: &str,
+        owner_id: &str,
+        ttl_secs: u64,
+        callback: F,
+        options: LeaseExecutionOptions,
+    ) -> std::result::Result<T, LeaseExecutionError<E>>
+    where
+        F: FnOnce(CancellationToken) -> Fut + Send + 'static,
+        Fut: Future<Output = std::result::Result<T, E>> + Send + 'static,
+        T: Send + 'static,
+        E: Send + 'static,
+    {
+        validate_fixed_route(route, "lease", 3).map_err(LeaseExecutionError::Acquisition)?;
+        if ttl_secs == 0 || ttl_secs > u64::from(u32::MAX) / 1_000 {
+            return Err(LeaseExecutionError::Acquisition(FitzError::Protocol(
+                "lease TTL must be positive and schedulable".into(),
+            )));
+        }
+        let route = route.to_owned();
+        let owner_id = owner_id.to_owned();
+        let mut delay = Duration::from_millis(50);
+        let mut grant = loop {
+            let client = self.clone();
+            let acquire_route = route.clone();
+            let acquire_owner = owner_id.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                client.acquire(&acquire_route, &acquire_owner, ttl_secs)
+            })
+            .await
+            .map_err(|error| {
+                LeaseExecutionError::Acquisition(FitzError::Connection(error.to_string()))
+            })?;
+            match result {
+                Ok(grant) => break grant,
+                Err(error) if options.wait_for_availability && is_contention(&error) => {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(1));
+                }
+                Err(error) => return Err(LeaseExecutionError::Acquisition(error)),
+            }
+        };
+
+        let cancellation = CancellationToken::new();
+        let callback_task =
+            tokio::spawn(AssertUnwindSafe(callback(cancellation.clone())).catch_unwind());
+        tokio::pin!(callback_task);
+        let renewal = tokio::time::sleep(Duration::from_secs(ttl_secs) / 3);
+        tokio::pin!(renewal);
+        loop {
+            tokio::select! {
+                biased;
+                callback_result = &mut callback_task => {
+                    let callback_outcome = callback_result.map_err(|error| {
+                        LeaseExecutionError::Acquisition(FitzError::Connection(error.to_string()))
+                    })?;
+                    let client = self.clone();
+                    let release_route = route.clone();
+                    let release_owner = owner_id.clone();
+                    let token = grant.fencing_token;
+                    let release_result = tokio::task::spawn_blocking(move || {
+                        client.release(&release_route, &release_owner, token)
+                    }).await.map_err(|error| FitzError::Connection(error.to_string())).and_then(|result| result);
+                    let callback_result = match callback_outcome {
+                        Ok(result) => result,
+                        Err(panic) => std::panic::resume_unwind(panic),
+                    };
+                    return match (callback_result, release_result) {
+                        (Ok(value), Ok(())) => Ok(value),
+                        (Err(error), Ok(())) => Err(LeaseExecutionError::Callback(error)),
+                        (Ok(_), Err(error)) => Err(LeaseExecutionError::Release(error)),
+                        (Err(callback), Err(lifecycle)) => Err(LeaseExecutionError::Combined { lifecycle, callback }),
+                    };
+                }
+                () = &mut renewal => {
+                    let client = self.clone();
+                    let renew_route = route.clone();
+                    let renew_owner = owner_id.clone();
+                    let token = grant.fencing_token;
+                    let renewed = tokio::task::spawn_blocking(move || {
+                        client.extend(&renew_route, &renew_owner, token, ttl_secs)
+                    }).await.map_err(|error| FitzError::Connection(error.to_string())).and_then(|result| result);
+                    match renewed {
+                        Ok(next) => {
+                            grant = next;
+                            renewal.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(ttl_secs) / 3);
+                        }
+                        Err(error) => {
+                            cancellation.cancel();
+                            let callback_outcome = callback_task.await.map_err(|join| {
+                                LeaseExecutionError::OwnershipLost(FitzError::Connection(join.to_string()))
+                            })?;
+                            let callback_result = match callback_outcome {
+                                Ok(result) => result,
+                                Err(panic) => std::panic::resume_unwind(panic),
+                            };
+                            return match callback_result {
+                                Ok(_) => Err(LeaseExecutionError::OwnershipLost(error)),
+                                Err(callback) => Err(LeaseExecutionError::Combined { lifecycle: error, callback }),
+                            };
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -177,34 +372,27 @@ impl LeaseClient {
 ///
 /// Returns `Ok(Some(token))` for success with token, `Ok(None)` for
 /// success without token (e.g. RELEASE), or `Err` for server errors.
-fn decode_success_response(buf: &[u8]) -> Result<Option<u64>> {
-    if buf.is_empty() {
-        return Err(FitzError::Codec("Empty response".into()));
-    }
-
+fn decode_lease_success<'a>(operation: &str, buf: &'a [u8]) -> Result<PayloadDecoder<'a>> {
     let mut dec = PayloadDecoder::new(buf);
     let status = dec.get_u8()?;
-
     match status {
-        0 => {
-            // Success — optional u64 token (put_optional_u64 format)
-            let has_token = dec.get_u8()?;
-            if has_token == 1 {
-                let token = dec.get_u64()?;
-                Ok(Some(token))
-            } else {
-                Ok(None)
-            }
-        }
+        0 => Ok(dec),
         1 => {
-            // Error — [u32 len][UTF-8 msg]
+            let code = dec.get_u32()?;
             let msg = dec.get_string()?;
-            Err(FitzError::DomainError(msg))
+            Err(FitzError::Domain {
+                code,
+                message: format!("{operation} failed: {msg}"),
+            })
         }
         _ => Err(FitzError::Protocol(format!(
             "Unknown response status byte: {status}"
         ))),
     }
+}
+
+fn is_contention(error: &FitzError) -> bool {
+    matches!(error, FitzError::Domain { code: 5001, .. })
 }
 
 #[cfg(test)]
@@ -214,36 +402,39 @@ mod tests {
     #[test]
     fn should_decode_success_with_token() {
         // Arrange
-        // [status=0][has_token=1][u64 token=42]
-        let mut buf = vec![0x00, 0x01];
+        // [status=0][response_type=Acquired][u64 token=42]
+        let mut buf = vec![0x00, 0x00];
         buf.extend_from_slice(&42u64.to_be_bytes());
         // Act
-        let result = decode_success_response(&buf).unwrap();
+        let mut result = decode_lease_success("ACQUIRE", &buf).unwrap();
         // Assert
-        assert_eq!(result, Some(42));
+        assert_eq!(result.get_u8().unwrap(), 0);
+        assert_eq!(result.get_u64().unwrap(), 42);
     }
 
     #[test]
     fn should_decode_success_without_token() {
         // Arrange
-        // [status=0][has_token=0]
-        let buf = vec![0x00, 0x00];
+        let buf = vec![0x00];
         // Act
-        let result = decode_success_response(&buf).unwrap();
+        let result = decode_lease_success("RELEASE", &buf).unwrap();
         // Assert
-        assert_eq!(result, None);
+        assert!(result.is_empty());
     }
 
     #[test]
     fn should_decode_error_response() {
         // Arrange
-        // [status=1][u32 len=9]["Not found"]
+        // [status=1][u32 code][u32 len=9]["Not found"]
         let msg = b"Not found";
         let mut buf = vec![0x01];
+        buf.extend_from_slice(&5004u32.to_be_bytes());
         buf.extend_from_slice(&u32::try_from(msg.len()).unwrap().to_be_bytes());
         buf.extend_from_slice(msg);
         // Act
-        let err = decode_success_response(&buf).unwrap_err();
+        let Err(err) = decode_lease_success("QUERY", &buf) else {
+            panic!("expected domain error");
+        };
         // Assert
         assert!(err.to_string().contains("Not found"));
     }
@@ -321,13 +512,25 @@ mod tests {
 
     #[test]
     fn should_reject_empty_response() {
-        let err = decode_success_response(&[]).unwrap_err();
-        assert!(err.to_string().contains("Empty"));
+        // Arrange
+        let response = [];
+        // Act
+        let Err(err) = decode_lease_success("QUERY", &response) else {
+            panic!("expected codec error");
+        };
+        // Assert
+        assert!(matches!(err, FitzError::Codec(_)));
     }
 
     #[test]
     fn should_reject_unknown_status_byte() {
-        let err = decode_success_response(&[0x02]).unwrap_err();
+        // Arrange
+        let response = [0x02];
+        // Act
+        let Err(err) = decode_lease_success("QUERY", &response) else {
+            panic!("expected protocol error");
+        };
+        // Assert
         assert!(err.to_string().contains("Unknown"));
     }
 }
