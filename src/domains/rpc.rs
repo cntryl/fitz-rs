@@ -96,7 +96,10 @@ pub struct RpcResponseStream {
 impl RpcResponseStream {
     // This blocking, fallible stream API intentionally differs from Iterator::next:
     // protocol errors are returned outside the optional end-of-stream value.
-    #[allow(clippy::should_implement_trait)]
+    #[allow(
+        clippy::should_implement_trait,
+        reason = "the wire stream returns protocol errors separately from end-of-stream"
+    )]
     ///
     /// # Errors
     /// Returns an error when validation, encoding, transport, or broker processing fails.

@@ -63,15 +63,12 @@ impl AuthMode {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum Verdict {
     Pass,
     Partial,
     Fail,
-    NotImplemented,
-    Unclear,
 }
 
 #[derive(Debug)]
