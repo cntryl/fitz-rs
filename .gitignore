@@ -6,3 +6,4 @@ Thumbs.db
 
 # Libraries typically do not commit Cargo.lock.
 Cargo.lock
+artifacts/

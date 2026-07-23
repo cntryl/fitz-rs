@@ -20,8 +20,6 @@
 //! let grant = client.lease().acquire("lease://my-realm/locks/leader", "node-1", 30)?;
 //! ```
 
-#[cfg(test)]
-mod auth;
 mod codec;
 mod connection;
 pub mod domains;

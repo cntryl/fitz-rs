@@ -26,7 +26,6 @@ fn should_keep_root_public_surface_narrow() {
     }
 
     for required in [
-        "mod auth;",
         "mod codec;",
         "mod connection;",
         "mod protocol;",

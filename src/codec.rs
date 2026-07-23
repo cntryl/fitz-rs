@@ -3,8 +3,6 @@
 //! Matches the server's `payload_codec` format (not TLV; fixed-order typed fields).
 //! Frame-level encode/decode is in `encode_message_frame` / `decode_message_frame`.
 
-#![allow(dead_code)]
-
 use crate::error::{FitzError, Result};
 
 /// Encoder for message payloads (sequential typed fields).
@@ -19,11 +17,6 @@ impl PayloadEncoder {
 
     pub fn put_u8(&mut self, value: u8) -> &mut Self {
         self.buf.push(value);
-        self
-    }
-
-    pub fn put_u16(&mut self, value: u16) -> &mut Self {
-        self.buf.extend_from_slice(&value.to_be_bytes());
         self
     }
 
@@ -99,13 +92,6 @@ impl<'a> PayloadDecoder<'a> {
         Ok(value)
     }
 
-    pub fn get_u16(&mut self) -> Result<u16> {
-        self.check_len(2)?;
-        let bytes = &self.buf[self.pos..self.pos + 2];
-        self.pos += 2;
-        Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
-    }
-
     pub fn get_u32(&mut self) -> Result<u32> {
         self.check_len(4)?;
         let bytes = &self.buf[self.pos..self.pos + 4];
@@ -150,15 +136,10 @@ impl<'a> PayloadDecoder<'a> {
     pub fn is_empty(&self) -> bool {
         self.pos >= self.buf.len()
     }
-
-    pub fn get_remaining(&mut self) -> &'a [u8] {
-        let slice = &self.buf[self.pos..];
-        self.pos = self.buf.len();
-        slice
-    }
 }
 
 /// Encode a message frame: [u16 `msg_type`][payload]
+#[cfg(test)]
 pub fn encode_message_frame(msg_type: u16, payload: &[u8]) -> Vec<u8> {
     assert!(
         u16::try_from(payload.len()).is_ok(),
