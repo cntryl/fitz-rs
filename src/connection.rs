@@ -315,11 +315,16 @@ impl SharedConnection {
     where
         F: FnMut(u16, &[u8]) -> bool,
     {
-        if let Some(frame) = self.take_deferred_matching(&mut matcher) {
-            return Ok(frame);
-        }
-
         loop {
+            if let Some(frame) = self.take_deferred_matching(&mut matcher) {
+                return Ok(frame);
+            }
+
+            let _reader = self.reader.lock();
+            if let Some(frame) = self.take_deferred_matching(&mut matcher) {
+                return Ok(frame);
+            }
+
             let frame = self.read_next_message()?;
             if matcher(frame.0, &frame.1) {
                 return Ok(frame);
@@ -405,7 +410,7 @@ mod tests {
     use super::*;
     use crate::FitzClient;
     use crate::protocol::TransactionMode;
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
 
@@ -415,6 +420,13 @@ mod tests {
         let len = u32::from_be_bytes(len_buf) as usize;
         let mut frame = vec![0u8; len];
         stream.read_exact(&mut frame).unwrap();
+    }
+
+    fn write_length_prefixed_frame(stream: &mut std::net::TcpStream, frame: &[u8]) {
+        let len = u32::try_from(frame.len()).unwrap();
+        stream.write_all(&len.to_be_bytes()).unwrap();
+        stream.write_all(frame).unwrap();
+        stream.flush().unwrap();
     }
 
     #[test]
@@ -499,6 +511,59 @@ mod tests {
         // Assert
         assert!(matches!(err, FitzError::ConnectionClosed));
 
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn should_route_out_of_order_matching_frames_to_concurrent_readers() {
+        // Arrange
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            release_rx.recv().unwrap();
+            write_length_prefixed_frame(
+                &mut socket,
+                &try_encode_message_frame(message_type::RPC_RESPONSE, &[2]).unwrap(),
+            );
+            write_length_prefixed_frame(
+                &mut socket,
+                &try_encode_message_frame(message_type::RPC_RESPONSE, &[1]).unwrap(),
+            );
+        });
+
+        let connection =
+            SharedConnection::new(FitzConnection::connect_tcp("127.0.0.1", port).unwrap(), 2);
+        let first_connection = connection.clone();
+        let first = thread::spawn(move || {
+            first_connection
+                .recv_message_matching(|msg_type, payload| {
+                    msg_type == message_type::RPC_RESPONSE && payload == [1]
+                })
+                .unwrap()
+        });
+
+        thread::sleep(Duration::from_millis(25));
+
+        let second_connection = connection.clone();
+        let second = thread::spawn(move || {
+            second_connection
+                .recv_message_matching(|msg_type, payload| {
+                    msg_type == message_type::RPC_RESPONSE && payload == [2]
+                })
+                .unwrap()
+        });
+
+        thread::sleep(Duration::from_millis(25));
+
+        // Act
+        release_tx.send(()).unwrap();
+
+        // Assert
+        assert_eq!(first.join().unwrap().1, vec![1]);
+        assert_eq!(second.join().unwrap().1, vec![2]);
         server.join().unwrap();
     }
 

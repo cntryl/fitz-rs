@@ -1,7 +1,10 @@
 mod jwt;
 
 use cntryl_fitz::TransactionMode;
-use cntryl_fitz::domains::stream::StreamCommitMode;
+use cntryl_fitz::domains::stream::{
+    StreamCommitMode, StreamDiscriminator, StreamFilterClause, StreamFilterSet,
+    StreamFilteredReason, StreamReadItem,
+};
 use cntryl_fitz::{FitzClient, FitzError, FitzErrorKind, Result};
 use serde::Serialize;
 use std::fs;
@@ -377,6 +380,42 @@ fn connect_broker_client(transport: Transport, auth_mode: AuthMode) -> Result<Fi
     }
 }
 
+fn connect_broker_client_with_max_in_flight(
+    transport: Transport,
+    auth_mode: AuthMode,
+    max_in_flight: usize,
+) -> Result<FitzClient> {
+    let secret = broker_secret();
+    let token = jwt::make_test_jwt(REALM, &secret);
+
+    match (transport, auth_mode) {
+        (Transport::Tcp, AuthMode::Anonymous) => {
+            let (host, port) = broker_tcp_addr(auth_mode);
+            FitzClient::builder_anonymous()
+                .with_max_in_flight_requests(max_in_flight)
+                .connect_tcp(&host, port)
+        }
+        (Transport::Tcp, AuthMode::ValidJwt) => {
+            let (host, port) = broker_tcp_addr(auth_mode);
+            FitzClient::builder(&token)
+                .with_max_in_flight_requests(max_in_flight)
+                .connect_tcp(&host, port)
+        }
+        (Transport::WebSocket, AuthMode::Anonymous) => {
+            let url = broker_ws_url(auth_mode);
+            FitzClient::builder_anonymous()
+                .with_max_in_flight_requests(max_in_flight)
+                .connect_ws(&url)
+        }
+        (Transport::WebSocket, AuthMode::ValidJwt) => {
+            let url = broker_ws_url(auth_mode);
+            FitzClient::builder(&token)
+                .with_max_in_flight_requests(max_in_flight)
+                .connect_ws(&url)
+        }
+    }
+}
+
 fn connect_stub_client(
     transport: Transport,
     auth_mode: AuthMode,
@@ -676,13 +715,28 @@ fn execute_suite(transport: Transport, auth_mode: AuthMode) -> AggregateResult {
             let client = connect_broker_client(transport, auth_mode)
                 .map_err(|err| format!("connect failed: {err}"))?;
             let route = unique_route("rpc");
-            let result = client.rpc().call(&route, b"ping");
+            let result = client
+                .rpc()
+                .call(&route, b"ping")
+                .and_then(|mut responses| responses.next());
 
             let (verdict, mut evidence) = match result {
+                Err(err)
+                    if matches!(err.kind(), FitzErrorKind::Domain | FitzErrorKind::Protocol) =>
+                {
+                    (
+                        Verdict::Pass,
+                        vec![format!(
+                            "unknown route rejected with typed error: {} ({})",
+                            err,
+                            audit_error(&err)
+                        )],
+                    )
+                }
                 Err(err) => (
-                    Verdict::Pass,
+                    Verdict::Partial,
                     vec![format!(
-                        "unknown route rejected with error: {} ({})",
+                        "unknown route rejected with weaker error classification: {} ({})",
                         err,
                         audit_error(&err)
                     )],
@@ -1330,6 +1384,211 @@ fn execute_suite(transport: Transport, auth_mode: AuthMode) -> AggregateResult {
         },
     ));
 
+    collector.record(run_scenario(
+        "CS-016",
+        "filtered stream replay",
+        "P1",
+        transport,
+        auth_mode,
+        || {
+            let client = connect_broker_client(transport, auth_mode)
+                .map_err(|err| format!("connect failed: {err}"))?;
+            let route = unique_route("stream");
+            let alpha = StreamDiscriminator::from("proj.alpha");
+            let beta = StreamDiscriminator::from("audit.beta");
+
+            let mut session = client
+                .stream()
+                .begin(&route, None)
+                .map_err(|err| format!("stream begin failed: {err}"))?;
+            let first_offset = session
+                .append(0, b"alpha", None, Some(&alpha))
+                .map_err(|err| format!("matching append failed: {err}"))?
+                .ok_or_else(|| "matching append returned no offset".to_string())?;
+            let second_offset = session
+                .append(first_offset + 1, b"beta", None, Some(&beta))
+                .map_err(|err| format!("filtered append failed: {err}"))?
+                .ok_or_else(|| "filtered append returned no offset".to_string())?;
+            session
+                .commit(StreamCommitMode::Sync)
+                .map_err(|err| format!("stream commit failed: {err}"))?;
+
+            let filter = StreamFilterSet {
+                clauses: vec![StreamFilterClause::Equals("proj.alpha".to_string())],
+            };
+            let records = client
+                .stream()
+                .read(&route, 0, 10, None, Some(&filter))
+                .map_err(|err| format!("filtered stream read failed: {err}"))?;
+            if records.len() != 1
+                || records[0].offset != first_offset
+                || records[0].body != b"alpha"
+            {
+                return Err(format!("unexpected filtered records: {records:?}"));
+            }
+
+            let page = client
+                .stream()
+                .read_page(&route, 0, 10, None, Some(&filter))
+                .map_err(|err| format!("filtered stream page failed: {err}"))?;
+            if page.cursor.last_resource_offset != second_offset
+                || page.cursor.has_more
+                || page.items.len() != 2
+                || !matches!(page.items[0], StreamReadItem::Event(_))
+                || page.items[1]
+                    != (StreamReadItem::Filtered {
+                        offset: second_offset,
+                        reason: Some(StreamFilteredReason::ServerFilter),
+                    })
+            {
+                return Err(format!("unexpected filtered stream page: {page:?}"));
+            }
+            close_client(&client);
+
+            Ok(ScenarioOutcome {
+                verdict: Verdict::Pass,
+                evidence: vec![
+                    "filtered read returned only the matching discriminator".to_string(),
+                    "page cursor advanced across the server-filtered record".to_string(),
+                ],
+            })
+        },
+    ));
+
+    collector.record(run_scenario(
+        "CS-017",
+        "bounded concurrency under burst load",
+        "P1",
+        transport,
+        auth_mode,
+        || {
+            let route = unique_route("rpc");
+            let worker_route = route.clone();
+            let (ready_tx, ready_rx) = mpsc::channel();
+
+            let worker = thread::spawn(move || -> std::result::Result<(), String> {
+                let worker_client = connect_broker_client(transport, auth_mode)
+                    .map_err(|err| format!("worker connect failed: {err}"))?;
+                let registration = worker_client
+                    .rpc()
+                    .register_worker(&worker_route)
+                    .map_err(|err| format!("worker registration failed: {err}"))?;
+                ready_tx
+                    .send(())
+                    .map_err(|_| "failed to signal worker readiness".to_string())?;
+
+                for expected in [b"first".as_slice(), b"second".as_slice()] {
+                    let mut request = registration
+                        .next()
+                        .map_err(|err| format!("worker receive failed: {err}"))?;
+                    if request.body != expected {
+                        return Err(format!(
+                            "worker received out-of-order body: {:?}",
+                            request.body
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(500));
+                    let body = request.body.clone();
+                    request
+                        .respond(&body, true)
+                        .map_err(|err| format!("worker response failed: {err}"))?;
+                }
+
+                registration
+                    .unregister()
+                    .map_err(|err| format!("worker unregister failed: {err}"))?;
+                close_client(&worker_client);
+                Ok(())
+            });
+
+            ready_rx
+                .recv_timeout(Duration::from_secs(2))
+                .map_err(|_| "worker did not become ready".to_string())?;
+
+            let caller = connect_broker_client_with_max_in_flight(transport, auth_mode, 1)
+                .map_err(|err| format!("caller connect failed: {err}"))?;
+            let first_stream = caller
+                .rpc()
+                .call(&route, b"first")
+                .map_err(|err| format!("first RPC call failed: {err}"))?;
+            let second_stream = caller
+                .rpc()
+                .call(&route, b"second")
+                .map_err(|err| format!("second RPC call failed: {err}"))?;
+
+            let (result_tx, result_rx) = mpsc::channel();
+            let first_tx = result_tx.clone();
+            let first_reader = thread::spawn(move || {
+                let mut stream = first_stream;
+                let result = stream
+                    .next()
+                    .map_err(|err| err.to_string())
+                    .and_then(|frame| {
+                        frame
+                            .map(|value| value.body)
+                            .ok_or_else(|| "first RPC stream ended without a frame".to_string())
+                    });
+                let _ = first_tx.send(("first", result));
+            });
+            let second_reader = thread::spawn(move || {
+                let mut stream = second_stream;
+                let result = stream
+                    .next()
+                    .map_err(|err| err.to_string())
+                    .and_then(|frame| {
+                        frame
+                            .map(|value| value.body)
+                            .ok_or_else(|| "second RPC stream ended without a frame".to_string())
+                    });
+                let _ = result_tx.send(("second", result));
+            });
+
+            thread::sleep(Duration::from_millis(100));
+            let settled_early = result_rx.try_recv().ok();
+            let mut responses = Vec::with_capacity(2);
+            if let Some(result) = settled_early.as_ref() {
+                responses.push((result.0, result.1.clone()));
+            }
+            while responses.len() < 2 {
+                responses.push(
+                    result_rx
+                        .recv_timeout(Duration::from_secs(3))
+                        .map_err(|_| "burst RPC responses did not drain".to_string())?,
+                );
+            }
+
+            first_reader
+                .join()
+                .map_err(|_| "first RPC reader panicked".to_string())?;
+            second_reader
+                .join()
+                .map_err(|_| "second RPC reader panicked".to_string())?;
+            close_client(&caller);
+            worker
+                .join()
+                .map_err(|_| "RPC worker panicked".to_string())??;
+
+            if settled_early.is_some() {
+                return Err("a burst RPC response completed before the delayed worker".to_string());
+            }
+            for (label, response) in responses {
+                let body = response.map_err(|err| format!("{label} RPC response failed: {err}"))?;
+                if body != label.as_bytes() {
+                    return Err(format!("{label} RPC response was not correlated"));
+                }
+            }
+
+            Ok(ScenarioOutcome {
+                verdict: Verdict::Pass,
+                evidence: vec![
+                    "both burst RPC calls remained pending behind the delayed worker".to_string(),
+                    "configured max_in_flight_requests=1 and both responses stayed correlated"
+                        .to_string(),
+                ],
+            })
+        },
+    ));
+
     collector.aggregate(transport, auth_mode)
 }
 
@@ -1347,17 +1606,23 @@ fn write_results(result: &AggregateResult) -> PathBuf {
 }
 
 #[test]
-#[ignore = "requires a running Fitz broker"]
+#[ignore = "requires fitz-auth and fitz-anon from compose.yml"]
 fn conformance_suite() {
     let transport = main_transport();
     let auth_mode = main_auth_mode();
     let result = execute_suite(transport, auth_mode);
     let output_path = write_results(&result);
 
-    assert_ne!(
+    assert_eq!(
+        result.scenarios.len(),
+        17,
+        "conformance must cover all shared scenarios; see {}",
+        output_path.display()
+    );
+    assert_eq!(
         result.overall_status,
-        "fail",
-        "conformance recorded a failing P0 scenario; see {}",
+        "pass",
+        "conformance recorded a non-passing scenario; see {}",
         output_path.display()
     );
 }

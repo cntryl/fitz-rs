@@ -124,14 +124,9 @@ impl QueueClient {
         enc.put_u8(1);
         enc.put_u32(normalized_batch);
 
-        match wait_seconds.filter(|value| *value > 0) {
-            Some(wait) => {
-                enc.put_u8(1);
-                enc.put_u64(wait);
-            }
-            None => {
-                enc.put_u8(0);
-            }
+        if let Some(wait) = wait_seconds.filter(|value| *value > 0) {
+            enc.put_u8(1);
+            enc.put_u64(wait);
         }
 
         let payload = enc.finish();

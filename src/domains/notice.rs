@@ -34,11 +34,8 @@ impl NoticeClient {
         enc.put_string(route);
         enc.put_bytes(body);
 
-        let resp = self
-            .conn
-            .send_request(message_type::NOTICE_PUBLISH, &enc.finish())?;
-
-        decode_notice_response("PUBLISH", &resp)
+        self.conn
+            .send_only(message_type::NOTICE_PUBLISH, &enc.finish())
     }
 
     ///

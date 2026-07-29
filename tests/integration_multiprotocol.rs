@@ -272,41 +272,49 @@ fn run_large_values(transport: Transport) {
 
 // Test runners for each transport
 #[test]
+#[ignore = "requires fitz-auth from compose.yml on 127.0.0.1:4090/4091"]
 fn should_execute_kv_crud_over_tcp() {
     run_kv_crud_operations(Transport::Tcp);
 }
 
 #[test]
+#[ignore = "requires fitz-auth from compose.yml on 127.0.0.1:4090/4091"]
 fn should_execute_kv_crud_over_websocket() {
     run_kv_crud_operations(Transport::WebSocket);
 }
 
 #[test]
+#[ignore = "requires fitz-auth from compose.yml on 127.0.0.1:4090/4091"]
 fn should_isolate_transactions_over_tcp() {
     run_transaction_isolation(Transport::Tcp);
 }
 
 #[test]
+#[ignore = "requires fitz-auth from compose.yml on 127.0.0.1:4090/4091"]
 fn should_isolate_transactions_over_websocket() {
     run_transaction_isolation(Transport::WebSocket);
 }
 
 #[test]
+#[ignore = "requires fitz-auth from compose.yml on 127.0.0.1:4090/4091"]
 fn should_rollback_over_tcp() {
     run_rollback_behavior(Transport::Tcp);
 }
 
 #[test]
+#[ignore = "requires fitz-auth from compose.yml on 127.0.0.1:4090/4091"]
 fn should_rollback_over_websocket() {
     run_rollback_behavior(Transport::WebSocket);
 }
 
 #[test]
+#[ignore = "requires fitz-auth from compose.yml on 127.0.0.1:4090/4091"]
 fn should_handle_large_values_over_tcp() {
     run_large_values(Transport::Tcp);
 }
 
 #[test]
+#[ignore = "requires fitz-auth from compose.yml on 127.0.0.1:4090/4091"]
 fn should_handle_large_values_over_websocket() {
     run_large_values(Transport::WebSocket);
 }

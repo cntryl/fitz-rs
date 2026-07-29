@@ -151,21 +151,25 @@ fn run_streaming_rpc(transport: Transport) {
 }
 
 #[test]
+#[ignore = "requires fitz-auth from compose.yml on 127.0.0.1:4090/4091"]
 fn should_execute_single_frame_rpc_over_tcp() {
     run_single_response_rpc(Transport::Tcp);
 }
 
 #[test]
+#[ignore = "requires fitz-auth from compose.yml on 127.0.0.1:4090/4091"]
 fn should_execute_single_frame_rpc_over_websocket() {
     run_single_response_rpc(Transport::WebSocket);
 }
 
 #[test]
+#[ignore = "requires fitz-auth from compose.yml on 127.0.0.1:4090/4091"]
 fn should_stream_rpc_frames_over_tcp() {
     run_streaming_rpc(Transport::Tcp);
 }
 
 #[test]
+#[ignore = "requires fitz-auth from compose.yml on 127.0.0.1:4090/4091"]
 fn should_stream_rpc_frames_over_websocket() {
     run_streaming_rpc(Transport::WebSocket);
 }

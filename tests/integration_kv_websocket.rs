@@ -21,8 +21,9 @@ fn unique_kv_route(suffix: &str) -> String {
 }
 
 /// Note: This test requires Fitz server with WebSocket support running on 127.0.0.1:4090
-/// Start with: docker compose up (or cargo run -F boot)
+/// Start with: docker compose up -d
 #[test]
+#[ignore = "requires fitz-auth from compose.yml on 127.0.0.1:4090"]
 fn should_execute_kv_transaction_over_websocket() {
     // Arrange
     let token = jwt::make_test_jwt("test-realm", "dev-test-secret");
@@ -84,6 +85,7 @@ fn should_execute_kv_transaction_over_websocket() {
 
 /// Test rollback over WebSocket
 #[test]
+#[ignore = "requires fitz-auth from compose.yml on 127.0.0.1:4090"]
 fn should_rollback_kv_transaction_over_websocket() {
     // Arrange
     let token = jwt::make_test_jwt("test-realm", "dev-test-secret");

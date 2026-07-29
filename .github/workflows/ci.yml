@@ -3,6 +3,8 @@ name: ci
 on:
   push:
   pull_request:
+  schedule:
+    - cron: "0 0 * * *"
 
 jobs:
   verify:
@@ -18,10 +20,57 @@ jobs:
           toolchain: ${{ matrix.toolchain }}
           components: rustfmt, clippy
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Run strict Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-targets
       - run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
       - run: cargo package
+
+  broker:
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Start broker stack
+        run: docker compose up -d
+
+      - name: Run broker integration tests
+        run: |
+          cargo test \
+            --test integration_kv_tcp \
+            --test integration_kv_websocket \
+            --test integration_domains \
+            --test integration_multiprotocol \
+            --test integration_rpc \
+            --test integration_stream \
+            -- --ignored --nocapture
+
+      - name: Run conformance matrix
+        shell: bash
+        run: |
+          for transport in tcp ws; do
+            for auth_mode in anonymous valid_jwt; do
+              output="artifacts/conformance-${transport}-${auth_mode}.json"
+              CONFORMANCE_TRANSPORT="$transport" \
+                CONFORMANCE_AUTH_MODE="$auth_mode" \
+                CONFORMANCE_OUTPUT="$output" \
+                cargo test --test conformance conformance_suite -- --ignored --nocapture
+            done
+          done
+
+      - name: Upload conformance results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fitz-rs-conformance-results
+          path: artifacts/conformance-*.json
+          if-no-files-found: warn
+
+      - name: Stop broker stack
+        if: always()
+        run: docker compose down --volumes
 
   security:
     timeout-minutes: 10

@@ -125,6 +125,12 @@ impl RpcResponseStream {
             self.finished = true;
         }
 
+        if response.stream_end {
+            if let Some(error) = decode_rpc_terminal_error(&response.body) {
+                return Err(error);
+            }
+        }
+
         if response.stream_end && response.body.is_empty() {
             return Ok(None);
         }
@@ -305,6 +311,25 @@ fn decode_rpc_response(payload: &[u8]) -> Result<DecodedRpcResponse> {
     })
 }
 
+fn decode_rpc_terminal_error(payload: &[u8]) -> Option<FitzError> {
+    let mut dec = PayloadDecoder::new(payload);
+    if dec.get_u8().ok()? != 1 {
+        return None;
+    }
+
+    let code = dec.get_u32().ok()?;
+    if !(6000..6100).contains(&code) {
+        return None;
+    }
+
+    let message = dec.get_string().ok()?;
+    if !dec.is_empty() {
+        return None;
+    }
+
+    Some(FitzError::Domain { code, message })
+}
+
 fn route_matches_pattern(route: &str, pattern: &str) -> bool {
     let route_segments: Vec<&str> = route.split('/').collect();
     let pattern_segments: Vec<&str> = pattern.split('/').collect();
@@ -355,6 +380,27 @@ mod tests {
         assert_eq!(response.sequence, 3);
         assert_eq!(response.body, b"pong");
         assert!(response.stream_end);
+    }
+
+    #[test]
+    fn should_decode_rpc_terminal_error_body() {
+        // Arrange
+        let mut buf = vec![1];
+        buf.extend_from_slice(&6004u32.to_be_bytes());
+        buf.extend_from_slice(&(31u32).to_be_bytes());
+        buf.extend_from_slice(b"No workers registered for route");
+
+        // Act
+        let error = decode_rpc_terminal_error(&buf).expect("missing terminal error");
+
+        // Assert
+        assert!(matches!(
+            error,
+            FitzError::Domain {
+                code: 6004,
+                message
+            } if message == "No workers registered for route"
+        ));
     }
 
     #[test]

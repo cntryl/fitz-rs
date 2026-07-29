@@ -29,11 +29,35 @@ async fn main() -> Result<()> {
 ```
 
 For a broker that permits anonymous sessions, use
-`Client::anonymous("ws://127.0.0.1:4090/ws")`.
+`Client::anonymous("ws://127.0.0.1:4190/ws")`.
 
 The canonical protocol, acceptance criteria, and cross-language scenarios live
 in the Fitz server repository under `docs/clients`. Production code in this
 crate never creates or inspects JWTs.
+
+## Local broker
+
+```console
+docker compose up -d
+```
+
+This starts `ghcr.io/cntryl/fitz:latest` as an authenticated broker on
+`127.0.0.1:4090/4091` and an anonymous broker on `127.0.0.1:4190/4191`.
+Both are loopback-only and use local storage volumes. The development JWT
+secret is `dev-test-secret`, the audience is `fitz`, and tenant `dev` maps to
+identity `1`.
+
+Run the broker-backed tests explicitly:
+
+```console
+cargo test --test integration_kv_tcp --test integration_kv_websocket --test integration_domains --test integration_multiprotocol --test integration_rpc --test integration_stream -- --ignored
+CONFORMANCE_TRANSPORT=tcp CONFORMANCE_AUTH_MODE=anonymous cargo test --test conformance conformance_suite -- --ignored --nocapture
+docker compose down --volumes
+```
+
+The broker-backed tests cover KV, Queue, RPC, Lease, Notice, Stream, and
+Schedule lifecycles. The conformance runner covers shared scenarios
+`CS-001` through `CS-017`.
 
 ## Managed leases
 

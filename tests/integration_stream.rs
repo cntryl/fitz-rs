@@ -171,21 +171,25 @@ fn run_stream_subscription(transport: Transport) {
 }
 
 #[test]
+#[ignore = "requires fitz-auth from compose.yml on 127.0.0.1:4090/4091"]
 fn should_replay_committed_stream_over_tcp() {
     run_stream_commit_and_read(Transport::Tcp);
 }
 
 #[test]
+#[ignore = "requires fitz-auth from compose.yml on 127.0.0.1:4090/4091"]
 fn should_replay_committed_stream_over_websocket() {
     run_stream_commit_and_read(Transport::WebSocket);
 }
 
 #[test]
+#[ignore = "requires fitz-auth from compose.yml on 127.0.0.1:4090/4091"]
 fn should_receive_stream_notifications_over_tcp() {
     run_stream_subscription(Transport::Tcp);
 }
 
 #[test]
+#[ignore = "requires fitz-auth from compose.yml on 127.0.0.1:4090/4091"]
 fn should_receive_stream_notifications_over_websocket() {
     run_stream_subscription(Transport::WebSocket);
 }
