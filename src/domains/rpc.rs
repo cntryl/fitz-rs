@@ -125,10 +125,10 @@ impl RpcResponseStream {
             self.finished = true;
         }
 
-        if response.stream_end {
-            if let Some(error) = decode_rpc_terminal_error(&response.body) {
-                return Err(error);
-            }
+        if response.stream_end
+            && let Some(error) = decode_rpc_terminal_error(&response.body)
+        {
+            return Err(error);
         }
 
         if response.stream_end && response.body.is_empty() {
