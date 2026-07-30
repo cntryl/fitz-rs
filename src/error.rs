@@ -114,3 +114,62 @@ impl From<std::io::Error> for FitzError {
 }
 
 pub type Result<T> = std::result::Result<T, FitzError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_classify_retryable_error_given_timeout_when_is_retryable_called() {
+        // Arrange
+        let error = FitzError::Timeout;
+
+        // Act
+        let retryable = error.is_retryable();
+
+        // Assert
+        assert!(retryable);
+    }
+
+    #[test]
+    fn should_classify_retryable_error_given_no_worker_code_when_is_retryable_called() {
+        // Arrange
+        let error = FitzError::Domain {
+            code: 5001,
+            message: "no worker".to_string(),
+        };
+
+        // Act
+        let retryable = error.is_retryable();
+
+        // Assert
+        assert!(retryable);
+    }
+
+    #[test]
+    fn should_fail_fast_given_unauthorized_code_when_retry_policy_evaluated() {
+        // Arrange
+        let error = FitzError::Domain {
+            code: 1001,
+            message: "unauthorized".to_string(),
+        };
+
+        // Act
+        let retryable = error.is_retryable();
+
+        // Assert
+        assert!(!retryable);
+    }
+
+    #[test]
+    fn should_fail_fast_given_fatal_protocol_error_when_retry_policy_evaluated() {
+        // Arrange
+        let error = FitzError::Protocol("fatal".to_string());
+
+        // Act
+        let retryable = error.is_retryable();
+
+        // Assert
+        assert!(!retryable);
+    }
+}

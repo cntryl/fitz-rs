@@ -502,6 +502,65 @@ mod tests {
     }
 
     #[test]
+    fn should_connect_given_valid_tcp_endpoint_when_connect_called() {
+        // Arrange
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            read_length_prefixed_frame(&mut socket);
+        });
+
+        // Act
+        let client = FitzClient::connect_tcp("127.0.0.1", port, "token").unwrap();
+
+        // Assert
+        client.close().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn should_authenticate_given_valid_token_when_connect_sent_first() {
+        // Arrange
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            read_length_prefixed_frame(&mut socket)
+        });
+
+        // Act
+        let client = FitzClient::connect_tcp("127.0.0.1", port, "valid-token").unwrap();
+        let frame = server.join().unwrap();
+        let (message_type, payload_start) = decode_message_frame(&frame).unwrap();
+
+        // Assert
+        assert_eq!(message_type, protocol::message_type::CONNECT);
+        assert_eq!(&frame[payload_start..], b"valid-token");
+        let _ = client.close();
+    }
+
+    #[test]
+    fn should_accept_anonymous_access_given_auth_disabled_when_connect_carries_empty_token() {
+        // Arrange
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            read_length_prefixed_frame(&mut socket)
+        });
+
+        // Act
+        let client = FitzClient::connect_tcp_anonymous("127.0.0.1", port).unwrap();
+        let frame = server.join().unwrap();
+        let (_, payload_start) = decode_message_frame(&frame).unwrap();
+
+        // Assert
+        assert!(frame[payload_start..].is_empty());
+        let _ = client.close();
+    }
+
+    #[test]
     fn should_create_client_builder() {
         let _builder = FitzClient::builder("secret");
     }
@@ -540,7 +599,7 @@ mod tests {
     }
 
     #[test]
-    fn should_bound_concurrent_outbound_requests_given_max_one_when_second_request_starts() {
+    fn should_enforce_max_in_flight_work_given_burst_above_limit_when_requests_issued() {
         // Arrange
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
