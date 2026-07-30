@@ -230,7 +230,15 @@ impl SharedConnection {
             }
 
             if let Some(_reader) = self.reader.try_lock() {
-                let (message_type, payload) = self.read_next_message()?;
+                let (message_type, payload) = match self.read_next_message() {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        if !matches!(error, FitzError::Timeout) {
+                            self.fail_pending_requests();
+                        }
+                        return Err(error);
+                    }
+                };
                 if is_server_notification(message_type) {
                     self.deferred_frames
                         .lock()
@@ -255,6 +263,16 @@ impl SharedConnection {
                 std::thread::yield_now();
             }
         }
+    }
+
+    fn fail_pending_requests(&self) {
+        let mut pending = self.pending.lock();
+        for waiters in pending.values_mut() {
+            for waiter in waiters.drain(..) {
+                let _ = waiter.send(Err(FitzError::ConnectionClosed));
+            }
+        }
+        pending.clear();
     }
 
     /// Send a typed request with a temporary transport timeout override.
@@ -511,6 +529,31 @@ mod tests {
         // Assert
         assert!(matches!(err, FitzError::ConnectionClosed));
 
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn should_fail_pending_work_given_transport_loss_when_request_in_flight() {
+        // Arrange
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            read_length_prefixed_frame(&mut socket);
+            read_length_prefixed_frame(&mut socket);
+        });
+        let connection =
+            SharedConnection::new(FitzConnection::connect_tcp("127.0.0.1", port).unwrap(), 2);
+        let first_connection = connection.clone();
+        let first = thread::spawn(move || first_connection.send_request(100, &[1]));
+        let second_connection = connection.clone();
+        let second = thread::spawn(move || second_connection.send_request(100, &[2]));
+
+        // Act
+        let results = [first.join().unwrap(), second.join().unwrap()];
+
+        // Assert
+        assert!(results.iter().all(Result::is_err));
         server.join().unwrap();
     }
 
