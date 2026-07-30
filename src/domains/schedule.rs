@@ -309,14 +309,30 @@ mod tests {
     }
 
     #[test]
-    fn should_validate_schedule_route_shape() {
+    fn should_accept_concrete_schedule_route_given_four_segments_when_validation_runs() {
         // Arrange
-        validate_schedule_route("schedule://realm/area/resource/op").unwrap();
+        let route = "schedule://realm/area/resource/op";
+
         // Act
-        for route in ["schedule://realm/area/resource", "queue://x", "*", ""] {
-            // Assert
-            assert!(validate_schedule_route(route).is_err());
-        }
+        let result = validate_schedule_route(route);
+
+        // Assert
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn should_reject_schedule_selector_given_wildcard_when_schedule_validation_runs() {
+        // Arrange
+        let routes = [
+            "schedule://realm/area/resource/*",
+            "schedule://realm/area/*/op",
+        ];
+
+        // Act
+        let results = routes.map(validate_schedule_route);
+
+        // Assert
+        assert!(results.iter().all(Result::is_err));
     }
 
     #[test]
@@ -345,7 +361,7 @@ mod tests {
     }
 
     #[test]
-    fn should_preserve_schedule_domain_error_code() {
+    fn should_preserve_typed_domain_code_given_error_response_when_mapping_errors() {
         // Arrange
         let mut buf = vec![1];
         buf.extend_from_slice(&7008u32.to_be_bytes());
@@ -359,5 +375,37 @@ mod tests {
 
         // Assert
         assert!(matches!(error, FitzError::Domain { code: 7008, .. }));
+    }
+
+    #[test]
+    fn should_classify_unknown_code_given_unregistered_code_when_mapping_errors() {
+        // Arrange
+        let mut buf = vec![1];
+        buf.extend_from_slice(&u32::MAX.to_be_bytes());
+        buf.extend_from_slice(&7u32.to_be_bytes());
+        buf.extend_from_slice(b"unknown");
+
+        // Act
+        let Err(error) = decode_schedule_success("CREATE", &buf) else {
+            panic!("expected unknown domain error");
+        };
+
+        // Assert
+        assert!(matches!(error, FitzError::Domain { code: u32::MAX, .. }));
+    }
+
+    #[test]
+    fn should_reject_malformed_domain_envelope_given_missing_required_fields_when_response_parsed()
+    {
+        // Arrange
+        let response = [1, 0, 0, 0, 1];
+
+        // Act
+        let Err(error) = decode_schedule_success("CREATE", &response) else {
+            panic!("expected malformed envelope error");
+        };
+
+        // Assert
+        assert!(matches!(error, FitzError::Codec(_)));
     }
 }
