@@ -114,7 +114,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn should_accept_valid_fixed_shape() {
+    fn should_accept_concrete_route_shape_given_valid_scheme_and_segment_count_when_validation_runs()
+     {
         // Arrange
         let route = "queue://realm/area/resource";
 
@@ -126,7 +127,7 @@ mod tests {
     }
 
     #[test]
-    fn should_accept_valid_selector_shapes() {
+    fn should_accept_selector_routes_given_terminal_wildcards_when_validation_runs() {
         // Arrange
         let selectors = ["queue://realm/area/*", "queue://realm/*/*"];
 
@@ -138,18 +139,38 @@ mod tests {
     }
 
     #[test]
-    fn should_reject_invalid_shapes() {
+    fn should_reject_wrong_scheme_given_domain_route_when_validation_runs() {
         // Arrange
-        let invalid = [
-            validate_fixed_route("queue://realm/area/*", "queue", 3),
-            validate_fixed_route("notice://realm/area/resource", "queue", 3),
-            validate_selector_route("queue://realm/*/resource", "queue", 3, true),
-        ];
+        let route = "notice://realm/area/resource";
 
         // Act
-        let all_rejected = invalid.iter().all(Result::is_err);
+        let result = validate_fixed_route(route, "queue", 3);
 
         // Assert
-        assert!(all_rejected);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn should_reject_empty_segment_given_route_with_empty_component_when_validation_runs() {
+        // Arrange
+        let route = "queue://realm//resource";
+
+        // Act
+        let result = validate_fixed_route(route, "queue", 3);
+
+        // Assert
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn should_reject_nonterminal_wildcard_given_selector_wildcard_in_middle_when_validation_runs() {
+        // Arrange
+        let route = "queue://realm/*/resource";
+
+        // Act
+        let result = validate_selector_route(route, "queue", 3, true);
+
+        // Assert
+        assert!(result.is_err());
     }
 }

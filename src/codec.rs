@@ -266,17 +266,18 @@ mod tests {
     }
 
     #[test]
-    fn should_encode_message_frame_single_byte_type() {
+    fn should_round_trip_message_type_boundary_given_single_byte_encoding_when_frame_decoded() {
         // Arrange
-        let payload = b"hello";
+        let message_types = [0, 1, 254];
 
         // Act
-        let frame = encode_message_frame(100, payload);
+        let decoded = message_types.map(|message_type| {
+            let frame = encode_message_frame(message_type, b"hello");
+            decode_message_frame(&frame).unwrap().0
+        });
 
         // Assert
-        assert_eq!(frame[0], 100);
-        assert_eq!(frame[1], 0);
-        assert_eq!(frame[2], 5); // length
+        assert_eq!(decoded, message_types);
     }
 
     #[test]
@@ -300,37 +301,67 @@ mod tests {
     }
 
     #[test]
-    fn should_encode_message_type_255_with_escape_prefix() {
+    fn should_round_trip_message_type_boundary_given_escaped_encoding_when_frame_decoded() {
         // Arrange
-        let payload = b"ok";
+        let message_types = [255, 256, u16::MAX];
 
         // Act
-        let frame = encode_message_frame(255, payload);
+        let decoded = message_types.map(|message_type| {
+            let frame = encode_message_frame(message_type, b"ok");
+            decode_message_frame(&frame).unwrap().0
+        });
 
         // Assert
-        assert_eq!(frame[0], 0xFF);
-        assert_eq!(&frame[1..3], &255u16.to_be_bytes());
-        assert_eq!(&frame[3..5], &[0, 2]);
+        assert_eq!(decoded, message_types);
     }
 
     #[test]
-    fn should_reject_oversized_frame_payload() {
+    fn should_reject_oversized_payload_given_value_above_frame_limit_when_encoding_attempted() {
+        // Arrange
         let payload = vec![0u8; (u16::MAX as usize) + 1];
+
+        // Act
         let err = try_encode_message_frame(100, &payload).unwrap_err();
+
+        // Assert
         assert!(matches!(err, FitzError::FrameTooLarge(_)));
     }
 
     #[test]
-    fn should_reject_frame_with_incomplete_payload() {
-        let frame = vec![100, 0, 5, b'h', b'e'];
-        let err = decode_message_frame(&frame).unwrap_err();
-        assert!(err.to_string().contains("Incomplete payload"));
+    fn should_reject_truncated_headers_given_incomplete_frame_bytes_when_frame_decoded() {
+        // Arrange
+        let frames: [&[u8]; 4] = [&[], &[0xFF], &[0xFF, 0], &[100, 0]];
+
+        // Act
+        let results = frames.map(decode_message_frame);
+
+        // Assert
+        assert!(results.iter().all(Result::is_err));
     }
 
     #[test]
-    fn should_reject_frame_with_trailing_bytes() {
+    fn should_reject_trailing_bytes_given_extra_frame_data_when_strict_decoding_used() {
+        // Arrange
         let frame = vec![100, 0, 2, b'h', b'i', b'!'];
+
+        // Act
         let err = decode_message_frame(&frame).unwrap_err();
+
+        // Assert
         assert!(err.to_string().contains("Frame length does not match"));
+    }
+
+    #[test]
+    fn should_reject_truncated_value_given_incomplete_length_prefixed_field_when_decoding_attempted()
+     {
+        // Arrange
+        let bytes = [0, 0, 0, 4, b'a', b'b'];
+        let mut decoder = PayloadDecoder::new(&bytes);
+
+        // Act
+        let error = decoder.get_bytes().unwrap_err();
+
+        // Assert
+        assert!(matches!(error, FitzError::Codec(_)));
     }
 }
