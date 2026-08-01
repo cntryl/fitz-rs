@@ -2,7 +2,7 @@
 
 use crate::codec::{PayloadDecoder, PayloadEncoder};
 use crate::connection::SharedConnection;
-use crate::domains::routes::validate_fixed_route;
+use crate::domains::routes::{validate_fixed_route, validate_registration_pattern};
 use crate::error::{FitzError, Result};
 use crate::protocol::message_type;
 
@@ -165,7 +165,7 @@ impl ScheduleClient {
     /// # Errors
     /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn subscribe(&self, pattern: &str) -> Result<ScheduleSubscription> {
-        validate_schedule_route(pattern)?;
+        validate_registration_pattern(pattern, "schedule", 4)?;
 
         let mut enc = PayloadEncoder::new();
         enc.put_string(pattern);
@@ -228,6 +228,7 @@ impl ScheduleSubscription {
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Notification payload emitted when a schedule fires.
 pub struct ScheduleNotification {
+    pub route: String,
     pub payload: Vec<u8>,
 }
 
@@ -269,8 +270,9 @@ fn decode_schedule_notify_subscription_id(payload: &[u8]) -> Result<u64> {
 fn decode_schedule_notify(payload: &[u8]) -> Result<ScheduleNotification> {
     let mut dec = PayloadDecoder::new(payload);
     let _subscription_id = dec.get_u64()?;
+    let route = dec.get_string()?;
     let payload = dec.get_bytes()?;
-    Ok(ScheduleNotification { payload })
+    Ok(ScheduleNotification { route, payload })
 }
 
 fn validate_schedule_route(route: &str) -> Result<()> {
@@ -350,13 +352,17 @@ mod tests {
     fn should_decode_schedule_notify_payload() {
         // Arrange
         let mut buf = Vec::new();
+        let route = b"schedule://realm/area/resource/run";
         buf.extend_from_slice(&42u64.to_be_bytes());
+        buf.extend_from_slice(&u32::try_from(route.len()).unwrap().to_be_bytes());
+        buf.extend_from_slice(route);
         buf.extend_from_slice(&(4u32).to_be_bytes());
         buf.extend_from_slice(b"fire");
 
         // Act
         let notification = decode_schedule_notify(&buf).unwrap();
         // Assert
+        assert_eq!(notification.route, "schedule://realm/area/resource/run");
         assert_eq!(notification.payload, b"fire");
     }
 

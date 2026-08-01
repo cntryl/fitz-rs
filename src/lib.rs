@@ -27,6 +27,7 @@ mod error;
 mod protocol;
 mod transport;
 
+pub use error::error_code;
 pub use error::{FitzError, FitzErrorKind, Result};
 pub use protocol::TransactionMode;
 

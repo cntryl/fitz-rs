@@ -35,6 +35,19 @@ The canonical protocol, acceptance criteria, and cross-language scenarios live
 in the Fitz server repository under `docs/clients`. Production code in this
 crate never creates or inspects JWTs.
 
+## Subscription registrations
+
+KV, Queue, Stream, Notice, RPC worker, and Schedule registrations accept exact
+routes and whole-segment `*` or `**` patterns, including wildcard realms. KV,
+Queue, and Stream patterns must be capable of matching three segments;
+Schedule patterns must match four; Notice and RPC have flexible depth. The
+broker permits 128 wildcard registrations per domain and session, while exact
+registrations do not consume the quota. Lease subscriptions accept only an
+exact `lease://realm/area/resource` route.
+
+Notifications expose the exact concrete route. Queue availability
+notifications additionally report ready, delayed, and inflight message counts.
+
 ## Local broker
 
 ```console

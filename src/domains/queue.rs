@@ -2,7 +2,9 @@
 
 use crate::codec::{PayloadDecoder, PayloadEncoder};
 use crate::connection::SharedConnection;
-use crate::domains::routes::{validate_fixed_route, validate_selector_route};
+use crate::domains::routes::{
+    validate_fixed_route, validate_registration_pattern, validate_selector_route,
+};
 use crate::error::{FitzError, Result};
 use crate::protocol::message_type;
 use std::time::Duration;
@@ -185,7 +187,7 @@ impl QueueClient {
     /// # Errors
     /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn subscribe(&self, pattern: &str) -> Result<QueueSubscription> {
-        validate_selector_route(pattern, "queue", 3, true)?;
+        validate_registration_pattern(pattern, "queue", 3)?;
 
         let mut enc = PayloadEncoder::new();
         enc.put_string(pattern);
@@ -248,7 +250,9 @@ impl QueueSubscription {
 /// Queue availability notification delivered to subscribers.
 pub struct QueueNotification {
     pub route: String,
-    pub payload: Vec<u8>,
+    pub ready_messages: u64,
+    pub delayed_messages: u64,
+    pub inflight_messages: u64,
 }
 
 fn decode_enqueue_response(buf: &[u8]) -> Result<u64> {
@@ -308,13 +312,11 @@ fn decode_subscription_response(operation: &str, buf: &[u8]) -> Result<u64> {
         return Err(decode_queue_error(operation, &mut dec));
     }
 
-    let has_subscription_id = if dec.is_empty() { 0 } else { dec.get_u8()? };
-    if has_subscription_id != 1 {
+    if dec.remaining() != 8 {
         return Err(FitzError::Protocol(format!(
             "{operation} response missing subscription id"
         )));
     }
-
     dec.get_u64()
 }
 
@@ -327,26 +329,36 @@ fn decode_queue_notify(payload: &[u8]) -> Result<QueueNotification> {
     let mut dec = PayloadDecoder::new(payload);
     let _subscription_id = dec.get_u64()?;
     let route = dec.get_string()?;
-    let payload = dec.get_bytes()?;
-    Ok(QueueNotification { route, payload })
+    let ready_messages = dec.get_u64()?;
+    let delayed_messages = dec.get_u64()?;
+    let inflight_messages = dec.get_u64()?;
+    if !dec.is_empty() {
+        return Err(FitzError::Protocol(
+            "QUEUE NOTIFY payload has trailing bytes".to_string(),
+        ));
+    }
+    Ok(QueueNotification {
+        route,
+        ready_messages,
+        delayed_messages,
+        inflight_messages,
+    })
 }
 
 fn decode_queue_error(operation: &str, dec: &mut PayloadDecoder<'_>) -> FitzError {
-    if dec.remaining() == 1 {
-        let code = dec.get_u8().unwrap_or_default();
-        let message = match code {
-            1 => "invalid lease token",
-            2 => "queue lease expired",
-            3 => "queue item not found",
-            4 => "queue not found",
-            _ => "unknown queue error",
-        };
-        return FitzError::DomainError(format!("{operation} failed: {message}"));
+    let Ok(code) = dec.get_u32() else {
+        return FitzError::Protocol(format!("{operation} failed with malformed error payload"));
+    };
+    let Ok(message) = dec.get_string() else {
+        return FitzError::Protocol(format!("{operation} failed with malformed error payload"));
+    };
+    if !dec.is_empty() {
+        return FitzError::Protocol(format!("{operation} failed with malformed error payload"));
     }
 
-    match dec.get_string() {
-        Ok(message) => FitzError::DomainError(format!("{operation} failed: {message}")),
-        Err(_) => FitzError::Protocol(format!("{operation} failed with malformed error payload")),
+    FitzError::Domain {
+        code,
+        message: format!("{operation} failed: {message}"),
     }
 }
 
@@ -371,14 +383,50 @@ mod tests {
 
     #[test]
     fn should_decode_queue_error_code_response() {
-        let err = decode_empty_ok_response("COMPLETE", &[1, 3]).unwrap_err();
-        assert!(err.to_string().contains("queue item not found"));
+        // Arrange
+        let mut buf = vec![1];
+        buf.extend_from_slice(&3u32.to_be_bytes());
+        buf.extend_from_slice(&20u32.to_be_bytes());
+        buf.extend_from_slice(b"queue item not found");
+
+        // Act
+        let error = decode_empty_ok_response("COMPLETE", &buf).unwrap_err();
+
+        // Assert
+        assert!(matches!(error, FitzError::Domain { code: 3, .. }));
+    }
+
+    #[test]
+    fn should_reject_legacy_queue_error_code_response() {
+        // Arrange
+        let buf = [1, 3];
+
+        // Act
+        let error = decode_empty_ok_response("COMPLETE", &buf).unwrap_err();
+
+        // Assert
+        assert!(matches!(error, FitzError::Protocol(_)));
+    }
+
+    #[test]
+    fn should_preserve_typed_subscription_error_given_broker_error_envelope() {
+        // Arrange
+        let mut buf = vec![1];
+        buf.extend_from_slice(&4010u32.to_be_bytes());
+        buf.extend_from_slice(&15u32.to_be_bytes());
+        buf.extend_from_slice(b"invalid pattern");
+
+        // Act
+        let error = decode_subscription_response("SUBSCRIBE", &buf).unwrap_err();
+
+        // Assert
+        assert!(matches!(error, FitzError::Domain { code: 4010, .. }));
     }
 
     #[test]
     fn should_decode_queue_subscription_response() {
         // Arrange
-        let mut buf = vec![0, 1];
+        let mut buf = vec![0];
         buf.extend_from_slice(&42u64.to_be_bytes());
         // Act
         let sub_id = decode_subscription_response("SUBSCRIBE", &buf).unwrap();
@@ -393,14 +441,17 @@ mod tests {
         buf.extend_from_slice(&7u64.to_be_bytes());
         buf.extend_from_slice(&(20u32).to_be_bytes());
         buf.extend_from_slice(b"queue://realm/area/x");
-        buf.extend_from_slice(&(4u32).to_be_bytes());
-        buf.extend_from_slice(b"fire");
+        buf.extend_from_slice(&3u64.to_be_bytes());
+        buf.extend_from_slice(&2u64.to_be_bytes());
+        buf.extend_from_slice(&1u64.to_be_bytes());
 
         // Act
         let notification = decode_queue_notify(&buf).unwrap();
         // Assert
         assert_eq!(notification.route, "queue://realm/area/x");
-        assert_eq!(notification.payload, b"fire");
+        assert_eq!(notification.ready_messages, 3);
+        assert_eq!(notification.delayed_messages, 2);
+        assert_eq!(notification.inflight_messages, 1);
     }
 
     fn read_length_prefixed_frame(stream: &mut std::net::TcpStream) {

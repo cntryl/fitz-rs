@@ -11,6 +11,9 @@ pub mod message_type {
     pub const KV_GET: u16 = 103;
     pub const KV_PUT: u16 = 104;
     pub const KV_DELETE: u16 = 106;
+    pub const KV_SUBSCRIBE: u16 = 109;
+    pub const KV_UNSUBSCRIBE: u16 = 110;
+    pub const KV_NOTIFY: u16 = 111;
 
     // Queue domain (200-299)
     pub const QUEUE_ENQUEUE: u16 = 200;
@@ -32,6 +35,8 @@ pub mod message_type {
     pub const LEASE_RENEW: u16 = 401;
     pub const LEASE_RELEASE: u16 = 402;
     pub const LEASE_QUERY: u16 = 403;
+    pub const LEASE_SUBSCRIBE: u16 = 407;
+    pub const LEASE_UNSUBSCRIBE: u16 = 408;
     pub const LEASE_NOTIFY: u16 = 409;
 
     // Notice domain (500-599)

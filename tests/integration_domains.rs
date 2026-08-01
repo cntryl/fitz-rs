@@ -60,6 +60,45 @@ fn run_queue_lifecycle(transport: Transport) {
     client.close().expect("failed to close queue client");
 }
 
+fn run_kv_subscription_lifecycle(transport: Transport) {
+    // Arrange
+    let client = connect_client(transport);
+    let unique_area = unique_route("kv")
+        .rsplit('/')
+        .next()
+        .expect("unique KV route should contain a resource")
+        .to_string();
+    let route = format!("kv://test-realm/{unique_area}/resource");
+    let pattern = format!("kv://test-realm/{unique_area}/**");
+    let subscription = client
+        .kv()
+        .subscribe(&pattern)
+        .expect("failed to subscribe to KV changes");
+
+    // Act
+    let transaction = client
+        .kv()
+        .begin(&route, cntryl_fitz::TransactionMode::ReadWrite)
+        .expect("failed to begin KV transaction");
+    transaction
+        .put(b"key", b"value")
+        .expect("failed to mutate KV route");
+    transaction
+        .commit()
+        .expect("failed to commit KV transaction");
+    let notification = subscription
+        .next()
+        .expect("failed to receive KV change notification");
+
+    // Assert
+    assert_eq!(notification.route, route);
+    assert_eq!(notification.mutation_count, 1);
+    subscription
+        .unsubscribe()
+        .expect("failed to unsubscribe from KV changes");
+    client.close().expect("failed to close KV client");
+}
+
 fn run_lease_lifecycle(transport: Transport) {
     let client = connect_client(transport);
     let route = unique_route("lease");
@@ -177,6 +216,18 @@ fn should_complete_queue_lifecycle_over_tcp() {
 #[ignore = "requires fitz-auth from compose.yml on 127.0.0.1:4090/4091"]
 fn should_complete_queue_lifecycle_over_websocket() {
     run_queue_lifecycle(Transport::WebSocket);
+}
+
+#[test]
+#[ignore = "requires fitz-auth from compose.yml on 127.0.0.1:4090/4091"]
+fn should_deliver_concrete_route_given_wildcard_kv_subscription_over_tcp() {
+    run_kv_subscription_lifecycle(Transport::Tcp);
+}
+
+#[test]
+#[ignore = "requires fitz-auth from compose.yml on 127.0.0.1:4090/4091"]
+fn should_deliver_concrete_route_given_wildcard_kv_subscription_over_websocket() {
+    run_kv_subscription_lifecycle(Transport::WebSocket);
 }
 
 #[test]

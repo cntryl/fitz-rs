@@ -2,7 +2,9 @@
 
 use crate::codec::{PayloadDecoder, PayloadEncoder};
 use crate::connection::SharedConnection;
-use crate::domains::routes::validate_concrete_route;
+use crate::domains::routes::{
+    route_matches_pattern, validate_concrete_route, validate_registration_pattern,
+};
 use crate::error::{FitzError, Result};
 use crate::protocol::message_type;
 use uuid::Uuid;
@@ -68,7 +70,7 @@ impl RpcClient {
     /// # Errors
     /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn register_worker(&self, pattern: &str) -> Result<RpcWorkerRegistration> {
-        validate_concrete_route(pattern, "rpc")?;
+        validate_registration_pattern(pattern, "rpc", 0)?;
 
         let mut enc = PayloadEncoder::new();
         enc.put_string(pattern);
@@ -261,10 +263,12 @@ fn decode_rpc_status_response(operation: &str, buf: &[u8]) -> Result<()> {
     match status {
         0 => Ok(()),
         1 => {
+            let code = dec.get_u32()?;
             let message = dec.get_string()?;
-            Err(FitzError::DomainError(format!(
-                "{operation} failed: {message}"
-            )))
+            Err(FitzError::Domain {
+                code,
+                message: format!("{operation} failed: {message}"),
+            })
         }
         other => Err(FitzError::Protocol(format!(
             "{operation} failed with unknown status byte: {other}"
@@ -328,34 +332,6 @@ fn decode_rpc_terminal_error(payload: &[u8]) -> Option<FitzError> {
     }
 
     Some(FitzError::Domain { code, message })
-}
-
-fn route_matches_pattern(route: &str, pattern: &str) -> bool {
-    let route_segments: Vec<&str> = route.split('/').collect();
-    let pattern_segments: Vec<&str> = pattern.split('/').collect();
-
-    let mut route_index = 0;
-    let mut pattern_index = 0;
-
-    while pattern_index < pattern_segments.len() && route_index < route_segments.len() {
-        let segment = pattern_segments[pattern_index];
-        if segment == "**" {
-            return true;
-        }
-
-        if segment != "*" && segment != route_segments[route_index] {
-            return false;
-        }
-
-        pattern_index += 1;
-        route_index += 1;
-    }
-
-    if pattern_index == pattern_segments.len() && route_index == route_segments.len() {
-        return true;
-    }
-
-    pattern_index + 1 == pattern_segments.len() && pattern_segments[pattern_index] == "**"
 }
 
 #[cfg(test)]
@@ -450,6 +426,7 @@ mod tests {
     fn should_decode_rpc_status_error_response() {
         // Arrange
         let mut buf = vec![1];
+        buf.extend_from_slice(&6012u32.to_be_bytes());
         buf.extend_from_slice(&(4u32).to_be_bytes());
         buf.extend_from_slice(b"nope");
 
@@ -457,5 +434,6 @@ mod tests {
         let err = decode_rpc_status_response("CALL", &buf).unwrap_err();
         // Assert
         assert!(err.to_string().contains("nope"));
+        assert!(matches!(err, FitzError::Domain { code: 6012, .. }));
     }
 }

@@ -2,7 +2,9 @@
 
 use crate::codec::{PayloadDecoder, PayloadEncoder};
 use crate::connection::SharedConnection;
-use crate::domains::routes::{validate_fixed_route, validate_selector_route};
+use crate::domains::routes::{
+    validate_fixed_route, validate_registration_pattern, validate_selector_route,
+};
 use crate::error::{FitzError, Result};
 use crate::protocol::message_type;
 use serde::{Deserialize, Serialize};
@@ -344,7 +346,7 @@ impl StreamClient {
     /// # Errors
     /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn subscribe(&self, pattern: &str) -> Result<StreamSubscription> {
-        validate_selector_route(pattern, "stream", 3, true)?;
+        validate_registration_pattern(pattern, "stream", 3)?;
 
         let mut enc = PayloadEncoder::new();
         enc.put_string(pattern);
@@ -587,10 +589,12 @@ fn decode_stream_response(operation: &str, buf: &[u8]) -> Result<StreamResponseP
             Ok(StreamResponsePayload { session_id, data })
         }
         1 => {
+            let code = dec.get_u32()?;
             let message = dec.get_string()?;
-            Err(FitzError::DomainError(format!(
-                "{operation} failed: {message}"
-            )))
+            Err(FitzError::Domain {
+                code,
+                message: format!("{operation} failed: {message}"),
+            })
         }
         other => Err(FitzError::Protocol(format!(
             "{operation} failed with unknown status byte: {other}"
@@ -1007,6 +1011,7 @@ mod tests {
     fn should_decode_stream_error_response() {
         // Arrange
         let mut buf = vec![1];
+        buf.extend_from_slice(&2010u32.to_be_bytes());
         buf.extend_from_slice(&(4u32).to_be_bytes());
         buf.extend_from_slice(b"nope");
 
@@ -1014,6 +1019,7 @@ mod tests {
         let err = decode_stream_response("READ", &buf).unwrap_err();
         // Assert
         assert!(err.to_string().contains("nope"));
+        assert!(matches!(err, FitzError::Domain { code: 2010, .. }));
     }
 
     #[test]

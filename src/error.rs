@@ -1,5 +1,23 @@
 use std::io::ErrorKind;
 
+/// Authoritative broker error codes used by live registration APIs.
+pub mod error_code {
+    pub const KV_INVALID_SUBSCRIPTION_PATTERN: u32 = 1012;
+    pub const KV_SUBSCRIPTION_LIMIT: u32 = 1013;
+    pub const STREAM_INVALID_SUBSCRIPTION_PATTERN: u32 = 2010;
+    pub const STREAM_SUBSCRIPTION_LIMIT: u32 = 2011;
+    pub const NOTICE_INVALID_PATTERN: u32 = 3002;
+    pub const NOTICE_SUBSCRIPTION_LIMIT: u32 = 3003;
+    pub const QUEUE_INVALID_SUBSCRIPTION_PATTERN: u32 = 4010;
+    pub const QUEUE_SUBSCRIPTION_LIMIT: u32 = 4011;
+    pub const LEASE_BAD_REQUEST: u32 = 5008;
+    pub const LEASE_INVALID_SUBSCRIPTION_ROUTE: u32 = 5010;
+    pub const RPC_INVALID_SUBSCRIPTION_PATTERN: u32 = 6012;
+    pub const RPC_SUBSCRIPTION_LIMIT: u32 = 6013;
+    pub const SCHEDULE_INVALID_SUBSCRIPTION_PATTERN: u32 = 7006;
+    pub const SCHEDULE_SUBSCRIPTION_LIMIT: u32 = 7007;
+}
+
 /// Stable error categories exposed by the SDK.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]

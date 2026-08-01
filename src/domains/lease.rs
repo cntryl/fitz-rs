@@ -222,6 +222,31 @@ impl LeaseClient {
         })
     }
 
+    /// Subscribe to changes for one exact three-segment Lease route.
+    ///
+    /// # Errors
+    /// Returns an error when the route is not exact or broker processing fails.
+    pub fn subscribe(&self, route: &str) -> Result<LeaseSubscription> {
+        validate_fixed_route(route, "lease", 3)?;
+        let mut encoder = PayloadEncoder::new();
+        encoder.put_string(route);
+        let response = self
+            .conn
+            .send_request(message_type::LEASE_SUBSCRIBE, &encoder.finish())?;
+        let mut decoder = decode_lease_success("SUBSCRIBE", &response)?;
+        let subscription_id = decoder.get_u64()?;
+        if !decoder.is_empty() {
+            return Err(FitzError::Protocol(
+                "LEASE SUBSCRIBE response has trailing bytes".to_string(),
+            ));
+        }
+        Ok(LeaseSubscription {
+            conn: self.conn.clone(),
+            route: route.to_string(),
+            subscription_id,
+        })
+    }
+
     /// Runs a callback while this client owns the lease.
     ///
     /// # Errors
@@ -360,6 +385,71 @@ impl LeaseClient {
             }
         }
     }
+}
+
+/// Active exact-route Lease change subscription.
+pub struct LeaseSubscription {
+    conn: SharedConnection,
+    route: String,
+    subscription_id: u64,
+}
+
+impl LeaseSubscription {
+    #[must_use]
+    pub fn subscription_id(&self) -> u64 {
+        self.subscription_id
+    }
+
+    /// Wait for the next Lease change notification.
+    ///
+    /// # Errors
+    /// Returns an error when decoding or transport fails.
+    pub fn next(&self) -> Result<LeaseChangeNotification> {
+        let (_, payload) = self.conn.recv_message_matching(|msg_type, payload| {
+            msg_type == message_type::LEASE_NOTIFY
+                && PayloadDecoder::new(payload)
+                    .get_u64()
+                    .is_ok_and(|id| id == self.subscription_id)
+        })?;
+        decode_lease_notification(&payload)
+    }
+
+    /// Unsubscribe from the exact route.
+    ///
+    /// # Errors
+    /// Returns an error when broker processing fails.
+    pub fn unsubscribe(&self) -> Result<()> {
+        let mut encoder = PayloadEncoder::new();
+        encoder.put_string(&self.route);
+        let response = self
+            .conn
+            .send_request(message_type::LEASE_UNSUBSCRIBE, &encoder.finish())?;
+        let decoder = decode_lease_success("UNSUBSCRIBE", &response)?;
+        if !decoder.is_empty() {
+            return Err(FitzError::Protocol(
+                "LEASE UNSUBSCRIBE response has trailing bytes".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseChangeNotification {
+    pub route: String,
+}
+
+fn decode_lease_notification(payload: &[u8]) -> Result<LeaseChangeNotification> {
+    let mut decoder = PayloadDecoder::new(payload);
+    let _subscription_id = decoder.get_u64()?;
+    let route = decoder.get_string()?;
+    let notification_payload = decoder.get_bytes()?;
+    if !notification_payload.is_empty() || !decoder.is_empty() {
+        return Err(FitzError::Protocol(
+            "LEASE NOTIFY payload must be empty and contain no trailing bytes".to_string(),
+        ));
+    }
+    Ok(LeaseChangeNotification { route })
 }
 
 /// Decode the standard lease response format.
@@ -532,5 +622,42 @@ mod tests {
         };
         // Assert
         assert!(err.to_string().contains("Unknown"));
+    }
+
+    #[test]
+    fn should_reject_wildcard_lease_routes_given_concrete_only_subscription_contract() {
+        // Arrange
+        let routes = [
+            "lease://realm/area/*",
+            "lease://realm/**",
+            "lease://*/area/resource",
+            "lease://realm/area/res*",
+            "queue://realm/area/resource",
+            "lease://realm/area",
+            "lease://realm/area/resource/extra",
+        ];
+
+        // Act
+        let results = routes.map(|route| validate_fixed_route(route, "lease", 3));
+
+        // Assert
+        assert!(results.iter().all(Result::is_err));
+    }
+
+    #[test]
+    fn should_decode_exact_lease_route_given_change_notification() {
+        // Arrange
+        let route = b"lease://realm/area/resource";
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&7u64.to_be_bytes());
+        payload.extend_from_slice(&u32::try_from(route.len()).unwrap().to_be_bytes());
+        payload.extend_from_slice(route);
+        payload.extend_from_slice(&0u32.to_be_bytes());
+
+        // Act
+        let notification = decode_lease_notification(&payload).unwrap();
+
+        // Assert
+        assert_eq!(notification.route, "lease://realm/area/resource");
     }
 }

@@ -23,7 +23,7 @@
 
 use crate::codec::{PayloadDecoder, PayloadEncoder};
 use crate::connection::SharedConnection;
-use crate::domains::routes::validate_fixed_route;
+use crate::domains::routes::{validate_fixed_route, validate_registration_pattern};
 use crate::error::{FitzError, Result};
 use crate::protocol::{TransactionMode, message_type};
 
@@ -66,8 +66,9 @@ impl KvClient {
         let mut dec = PayloadDecoder::new(&resp);
         let status = dec.get_u8()?;
         if status == 1 {
-            let msg = dec.get_string()?;
-            return Err(FitzError::DomainError(msg));
+            let code = dec.get_u32()?;
+            let message = dec.get_string()?;
+            return Err(FitzError::Domain { code, message });
         }
         let tx_id = dec.get_u64()?;
 
@@ -77,6 +78,112 @@ impl KvClient {
             route: route.to_string(),
         })
     }
+
+    /// Subscribe to committed-mutation notifications for an exact route or
+    /// strict whole-segment pattern capable of matching a three-segment KV route.
+    ///
+    /// # Errors
+    /// Returns an error when validation, encoding, transport, or broker processing fails.
+    pub fn subscribe(&self, pattern: &str) -> Result<KvSubscription> {
+        validate_registration_pattern(pattern, "kv", 3)?;
+        let mut enc = PayloadEncoder::new();
+        enc.put_string(pattern);
+        let response = self
+            .conn
+            .send_request(message_type::KV_SUBSCRIBE, &enc.finish())?;
+        let subscription_id = decode_kv_subscription(&response)?;
+        Ok(KvSubscription {
+            conn: self.conn.clone(),
+            pattern: pattern.to_string(),
+            subscription_id,
+        })
+    }
+}
+
+/// Active KV change-watch registration.
+pub struct KvSubscription {
+    conn: SharedConnection,
+    pattern: String,
+    subscription_id: u64,
+}
+
+impl KvSubscription {
+    #[must_use]
+    pub fn subscription_id(&self) -> u64 {
+        self.subscription_id
+    }
+
+    /// Wait for the next notification for this registration.
+    ///
+    /// # Errors
+    /// Returns an error when decoding, transport, or broker processing fails.
+    pub fn next(&self) -> Result<KvNotification> {
+        let (_, payload) = self.conn.recv_message_matching(|msg_type, payload| {
+            msg_type == message_type::KV_NOTIFY
+                && PayloadDecoder::new(payload)
+                    .get_u64()
+                    .is_ok_and(|id| id == self.subscription_id)
+        })?;
+        decode_kv_notification(&payload)
+    }
+
+    /// Unsubscribe using the original registration string.
+    ///
+    /// # Errors
+    /// Returns an error when encoding, transport, or broker processing fails.
+    pub fn unsubscribe(&self) -> Result<()> {
+        let mut enc = PayloadEncoder::new();
+        enc.put_string(&self.pattern);
+        let response = self
+            .conn
+            .send_request(message_type::KV_UNSUBSCRIBE, &enc.finish())?;
+        decode_ok_response(&response)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvNotification {
+    pub route: String,
+    pub mutation_count: u64,
+}
+
+fn decode_kv_subscription(response: &[u8]) -> Result<u64> {
+    let mut decoder = PayloadDecoder::new(response);
+    match decoder.get_u8()? {
+        0 => {
+            let subscription_id = decoder.get_u64()?;
+            if !decoder.is_empty() {
+                return Err(FitzError::Protocol(
+                    "KV SUBSCRIBE response has trailing bytes".to_string(),
+                ));
+            }
+            Ok(subscription_id)
+        }
+        1 => {
+            let code = decoder.get_u32()?;
+            let message = decoder.get_string()?;
+            Err(FitzError::Domain { code, message })
+        }
+        status => Err(FitzError::Protocol(format!(
+            "KV SUBSCRIBE returned unknown status byte {status}"
+        ))),
+    }
+}
+
+fn decode_kv_notification(payload: &[u8]) -> Result<KvNotification> {
+    let mut decoder = PayloadDecoder::new(payload);
+    let _subscription_id = decoder.get_u64()?;
+    let route = decoder.get_string()?;
+    let mutation_count = decoder.get_u64()?;
+    if !decoder.is_empty() {
+        return Err(FitzError::Protocol(
+            "KV NOTIFY payload has trailing bytes".to_string(),
+        ));
+    }
+    Ok(KvNotification {
+        route,
+        mutation_count,
+    })
 }
 
 /// A live KV transaction.
@@ -113,8 +220,9 @@ impl KvTransaction {
         let mut dec = PayloadDecoder::new(&resp);
         let status = dec.get_u8()?;
         if status == 1 {
-            let msg = dec.get_string()?;
-            return Err(FitzError::DomainError(msg));
+            let code = dec.get_u32()?;
+            let message = dec.get_string()?;
+            return Err(FitzError::Domain { code, message });
         }
         let found = dec.get_u8()? != 0;
         let value = dec.get_bytes()?;
@@ -208,8 +316,9 @@ fn decode_ok_response(buf: &[u8]) -> Result<()> {
     match status {
         0 => Ok(()),
         1 => {
-            let msg = dec.get_string()?;
-            Err(FitzError::DomainError(msg))
+            let code = dec.get_u32()?;
+            let message = dec.get_string()?;
+            Err(FitzError::Domain { code, message })
         }
         _ => Err(FitzError::Protocol(format!(
             "Unknown response status byte: {status}"
@@ -248,12 +357,59 @@ mod tests {
         // Arrange
         let msg = b"tx not found";
         let mut buf = vec![0x01];
+        buf.extend_from_slice(&1003u32.to_be_bytes());
         buf.extend_from_slice(&u32::try_from(msg.len()).unwrap().to_be_bytes());
         buf.extend_from_slice(msg);
         // Act
         let err = decode_ok_response(&buf).unwrap_err();
         // Assert
         assert!(err.to_string().contains("tx not found"));
+        assert!(matches!(err, FitzError::Domain { code: 1003, .. }));
+    }
+
+    #[test]
+    fn should_decode_kv_subscription_id_given_success_response() {
+        // Arrange
+        let mut response = vec![0];
+        response.extend_from_slice(&42u64.to_be_bytes());
+
+        // Act
+        let subscription_id = decode_kv_subscription(&response).unwrap();
+
+        // Assert
+        assert_eq!(subscription_id, 42);
+    }
+
+    #[test]
+    fn should_preserve_typed_kv_subscription_error_given_error_response() {
+        // Arrange
+        let mut response = vec![1];
+        response.extend_from_slice(&1012u32.to_be_bytes());
+        response.extend_from_slice(&15u32.to_be_bytes());
+        response.extend_from_slice(b"invalid pattern");
+
+        // Act
+        let error = decode_kv_subscription(&response).unwrap_err();
+
+        // Assert
+        assert!(matches!(error, FitzError::Domain { code: 1012, .. }));
+    }
+
+    #[test]
+    fn should_decode_concrete_kv_notification_given_wildcard_registration_delivery() {
+        // Arrange
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&42u64.to_be_bytes());
+        payload.extend_from_slice(&24u32.to_be_bytes());
+        payload.extend_from_slice(b"kv://realm/area/resource");
+        payload.extend_from_slice(&3u64.to_be_bytes());
+
+        // Act
+        let notification = decode_kv_notification(&payload).unwrap();
+
+        // Assert
+        assert_eq!(notification.route, "kv://realm/area/resource");
+        assert_eq!(notification.mutation_count, 3);
     }
 
     #[test]

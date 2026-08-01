@@ -401,6 +401,7 @@ fn is_server_notification(msg_type: u16) -> bool {
         msg_type,
         message_type::RPC_REQUEST
             | message_type::RPC_RESPONSE
+            | message_type::KV_NOTIFY
             | message_type::QUEUE_NOTIFY
             | message_type::LEASE_NOTIFY
             | message_type::NOTICE_NOTIFY
@@ -431,6 +432,11 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
+
+    #[test]
+    fn should_classify_kv_notify_given_server_notification_message_type() {
+        assert!(is_server_notification(message_type::KV_NOTIFY));
+    }
 
     fn read_length_prefixed_frame(stream: &mut std::net::TcpStream) {
         let mut len_buf = [0u8; 4];
