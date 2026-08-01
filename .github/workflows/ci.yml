@@ -39,6 +39,7 @@ jobs:
       - name: Run broker integration tests
         run: |
           cargo test \
+            --features legacy-blocking \
             --test integration_kv_tcp \
             --test integration_kv_websocket \
             --test integration_domains \
@@ -56,7 +57,7 @@ jobs:
               CONFORMANCE_TRANSPORT="$transport" \
                 CONFORMANCE_AUTH_MODE="$auth_mode" \
                 CONFORMANCE_OUTPUT="$output" \
-                cargo test --test conformance conformance_suite -- --ignored --nocapture
+                cargo test --features legacy-blocking --test conformance conformance_suite -- --ignored --nocapture
             done
           done
 
