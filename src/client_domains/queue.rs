@@ -1,0 +1,275 @@
+use super::decode_ok;
+use crate::async_connection::{AsyncConnection, RestorableRegistration};
+use crate::codec::{PayloadDecoder, PayloadEncoder};
+use crate::domains::routes::{
+    validate_fixed_route, validate_registration_pattern, validate_selector_route,
+};
+use crate::protocol::message_type;
+use crate::{FitzError, Result};
+use futures_core::Stream;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio_stream::wrappers::BroadcastStream;
+
+#[derive(Clone)]
+pub struct QueueClient {
+    connection: AsyncConnection,
+}
+
+impl QueueClient {
+    pub(crate) fn new(connection: AsyncConnection) -> Self {
+        Self { connection }
+    }
+
+    /// Performs the operation asynchronously.
+    ///
+    /// # Errors
+    /// Returns an error when validation, transport, or broker processing fails.
+    pub async fn enqueue(&self, route: &str, body: &[u8], delay_ms: Option<u64>) -> Result<u64> {
+        validate_fixed_route(route, "queue", 3)?;
+        let mut encoder = PayloadEncoder::new();
+        encoder.put_string(route).put_bytes(body);
+        if let Some(delay) = delay_ms.filter(|delay| *delay > 0) {
+            encoder.put_u8(1).put_u64(delay / 1_000);
+        } else {
+            encoder.put_u8(0);
+        }
+        let response = self
+            .connection
+            .request(message_type::QUEUE_ENQUEUE, encoder.finish())
+            .await?;
+        let mut decoder = success_decoder(&response, "ENQUEUE")?;
+        if decoder.is_empty() {
+            Ok(0)
+        } else {
+            decoder.get_u64()
+        }
+    }
+
+    /// Performs the operation asynchronously.
+    ///
+    /// # Errors
+    /// Returns an error when validation, transport, or broker processing fails.
+    pub async fn reserve(
+        &self,
+        route: &str,
+        lease_seconds: u64,
+        batch_size: u32,
+        wait_seconds: Option<u64>,
+    ) -> Result<Vec<QueueItem>> {
+        validate_selector_route(route, "queue", 3, false)?;
+        let mut encoder = PayloadEncoder::new();
+        encoder
+            .put_string(route)
+            .put_u64(lease_seconds)
+            .put_u8(1)
+            .put_u32(batch_size.max(1));
+        if let Some(wait) = wait_seconds.filter(|wait| *wait > 0) {
+            encoder.put_u8(1).put_u64(wait);
+        } else {
+            encoder.put_u8(0);
+        }
+        let response = self
+            .connection
+            .request(message_type::QUEUE_RESERVE, encoder.finish())
+            .await?;
+        let mut decoder = success_decoder(&response, "RESERVE")?;
+        if decoder.is_empty() {
+            return Ok(Vec::new());
+        }
+        let count = decoder.get_u32()?;
+        let generation = self.connection.generation();
+        let mut items = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            items.push(QueueItem {
+                connection: self.connection.clone(),
+                generation,
+                route: route.to_owned(),
+                id: decoder.get_u64()?,
+                token: decoder.get_u64()?,
+                body: decoder.get_bytes()?,
+            });
+        }
+        Ok(items)
+    }
+
+    /// Performs the operation asynchronously.
+    ///
+    /// # Errors
+    /// Returns an error when validation, transport, or broker processing fails.
+    pub async fn subscribe(&self, pattern: &str) -> Result<QueueSubscription> {
+        validate_registration_pattern(pattern, "queue", 3)?;
+        let receiver = self
+            .connection
+            .notifications(message_type::QUEUE_NOTIFY, 64);
+        let mut encoder = PayloadEncoder::new();
+        encoder.put_string(pattern);
+        let payload = encoder.finish();
+        let response = self
+            .connection
+            .request(message_type::QUEUE_SUBSCRIBE, payload.clone())
+            .await?;
+        let subscription_id = decode_subscription_id(&response)?;
+        let registration = self.connection.register_restorable(
+            message_type::QUEUE_SUBSCRIBE,
+            payload,
+            subscription_id,
+            decode_subscription_id,
+        );
+        Ok(QueueSubscription {
+            connection: self.connection.clone(),
+            pattern: pattern.to_owned(),
+            registration,
+            receiver: BroadcastStream::new(receiver),
+            closed: false,
+        })
+    }
+}
+
+pub struct QueueItem {
+    connection: AsyncConnection,
+    generation: u64,
+    route: String,
+    id: u64,
+    token: u64,
+    pub body: Vec<u8>,
+}
+
+impl QueueItem {
+    fn ensure_current(&self) -> Result<()> {
+        if self.connection.generation() == self.generation {
+            Ok(())
+        } else {
+            Err(FitzError::StaleHandle)
+        }
+    }
+    /// Performs the operation asynchronously.
+    ///
+    /// # Errors
+    /// Returns an error when validation, transport, or broker processing fails.
+    pub async fn extend(&self, lease_seconds: u64) -> Result<()> {
+        self.ensure_current()?;
+        let mut encoder = PayloadEncoder::new();
+        encoder
+            .put_string(&self.route)
+            .put_u64(self.id)
+            .put_u64(self.token)
+            .put_u64(lease_seconds);
+        decode_ok(
+            &self
+                .connection
+                .request(message_type::QUEUE_EXTEND, encoder.finish())
+                .await?,
+        )
+    }
+    /// Performs the operation asynchronously.
+    ///
+    /// # Errors
+    /// Returns an error when validation, transport, or broker processing fails.
+    pub async fn complete(self) -> Result<()> {
+        self.ensure_current()?;
+        let mut encoder = PayloadEncoder::new();
+        encoder
+            .put_string(&self.route)
+            .put_u64(self.id)
+            .put_u64(self.token);
+        decode_ok(
+            &self
+                .connection
+                .request(message_type::QUEUE_COMPLETE, encoder.finish())
+                .await?,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueNotification {
+    pub route: String,
+    pub ready_messages: u64,
+    pub delayed_messages: u64,
+    pub inflight_messages: u64,
+}
+
+pub struct QueueSubscription {
+    connection: AsyncConnection,
+    pattern: String,
+    registration: RestorableRegistration,
+    receiver: BroadcastStream<Vec<u8>>,
+    closed: bool,
+}
+
+impl QueueSubscription {
+    /// Performs the operation asynchronously.
+    ///
+    /// # Errors
+    /// Returns an error when validation, transport, or broker processing fails.
+    pub async fn unsubscribe(mut self) -> Result<()> {
+        self.closed = true;
+        self.registration.deactivate();
+        let mut encoder = PayloadEncoder::new();
+        encoder.put_string(&self.pattern);
+        decode_ok(
+            &self
+                .connection
+                .request(message_type::QUEUE_UNSUBSCRIBE, encoder.finish())
+                .await?,
+        )
+    }
+}
+
+impl Stream for QueueSubscription {
+    type Item = Result<QueueNotification>;
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.closed {
+            return Poll::Ready(None);
+        }
+        loop {
+            match Pin::new(&mut self.receiver).poll_next(context) {
+                Poll::Ready(Some(Ok(payload))) => {
+                    let mut decoder = PayloadDecoder::new(&payload);
+                    let id = match decoder.get_u64() {
+                        Ok(v) => v,
+                        Err(e) => return Poll::Ready(Some(Err(e))),
+                    };
+                    if id != self.registration.wire_id() {
+                        continue;
+                    }
+                    let result = (|| {
+                        Ok(QueueNotification {
+                            route: decoder.get_string()?,
+                            ready_messages: decoder.get_u64()?,
+                            delayed_messages: decoder.get_u64()?,
+                            inflight_messages: decoder.get_u64()?,
+                        })
+                    })();
+                    return Poll::Ready(Some(result));
+                }
+                Poll::Ready(Some(Err(_))) => {
+                    return Poll::Ready(Some(Err(FitzError::Backpressure(
+                        "Queue subscription buffer is full".into(),
+                    ))));
+                }
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+fn decode_subscription_id(response: &[u8]) -> Result<u64> {
+    success_decoder(response, "SUBSCRIBE")?.get_u64()
+}
+
+fn success_decoder<'a>(response: &'a [u8], operation: &str) -> Result<PayloadDecoder<'a>> {
+    let mut decoder = PayloadDecoder::new(response);
+    match decoder.get_u8()? {
+        0 => Ok(decoder),
+        1 => Err(FitzError::Domain {
+            code: decoder.get_u32()?,
+            message: decoder.get_string()?,
+        }),
+        status => Err(FitzError::Protocol(format!(
+            "Queue {operation} returned status {status}"
+        ))),
+    }
+}

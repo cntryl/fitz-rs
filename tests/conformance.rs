@@ -5,7 +5,9 @@ use cntryl_fitz::domains::stream::{
     StreamCommitMode, StreamDiscriminator, StreamFilterClause, StreamFilterSet,
     StreamFilteredReason, StreamReadItem,
 };
-use cntryl_fitz::{FitzClient, FitzError, FitzErrorKind, Result};
+use cntryl_fitz::{
+    Client, ConnectionState, FitzClient, FitzError, FitzErrorKind, ReconnectPolicy, Result,
+};
 use serde::Serialize;
 use std::fs;
 use std::io::Read;
@@ -16,6 +18,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::io::AsyncWriteExt;
+use tokio::sync::oneshot;
 
 const CLIENT_NAME: &str = "fitz-rs";
 const REALM: &str = "test-realm";
@@ -255,6 +259,135 @@ fn broker_ws_url(auth_mode: AuthMode) -> String {
         AuthMode::ValidJwt => "ws://127.0.0.1:4090/ws",
     };
     std::env::var(key).unwrap_or_else(|_| fallback.to_string())
+}
+
+async fn run_real_drop_reconnect(
+    transport: Transport,
+    auth_mode: AuthMode,
+) -> std::result::Result<ScenarioOutcome, String> {
+    let (target_host, target_port) = match transport {
+        Transport::Tcp => broker_tcp_addr(auth_mode),
+        Transport::WebSocket => {
+            let port = match auth_mode {
+                AuthMode::Anonymous => 4190,
+                AuthMode::ValidJwt => 4090,
+            };
+            ("127.0.0.1".to_owned(), port)
+        }
+    };
+    let target = format!("{target_host}:{target_port}");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|error| format!("relay bind failed: {error}"))?;
+    let relay_address = listener
+        .local_addr()
+        .map_err(|error| format!("relay address failed: {error}"))?;
+    let (drop_tx, drop_rx) = oneshot::channel();
+    let relay = tokio::spawn(run_drop_relay(listener, target, drop_rx));
+    let endpoint = match transport {
+        Transport::Tcp => format!("tcp://{relay_address}"),
+        Transport::WebSocket => format!("ws://{relay_address}/ws"),
+    };
+    let token = match auth_mode {
+        AuthMode::Anonymous => String::new(),
+        AuthMode::ValidJwt => jwt::make_test_jwt(REALM, &broker_secret()),
+    };
+    let client = Client::builder(endpoint, move || {
+        let token = token.clone();
+        async move { Ok(token) }
+    })
+    .request_timeout(Duration::from_secs(3))
+    .reconnect_policy(ReconnectPolicy {
+        base_delay: Duration::from_millis(25),
+        maximum_delay: Duration::from_millis(100),
+        maximum_attempts: 20,
+        ..ReconnectPolicy::default()
+    })
+    .build()
+    .map_err(|error| format!("async client build failed: {error}"))?;
+
+    client
+        .connect()
+        .await
+        .map_err(|error| format!("initial connect failed: {error}"))?;
+    write_reconnect_marker(&client, "pre-drop").await?;
+
+    let mut states = client.subscribe_state();
+    let _ = drop_tx.send(());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while *states.borrow() != ConnectionState::Reconnecting {
+            states
+                .changed()
+                .await
+                .map_err(|_| "state channel closed during disconnect")?;
+        }
+        while *states.borrow() != ConnectionState::Authenticated {
+            states
+                .changed()
+                .await
+                .map_err(|_| "state channel closed during reconnect")?;
+        }
+        Ok::<(), &str>(())
+    })
+    .await
+    .map_err(|_| "same client did not reauthenticate after real transport loss".to_owned())?
+    .map_err(str::to_owned)?;
+
+    write_reconnect_marker(&client, "post-drop").await?;
+    client
+        .close()
+        .await
+        .map_err(|error| format!("async client close failed: {error}"))?;
+    relay.abort();
+
+    Ok(ScenarioOutcome {
+        verdict: Verdict::Pass,
+        evidence: vec![
+            "pre-drop request succeeded".to_owned(),
+            "relay dropped the live transport while the broker remained available".to_owned(),
+            "the same Client reauthenticated and completed post-drop work".to_owned(),
+        ],
+    })
+}
+
+async fn write_reconnect_marker(client: &Client, phase: &str) -> std::result::Result<(), String> {
+    let route = unique_route("kv");
+    let tx = client
+        .kv()
+        .map_err(|error| format!("{phase} KV accessor failed: {error}"))?
+        .begin(&route, TransactionMode::ReadWrite)
+        .await
+        .map_err(|error| format!("{phase} KV begin failed: {error}"))?;
+    tx.put(phase.as_bytes(), b"ok")
+        .await
+        .map_err(|error| format!("{phase} KV put failed: {error}"))?;
+    tx.commit()
+        .await
+        .map_err(|error| format!("{phase} KV commit failed: {error}"))
+}
+
+async fn run_drop_relay(
+    listener: tokio::net::TcpListener,
+    target: String,
+    drop_rx: oneshot::Receiver<()>,
+) {
+    let mut first_drop = Some(drop_rx);
+    while let Ok((mut inbound, _)) = listener.accept().await {
+        let Ok(mut outbound) = tokio::net::TcpStream::connect(&target).await else {
+            return;
+        };
+        if let Some(drop_rx) = first_drop.take() {
+            tokio::select! {
+                _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => {}
+                _ = drop_rx => {
+                    let _ = inbound.shutdown().await;
+                    let _ = outbound.shutdown().await;
+                }
+            }
+        } else {
+            let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+        }
+    }
 }
 
 fn broker_secret() -> String {
@@ -1043,50 +1176,9 @@ fn execute_suite(transport: Transport, auth_mode: AuthMode) -> AggregateResult {
         transport,
         auth_mode,
         || {
-            // For a synchronous blocking client, reconnect is expressed as creating a new
-            // FitzClient after a connection loss.  This scenario verifies that workflow:
-            // 1. Connect, confirm a request works.
-            // 2. Close the client (simulates connection loss / explicit teardown).
-            // 3. Create a new client (the "reconnect").
-            // 4. Confirm new requests succeed on the fresh connection.
-            let client = connect_broker_client(transport, auth_mode)
-                .map_err(|err| format!("initial connect failed: {err}"))?;
-            let route = unique_route("kv");
-            let tx = client
-                .kv()
-                .begin(&route, TransactionMode::ReadWrite)
-                .map_err(|err| format!("pre-reconnect kv begin failed: {err}"))?;
-            tx.put(b"pre-reconnect", b"ok")
-                .map_err(|err| format!("pre-reconnect kv put failed: {err}"))?;
-            tx.commit()
-                .map_err(|err| format!("pre-reconnect kv commit failed: {err}"))?;
-            close_client(&client);
-
-            // Reconnect: create a new client.
-            let reconnected = connect_broker_client(transport, auth_mode)
-                .map_err(|err| format!("reconnect (new client) failed: {err}"))?;
-            let post_route = unique_route("kv");
-            let post_tx = reconnected
-                .kv()
-                .begin(&post_route, TransactionMode::ReadWrite)
-                .map_err(|err| format!("post-reconnect kv begin failed: {err}"))?;
-            post_tx
-                .put(b"post-reconnect", b"ok")
-                .map_err(|err| format!("post-reconnect kv put failed: {err}"))?;
-            post_tx
-                .commit()
-                .map_err(|err| format!("post-reconnect kv commit failed: {err}"))?;
-            close_client(&reconnected);
-
-            Ok(ScenarioOutcome {
-                verdict: Verdict::Pass,
-                evidence: vec![
-                    "initial request succeeded before close".to_string(),
-                    "new FitzClient created after close (manual reconnect for blocking API)"
-                        .to_string(),
-                    "new requests succeeded on the reconnected client".to_string(),
-                ],
-            })
+            tokio::runtime::Runtime::new()
+                .map_err(|error| format!("Tokio runtime creation failed: {error}"))?
+                .block_on(run_real_drop_reconnect(transport, auth_mode))
         },
     ));
 

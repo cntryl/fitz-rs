@@ -10,7 +10,10 @@ pub mod message_type {
     pub const KV_ROLLBACK: u16 = 102;
     pub const KV_GET: u16 = 103;
     pub const KV_PUT: u16 = 104;
+    pub const KV_INSERT: u16 = 105;
     pub const KV_DELETE: u16 = 106;
+    pub const KV_DELETE_RANGE: u16 = 107;
+    pub const KV_SCAN: u16 = 108;
     pub const KV_SUBSCRIBE: u16 = 109;
     pub const KV_UNSUBSCRIBE: u16 = 110;
     pub const KV_NOTIFY: u16 = 111;
@@ -43,6 +46,7 @@ pub mod message_type {
     pub const NOTICE_PUBLISH: u16 = 500;
     pub const NOTICE_SUBSCRIBE: u16 = 501;
     pub const NOTICE_UNSUBSCRIBE: u16 = 502;
+    #[cfg(feature = "legacy-blocking")]
     pub const NOTICE_UNSUBSCRIBE_ALL: u16 = 503;
     pub const NOTICE_NOTIFY: u16 = 504;
 

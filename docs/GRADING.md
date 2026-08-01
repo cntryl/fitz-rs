@@ -12,7 +12,7 @@ Status legend:
 - Transport support: PASS
 - Authentication helpers: PASS
 - Domain coverage: PASS
-- Connection lifecycle: PARTIAL
+- Connection lifecycle: PASS
 - Error model: PASS
 - Conformance runner: PASS
 - Documentation and verification: PASS
@@ -25,14 +25,15 @@ Status legend:
 | Authentication | PASS | JWT connect helpers remain available, and anonymous connect helpers are now exposed for broker modes that do not require a token. |
 | Domain clients | PASS | KV, Queue, Notice, RPC, Lease, Stream, and Schedule are all exposed from the public client facade. |
 | Error contract | PASS | `FitzErrorKind`, `kind()`, `is_retryable()`, and `domain_message()` provide machine-readable classification without parsing strings. |
-| Connection lifecycle | PARTIAL | Clean close and closed-state checks are in place. Reconnect orchestration is not part of the current synchronous Rust surface. |
-| Conformance runner | PASS | `tests/conformance.rs` emits normalized JSON artifacts and enforces the shared `CS-001` through `CS-017` matrix. |
+| Connection lifecycle | PASS | The Tokio supervisor reconnects with a fresh token, fails stale stateful handles, restores active registrations, and returns to `Authenticated` only after restoration. |
+| Conformance runner | PASS | `tests/conformance.rs` emits normalized JSON artifacts and enforces `CS-001` through `CS-017`; CS-010 drops a relay transport and proves recovery on the same client. |
 | Verification docs | PASS | The README and local docs now point at the real conformance runner and artifact path. |
 
 ## Verification Commands
 
 ```bash
-cargo test --lib
+cargo test --locked --all-targets --all-features
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings -D clippy::pedantic
 cargo test --test conformance -- --ignored --nocapture
 CONFORMANCE_TRANSPORT=ws CONFORMANCE_AUTH_MODE=valid_jwt cargo test --test conformance -- --ignored --nocapture
 ```

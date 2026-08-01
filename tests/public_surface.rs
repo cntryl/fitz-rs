@@ -30,7 +30,7 @@ fn should_keep_root_public_surface_narrow() {
         "mod connection;",
         "mod protocol;",
         "mod transport;",
-        "pub mod domains;",
+        "pub mod client_domains;",
         "pub use error::{FitzError, FitzErrorKind, Result};",
         "pub use protocol::TransactionMode;",
     ] {

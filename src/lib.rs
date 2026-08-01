@@ -1,41 +1,52 @@
 //! Fitz Rust Client Library
 //!
-//! A synchronous client library for the Fitz event streaming and orchestration platform.
-//! Supports both TCP and WebSocket transports.
+//! An async Tokio client library for the Fitz event streaming and orchestration platform.
+//! Supports both TCP and WebSocket transports with reconnect and restoration.
 //!
 //! # Quick Start
 //!
 //! ```ignore
-//! use cntryl::FitzClient;
+//! use cntryl_fitz::Client;
 //!
 //! // Connect with an opaque token; the client never parses or stores auth secrets.
-//! let client = FitzClient::connect_tcp("127.0.0.1", 4091, "opaque-token")?;
+//! let client = Client::anonymous("tcp://127.0.0.1:4091").build()?;
+//! client.connect().await?;
 //!
 //! // Routes are opaque strings — the client never parses them.
-//! let tx = client.kv().begin("kv://my-realm/app/users", TransactionMode::ReadWrite)?;
-//! tx.put(b"user:1", b"alice")?;
-//! tx.commit()?;
+//! let tx = client.kv()?.begin("kv://my-realm/app/users", TransactionMode::ReadWrite).await?;
+//! tx.put(b"user:1", b"alice").await?;
+//! tx.commit().await?;
 //!
 //! // Leases
-//! let grant = client.lease().acquire("lease://my-realm/locks/leader", "node-1", 30)?;
+//! let grant = client.lease()?.acquire("lease://my-realm/locks/leader", "node-1", 30).await?;
 //! ```
 
+mod async_connection;
+pub mod client_domains;
 mod codec;
+#[cfg(feature = "legacy-blocking")]
 mod connection;
+#[cfg(feature = "legacy-blocking")]
 pub mod domains;
+#[cfg(not(feature = "legacy-blocking"))]
+mod domains;
 mod error;
 mod protocol;
+#[cfg(feature = "legacy-blocking")]
 mod transport;
 
 pub use error::error_code;
 pub use error::{FitzError, FitzErrorKind, Result};
 pub use protocol::TransactionMode;
 
+use async_connection::AsyncConnection;
 use async_trait::async_trait;
+#[cfg(feature = "legacy-blocking")]
 use connection::{FitzConnection, SharedConnection};
+use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex as AsyncMutex, watch};
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 /// Options shared by every domain operation.
@@ -153,7 +164,7 @@ impl ClientBuilder {
                 max_in_flight: self.max_in_flight,
                 reconnect: self.reconnect,
                 state_tx,
-                connection: AsyncMutex::new(None),
+                connection: Mutex::new(None),
             }),
         })
     }
@@ -166,7 +177,7 @@ struct ClientInner {
     max_in_flight: usize,
     reconnect: ReconnectPolicy,
     state_tx: watch::Sender<ConnectionState>,
-    connection: AsyncMutex<Option<FitzClient>>,
+    connection: Mutex<Option<AsyncConnection>>,
 }
 
 /// Async Fitz client entry point.
@@ -207,6 +218,61 @@ impl Client {
     pub fn subscribe_state(&self) -> watch::Receiver<ConnectionState> {
         self.inner.state_tx.subscribe()
     }
+    /// Returns a KV domain handle.
+    ///
+    /// # Errors
+    /// Returns [`FitzError::ConnectionClosed`] until [`Self::connect`] succeeds.
+    pub fn kv(&self) -> Result<client_domains::kv::KvClient> {
+        Ok(client_domains::kv::KvClient::new(self.connection()?))
+    }
+    /// Returns a Notice domain handle.
+    ///
+    /// # Errors
+    /// Returns [`FitzError::ConnectionClosed`] until [`Self::connect`] succeeds.
+    pub fn notice(&self) -> Result<client_domains::notice::NoticeClient> {
+        Ok(client_domains::notice::NoticeClient::new(
+            self.connection()?,
+        ))
+    }
+    /// Returns a Queue domain handle.
+    ///
+    /// # Errors
+    /// Returns [`FitzError::ConnectionClosed`] until [`Self::connect`] succeeds.
+    pub fn queue(&self) -> Result<client_domains::queue::QueueClient> {
+        Ok(client_domains::queue::QueueClient::new(self.connection()?))
+    }
+    /// Returns a Schedule domain handle.
+    ///
+    /// # Errors
+    /// Returns [`FitzError::ConnectionClosed`] until [`Self::connect`] succeeds.
+    pub fn schedule(&self) -> Result<client_domains::schedule::ScheduleClient> {
+        Ok(client_domains::schedule::ScheduleClient::new(
+            self.connection()?,
+        ))
+    }
+    /// Returns a Lease domain handle.
+    ///
+    /// # Errors
+    /// Returns [`FitzError::ConnectionClosed`] until [`Self::connect`] succeeds.
+    pub fn lease(&self) -> Result<client_domains::lease::LeaseClient> {
+        Ok(client_domains::lease::LeaseClient::new(self.connection()?))
+    }
+    /// Returns an RPC domain handle.
+    ///
+    /// # Errors
+    /// Returns [`FitzError::ConnectionClosed`] until [`Self::connect`] succeeds.
+    pub fn rpc(&self) -> Result<client_domains::rpc::RpcClient> {
+        Ok(client_domains::rpc::RpcClient::new(self.connection()?))
+    }
+    /// Returns a Stream domain handle.
+    ///
+    /// # Errors
+    /// Returns [`FitzError::ConnectionClosed`] until [`Self::connect`] succeeds.
+    pub fn stream(&self) -> Result<client_domains::stream::StreamClient> {
+        Ok(client_domains::stream::StreamClient::new(
+            self.connection()?,
+        ))
+    }
     ///
     /// # Errors
     /// Returns an error when validation, encoding, transport, or broker processing fails.
@@ -217,23 +283,21 @@ impl Client {
         self.inner
             .state_tx
             .send_replace(ConnectionState::Connecting);
-        let token = self.inner.token_provider.token().await?;
-        self.inner.state_tx.send_replace(ConnectionState::Connected);
-        self.inner
-            .state_tx
-            .send_replace(ConnectionState::Authenticating);
-        let endpoint = self.inner.endpoint.clone();
-        let timeout = self.inner.timeout;
-        let max_in_flight = self.inner.max_in_flight;
-        let client = tokio::task::spawn_blocking(move || {
-            connect_endpoint(&endpoint, &token, timeout, max_in_flight)
-        })
-        .await
-        .map_err(|error| FitzError::Connection(error.to_string()))??;
-        *self.inner.connection.lock().await = Some(client);
-        self.inner
-            .state_tx
-            .send_replace(ConnectionState::Authenticated);
+        let connection = {
+            let mut slot = self.inner.connection.lock();
+            slot.get_or_insert_with(|| {
+                AsyncConnection::spawn(
+                    self.inner.endpoint.clone(),
+                    Arc::clone(&self.inner.token_provider),
+                    self.inner.timeout,
+                    self.inner.max_in_flight,
+                    self.inner.reconnect.clone(),
+                    self.inner.state_tx.clone(),
+                )
+            })
+            .clone()
+        };
+        connection.connect().await?;
         tracing::info!(endpoint = %self.inner.endpoint, "fitz client authenticated");
         Ok(())
     }
@@ -241,11 +305,9 @@ impl Client {
     /// # Errors
     /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub async fn close(&self) -> Result<()> {
-        let connection = self.inner.connection.lock().await.take();
+        let connection = self.inner.connection.lock().take();
         if let Some(connection) = connection {
-            tokio::task::spawn_blocking(move || connection.close())
-                .await
-                .map_err(|error| FitzError::Connection(error.to_string()))??;
+            connection.close().await;
         }
         self.inner.state_tx.send_replace(ConnectionState::Closed);
         Ok(())
@@ -254,47 +316,32 @@ impl Client {
     pub fn reconnect_policy(&self) -> &ReconnectPolicy {
         &self.inner.reconnect
     }
+
+    fn connection(&self) -> Result<AsyncConnection> {
+        self.inner
+            .connection
+            .lock()
+            .as_ref()
+            .cloned()
+            .ok_or(FitzError::ConnectionClosed)
+    }
 }
 
-fn connect_endpoint(
-    endpoint: &str,
-    token: &str,
-    timeout: Duration,
-    max_in_flight: usize,
-) -> Result<FitzClient> {
-    let builder = FitzClient::builder(token)
-        .with_timeout(timeout)
-        .with_max_in_flight_requests(max_in_flight);
-    if let Some(address) = endpoint.strip_prefix("tcp://") {
-        let (host, port) = address
-            .rsplit_once(':')
-            .ok_or_else(|| FitzError::Connection("TCP endpoint must include a port".into()))?;
-        return builder.connect_tcp(
-            host,
-            port.parse()
-                .map_err(|_| FitzError::Connection("invalid TCP port".into()))?,
-        );
-    }
-    if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
-        return builder.connect_ws(endpoint);
-    }
-    Err(FitzError::Connection(
-        "endpoint must use tcp://, ws://, or wss://".into(),
-    ))
-}
-
+#[cfg(feature = "legacy-blocking")]
 enum ClientAuth {
     Token(String),
     Anonymous,
 }
 
 /// Builder for creating Fitz clients with flexible configuration.
+#[cfg(feature = "legacy-blocking")]
 pub struct FitzClientBuilder {
     auth: ClientAuth,
     timeout: Duration,
     max_in_flight_requests: usize,
 }
 
+#[cfg(feature = "legacy-blocking")]
 impl FitzClientBuilder {
     #[must_use]
     pub fn new(token: &str) -> Self {
@@ -369,10 +416,12 @@ impl FitzClientBuilder {
 ///
 /// The client is intentionally realm-agnostic — realm context lives in
 /// the auth token sent during CONNECT, and route strings carry the addressing.
+#[cfg(feature = "legacy-blocking")]
 pub struct FitzClient {
     connection: SharedConnection,
 }
 
+#[cfg(feature = "legacy-blocking")]
 impl FitzClient {
     /// Create a builder.
     #[must_use]
@@ -483,7 +532,7 @@ impl FitzClient {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-blocking"))]
 mod tests {
     use super::*;
     use crate::codec::{decode_message_frame, encode_message_frame};

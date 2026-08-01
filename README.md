@@ -37,6 +37,13 @@ crate never creates or inspects JWTs.
 
 ## Subscription registrations
 
+All domain operations are async. Domain accessors such as `client.kv()` and
+`client.notice()` return typed clients, while subscription and RPC worker
+handles implement `futures_core::Stream`. Wire registration IDs remain private
+and are replaced transparently after reconnect. Dropping a one-shot future is
+cancellation-safe; slow bounded streams terminate with a typed backpressure
+error instead of stalling the receive loop.
+
 KV, Queue, Stream, Notice, RPC worker, and Schedule registrations accept exact
 routes and whole-segment `*` or `**` patterns, including wildcard realms. KV,
 Queue, and Stream patterns must be capable of matching three segments;
@@ -70,7 +77,8 @@ docker compose down --volumes
 
 The broker-backed tests cover KV, Queue, RPC, Lease, Notice, Stream, and
 Schedule lifecycles. The conformance runner covers shared scenarios
-`CS-001` through `CS-017`.
+`CS-001` through `CS-017`, including a real relay-induced transport loss that
+must recover on the same `Client` instance.
 
 ## Managed leases
 

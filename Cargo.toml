@@ -13,6 +13,10 @@ keywords = ["fitz", "queue", "stream", "rpc", "database"]
 categories = ["api-bindings", "asynchronous", "database"]
 exclude = ["artifacts/", "compose.yml"]
 
+[features]
+default = []
+legacy-blocking = []
+
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "time", "sync"] }
 bytes = "1"
@@ -26,6 +30,7 @@ futures-util = "0.3"
 futures-core = "0.3"
 async-trait = "0.1"
 tokio-util = { version = "0.7", features = ["rt"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 url = "2"
 parking_lot = "0.12"
 
@@ -45,3 +50,43 @@ pedantic = "deny"
 [[bench]]
 name = "codec"
 harness = false
+
+[[test]]
+name = "conformance"
+path = "tests/conformance.rs"
+required-features = ["legacy-blocking"]
+
+[[test]]
+name = "integration_domain_edges"
+path = "tests/integration_domain_edges.rs"
+required-features = ["legacy-blocking"]
+
+[[test]]
+name = "integration_domains"
+path = "tests/integration_domains.rs"
+required-features = ["legacy-blocking"]
+
+[[test]]
+name = "integration_kv_tcp"
+path = "tests/integration_kv_tcp.rs"
+required-features = ["legacy-blocking"]
+
+[[test]]
+name = "integration_kv_websocket"
+path = "tests/integration_kv_websocket.rs"
+required-features = ["legacy-blocking"]
+
+[[test]]
+name = "integration_multiprotocol"
+path = "tests/integration_multiprotocol.rs"
+required-features = ["legacy-blocking"]
+
+[[test]]
+name = "integration_rpc"
+path = "tests/integration_rpc.rs"
+required-features = ["legacy-blocking"]
+
+[[test]]
+name = "integration_stream"
+path = "tests/integration_stream.rs"
+required-features = ["legacy-blocking"]
