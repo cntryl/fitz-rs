@@ -252,6 +252,7 @@ fn scenario_title(id: u8) -> &'static str {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires fitz-auth and fitz-anon from compose.yml"]
 async fn should_complete_default_async_conformance_suite() {
     // Arrange
     let transport = Transport::from_env();

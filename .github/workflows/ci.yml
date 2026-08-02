@@ -19,11 +19,11 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
           components: rustfmt, clippy
-      - run: cargo fmt --check
+      - run: cargo fmt --all -- --check
       - name: Run strict Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --all-targets
-      - run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings -D clippy::pedantic
+      - run: cargo test --locked --workspace --all-targets --all-features
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --all-features --no-deps
       - run: cargo package
 
   broker:
@@ -57,7 +57,7 @@ jobs:
               CONFORMANCE_TRANSPORT="$transport" \
                 CONFORMANCE_AUTH_MODE="$auth_mode" \
                 CONFORMANCE_OUTPUT="$output" \
-                cargo test --features legacy-blocking --test conformance conformance_suite -- --ignored --nocapture
+                cargo test --test conformance should_complete_default_async_conformance_suite -- --ignored --nocapture
             done
           done
 

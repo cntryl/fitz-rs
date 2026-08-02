@@ -71,7 +71,7 @@ Run the broker-backed tests explicitly:
 
 ```console
 cargo test --features legacy-blocking --test integration_kv_tcp --test integration_kv_websocket --test integration_domains --test integration_multiprotocol --test integration_rpc --test integration_stream -- --ignored
-CONFORMANCE_TRANSPORT=tcp CONFORMANCE_AUTH_MODE=anonymous cargo test --test conformance -- --nocapture
+CONFORMANCE_TRANSPORT=tcp CONFORMANCE_AUTH_MODE=anonymous cargo test --test conformance -- --ignored --nocapture
 docker compose down --volumes
 ```
 
