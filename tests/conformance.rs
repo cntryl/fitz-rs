@@ -152,7 +152,18 @@ async fn should_run_scenario(
             })
             .request_timeout(Duration::from_secs(2))
             .build()?;
-            assert!(invalid.connect().await.is_err());
+            if invalid.connect().await.is_ok() {
+                let result = invalid
+                    .kv()?
+                    .begin(
+                        &unique_route("kv"),
+                        TransactionMode::ReadWrite,
+                        KvDurability::Buffered,
+                    )
+                    .await;
+                assert!(result.is_err(), "invalid JWT must reject the first request");
+                invalid.close().await?;
+            }
         }
         4..=6 => {
             let result = connected
