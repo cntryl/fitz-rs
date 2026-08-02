@@ -75,7 +75,7 @@ impl StreamClient {
         }
         let response = self
             .connection
-            .request(message_type::STREAM_READ, e.finish())
+            .request_replayable(message_type::STREAM_READ, e.finish())
             .await?;
         parse_stream_read_page(&decode_stream_response("READ", &response)?.data)
     }
@@ -108,7 +108,7 @@ impl StreamClient {
         e.put_string(route);
         let response = self
             .connection
-            .request(message_type::STREAM_LAST, e.finish())
+            .request_replayable(message_type::STREAM_LAST, e.finish())
             .await?;
         parse_stream_record(&decode_stream_response("LAST", &response)?.data)
     }
@@ -122,7 +122,7 @@ impl StreamClient {
         e.put_string(route);
         let response = self
             .connection
-            .request(message_type::STREAM_GET_METADATA, e.finish())
+            .request_replayable(message_type::STREAM_GET_METADATA, e.finish())
             .await?;
         let data = decode_stream_response("METADATA", &response)?.data;
         if data.is_empty() {

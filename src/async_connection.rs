@@ -1,5 +1,8 @@
 use crate::codec::{decode_message_frame, try_encode_message_frame};
-use crate::{ConnectionState, FitzError, ReconnectPolicy, Result, TokenProvider};
+use crate::{
+    ConnectionState, FitzAttributes, FitzError, FitzLifecycleEvent, FitzObservability,
+    HeartbeatOptions, ReconnectPolicy, Result, RetryPolicy, TokenProvider,
+};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -79,17 +82,34 @@ pub(crate) struct AsyncConnection {
     registrations: Arc<parking_lot::Mutex<HashMap<u64, Registration>>>,
     next_registration_id: Arc<AtomicU64>,
     timeout: Duration,
+    retry: RetryPolicy,
+}
+
+pub(crate) struct AsyncConnectionOptions {
+    pub endpoint: String,
+    pub token_provider: Arc<dyn TokenProvider>,
+    pub timeout: Duration,
+    pub max_queued: usize,
+    pub reconnect: ReconnectPolicy,
+    pub retry: RetryPolicy,
+    pub heartbeat: HeartbeatOptions,
+    pub observability: FitzObservability,
+    pub state: watch::Sender<ConnectionState>,
 }
 
 impl AsyncConnection {
-    pub(crate) fn spawn(
-        endpoint: String,
-        token_provider: Arc<dyn TokenProvider>,
-        timeout: Duration,
-        max_queued: usize,
-        reconnect: ReconnectPolicy,
-        state: watch::Sender<ConnectionState>,
-    ) -> Self {
+    pub(crate) fn spawn(options: AsyncConnectionOptions) -> Self {
+        let AsyncConnectionOptions {
+            endpoint,
+            token_provider,
+            timeout,
+            max_queued,
+            reconnect,
+            retry,
+            heartbeat,
+            observability,
+            state,
+        } = options;
         let (commands, command_rx) = mpsc::channel(max_queued.max(1));
         let (cancellations, cancellation_rx) = mpsc::unbounded_channel();
         let notifications = Arc::new(parking_lot::Mutex::new(HashMap::new()));
@@ -100,6 +120,8 @@ impl AsyncConnection {
             token_provider,
             timeout,
             reconnect,
+            heartbeat,
+            observability,
             state,
             commands: command_rx,
             cancellations: cancellation_rx,
@@ -116,6 +138,7 @@ impl AsyncConnection {
             registrations,
             next_registration_id: Arc::new(AtomicU64::new(1)),
             timeout,
+            retry,
         }
     }
 
@@ -162,6 +185,51 @@ impl AsyncConnection {
         }
         .instrument(span)
         .await
+    }
+
+    pub(crate) async fn request_replayable(
+        &self,
+        message_type: u16,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        let attempts = if self.retry.enabled {
+            self.retry.maximum_attempts.max(1)
+        } else {
+            1
+        };
+        let mut delay = self.retry.base_delay;
+        for attempt in 1..=attempts {
+            match self.request(message_type, payload.clone()).await {
+                Ok(response) => return Ok(response),
+                Err(error) if attempt == attempts || !error.is_retryable() => return Err(error),
+                Err(_) => tokio::time::sleep(delay).await,
+            }
+            delay = delay.saturating_mul(2).min(self.retry.maximum_delay);
+        }
+        Err(FitzError::ConnectionClosed)
+    }
+
+    pub(crate) async fn request_confirmed_negative(
+        &self,
+        message_type: u16,
+        payload: Vec<u8>,
+        retryable_rejection: impl Fn(&[u8]) -> bool,
+    ) -> Result<Vec<u8>> {
+        let attempts = if self.retry.enabled {
+            self.retry.maximum_attempts.max(1)
+        } else {
+            1
+        };
+        let mut delay = self.retry.base_delay;
+        for attempt in 1..=attempts {
+            let response = self.request(message_type, payload.clone()).await?;
+            if attempt == attempts || !retryable_rejection(&response) {
+                return Ok(response);
+            }
+            tokio::time::sleep(delay).await;
+            delay = delay.saturating_mul(2).min(self.retry.maximum_delay);
+        }
+        Err(FitzError::ConnectionClosed)
     }
 
     pub(crate) async fn send(&self, message_type: u16, payload: Vec<u8>) -> Result<()> {
@@ -252,6 +320,8 @@ struct Supervisor {
     token_provider: Arc<dyn TokenProvider>,
     timeout: Duration,
     reconnect: ReconnectPolicy,
+    heartbeat: HeartbeatOptions,
+    observability: FitzObservability,
     state: watch::Sender<ConnectionState>,
     commands: mpsc::Receiver<Command>,
     cancellations: mpsc::UnboundedReceiver<u64>,
@@ -268,6 +338,7 @@ async fn supervise(mut supervisor: Supervisor) {
             }
             Command::Close(response) => {
                 supervisor.state.send_replace(ConnectionState::Closed);
+                emit_lifecycle(&supervisor, "closed");
                 let _ = response.send(());
                 return;
             }
@@ -286,6 +357,7 @@ async fn connect_and_run(
     mut initial_response: Option<oneshot::Sender<Result<()>>>,
 ) -> Result<()> {
     supervisor.state.send_replace(ConnectionState::Connecting);
+    emit_lifecycle(supervisor, "connect_start");
     let mut attempts = 0_usize;
     loop {
         match open_session(supervisor).await {
@@ -295,9 +367,18 @@ async fn connect_and_run(
                     tracing::warn!(%error, "fitz registration restoration failed");
                     supervisor.generation.fetch_add(1, Ordering::AcqRel);
                 } else {
+                    let reconnected = initial_response.is_none();
                     supervisor
                         .state
                         .send_replace(ConnectionState::Authenticated);
+                    emit_lifecycle(
+                        supervisor,
+                        if reconnected {
+                            "reconnect_succeeded"
+                        } else {
+                            "connect_succeeded"
+                        },
+                    );
                     if let Some(response) = initial_response.take() {
                         let _ = response.send(Ok(()));
                     }
@@ -306,6 +387,7 @@ async fn connect_and_run(
                         return Ok(());
                     }
                     supervisor.generation.fetch_add(1, Ordering::AcqRel);
+                    emit_lifecycle(supervisor, "connection_lost");
                     tracing::warn!(
                         generation = supervisor.generation.load(Ordering::Acquire),
                         "fitz transport disconnected"
@@ -314,10 +396,19 @@ async fn connect_and_run(
             }
             Err(error) if error.is_auth_failure() => {
                 supervisor.state.send_replace(ConnectionState::Closed);
+                emit_lifecycle(supervisor, "auth_rejected");
                 if let Some(response) = initial_response.take() {
                     let _ = response.send(Err(FitzError::Authentication {
                         message: error.to_string(),
                     }));
+                }
+                return Err(error);
+            }
+            Err(error) if initial_response.is_some() => {
+                supervisor.state.send_replace(ConnectionState::Disconnected);
+                emit_lifecycle(supervisor, "connect_failed");
+                if let Some(response) = initial_response.take() {
+                    let _ = response.send(Err(FitzError::Connection(error.to_string())));
                 }
                 return Err(error);
             }
@@ -328,10 +419,12 @@ async fn connect_and_run(
                 }
                 return Err(error);
             }
-            Err(_) => {}
+            Err(_) => emit_lifecycle(supervisor, "reconnect_failed"),
         }
         attempts += 1;
-        if attempts > supervisor.reconnect.maximum_attempts {
+        if supervisor.reconnect.maximum_attempts != 0
+            && attempts > supervisor.reconnect.maximum_attempts
+        {
             supervisor.state.send_replace(ConnectionState::Disconnected);
             if let Some(response) = initial_response.take() {
                 let _ = response.send(Err(FitzError::Connection(
@@ -341,6 +434,7 @@ async fn connect_and_run(
             return Err(FitzError::Connection("reconnect attempts exhausted".into()));
         }
         supervisor.state.send_replace(ConnectionState::Reconnecting);
+        emit_lifecycle(supervisor, "reconnect_start");
         let multiplier = supervisor
             .reconnect
             .multiplier
@@ -366,12 +460,20 @@ async fn open_session(supervisor: &Supervisor) -> Result<Session> {
     let token = supervisor.token_provider.token().await?;
     supervisor.state.send_replace(ConnectionState::Connecting);
     let mut session = if let Some(address) = supervisor.endpoint.strip_prefix("tcp://") {
-        Session::Tcp(
-            tokio::time::timeout(supervisor.timeout, TcpStream::connect(address))
-                .await
-                .map_err(|_| FitzError::Timeout)?
-                .map_err(FitzError::from)?,
-        )
+        let stream = tokio::time::timeout(supervisor.timeout, TcpStream::connect(address))
+            .await
+            .map_err(|_| FitzError::Timeout)?
+            .map_err(FitzError::from)?;
+        if supervisor.heartbeat.enabled {
+            let socket = socket2::SockRef::from(&stream);
+            socket.set_keepalive(true).map_err(FitzError::from)?;
+            socket
+                .set_tcp_keepalive(
+                    &socket2::TcpKeepalive::new().with_time(supervisor.heartbeat.idle_interval),
+                )
+                .map_err(FitzError::from)?;
+        }
+        Session::Tcp(stream)
     } else if supervisor.endpoint.starts_with("ws://") || supervisor.endpoint.starts_with("wss://")
     {
         let (socket, _) = tokio::time::timeout(
@@ -390,6 +492,7 @@ async fn open_session(supervisor: &Supervisor) -> Result<Session> {
     supervisor
         .state
         .send_replace(ConnectionState::Authenticating);
+    emit_lifecycle(supervisor, "auth_start");
     write_session(
         &mut session,
         crate::protocol::message_type::CONNECT,
@@ -398,6 +501,27 @@ async fn open_session(supervisor: &Supervisor) -> Result<Session> {
     .await?;
     settle_authentication(&mut session).await?;
     Ok(session)
+}
+
+fn emit_lifecycle(supervisor: &Supervisor, name: &'static str) {
+    let mut attributes = FitzAttributes::new();
+    attributes.insert("endpoint".into(), supervisor.endpoint.clone());
+    if let Some(logger) = &supervisor.observability.logger {
+        logger.event(name, &attributes);
+    }
+    if let Some(tracer) = &supervisor.observability.tracer {
+        tracer.start(name, &attributes).end();
+    }
+    if let Some(meter) = &supervisor.observability.meter {
+        meter.increment("fitz.lifecycle.events", 1, &attributes);
+    }
+    if let Some(handler) = &supervisor.observability.lifecycle {
+        handler(FitzLifecycleEvent {
+            name,
+            state: *supervisor.state.borrow(),
+            attributes,
+        });
+    }
 }
 
 async fn settle_authentication(session: &mut Session) -> Result<()> {
@@ -471,7 +595,7 @@ where
                 }
                 Some(Command::Send { message_type, payload, response }) => { let _ = response.send(write_tcp(&mut writer, message_type, payload).await); }
                 Some(Command::Connect(response)) => { let _ = response.send(Ok(())); }
-                Some(Command::Close(response)) => { let _ = writer.shutdown().await; let _=response.send(()); fail_pending(&mut pending); supervisor.state.send_replace(ConnectionState::Closed); return SessionResult::Closed; }
+                Some(Command::Close(response)) => { let _ = writer.shutdown().await; let _=response.send(()); fail_pending(&mut pending); supervisor.state.send_replace(ConnectionState::Closed); emit_lifecycle(supervisor, "closed"); return SessionResult::Closed; }
                 None => { let _ = writer.shutdown().await; fail_pending(&mut pending); return SessionResult::Closed; }
             },
             Some(id) = supervisor.cancellations.recv() => if !cancel_pending(&mut pending, id) { canceled.insert(id); },
@@ -492,6 +616,12 @@ async fn run_websocket(
     let (mut writer, mut reader) = socket.split();
     let mut pending: HashMap<u16, VecDeque<PendingRequest>> = HashMap::new();
     let mut canceled = HashSet::new();
+    let heartbeat_enabled = supervisor.heartbeat.enabled;
+    let heartbeat_idle = supervisor.heartbeat.idle_interval;
+    let heartbeat_timeout = supervisor.heartbeat.timeout;
+    let heartbeat = tokio::time::sleep(heartbeat_idle);
+    tokio::pin!(heartbeat);
+    let mut awaiting_pong = false;
     loop {
         tokio::select! {
             command = supervisor.commands.recv() => match command {
@@ -500,23 +630,43 @@ async fn run_websocket(
                     pending.entry(message_type).or_default().push_back(PendingRequest { id, response });
                     let frame = try_encode_message_frame(message_type, &payload);
                     if frame.is_err() || writer.send(Message::Binary(frame.unwrap_or_default().into())).await.is_err() { fail_pending(&mut pending); return SessionResult::Disconnected; }
+                    awaiting_pong = false;
+                    heartbeat.as_mut().reset(tokio::time::Instant::now() + heartbeat_idle);
                 }
                 Some(Command::Send { message_type, payload, response }) => { let result = async { let frame=try_encode_message_frame(message_type,&payload)?; writer.send(Message::Binary(frame.into())).await.map_err(|e| FitzError::Transport(e.to_string())) }.await; let _=response.send(result); }
                 Some(Command::Connect(response)) => { let _ = response.send(Ok(())); }
-                Some(Command::Close(response)) => { let _=writer.close().await; let _=response.send(()); fail_pending(&mut pending); supervisor.state.send_replace(ConnectionState::Closed); return SessionResult::Closed; }
+                Some(Command::Close(response)) => { let _=writer.close().await; let _=response.send(()); fail_pending(&mut pending); supervisor.state.send_replace(ConnectionState::Closed); emit_lifecycle(supervisor, "closed"); return SessionResult::Closed; }
                 None => { let _=writer.close().await; fail_pending(&mut pending); return SessionResult::Closed; }
             },
             Some(id) = supervisor.cancellations.recv() => if !cancel_pending(&mut pending, id) { canceled.insert(id); },
             message = reader.next() => match message {
                 Some(Ok(Message::Binary(frame))) => if let Ok((message_type, payload_start)) = decode_message_frame(&frame) {
+                    awaiting_pong = false;
+                    heartbeat.as_mut().reset(tokio::time::Instant::now() + heartbeat_idle);
                     dispatch(supervisor, &mut pending, message_type, frame[payload_start..].to_vec());
                 } else {
                     fail_pending(&mut pending);
                     return SessionResult::Disconnected;
                 },
-                Some(Ok(_)) => {},
+                Some(Ok(Message::Ping(payload))) => {
+                    if writer.send(Message::Pong(payload)).await.is_err() { fail_pending(&mut pending); return SessionResult::Disconnected; }
+                    heartbeat.as_mut().reset(tokio::time::Instant::now() + heartbeat_idle);
+                },
+                Some(Ok(Message::Pong(_))) => {
+                    awaiting_pong = false;
+                    heartbeat.as_mut().reset(tokio::time::Instant::now() + heartbeat_idle);
+                },
+                Some(Ok(_)) => { heartbeat.as_mut().reset(tokio::time::Instant::now() + heartbeat_idle); },
                 _ => { fail_pending(&mut pending); return SessionResult::Disconnected; }
-            }
+            },
+            () = &mut heartbeat, if heartbeat_enabled => {
+                if awaiting_pong || writer.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    fail_pending(&mut pending);
+                    return SessionResult::Disconnected;
+                }
+                awaiting_pong = true;
+                heartbeat.as_mut().reset(tokio::time::Instant::now() + heartbeat_timeout);
+            },
         }
     }
 }
@@ -677,17 +827,20 @@ mod tests {
                 .unwrap();
         });
         let (state, _) = watch::channel(ConnectionState::Disconnected);
-        let connection = AsyncConnection::spawn(
-            format!("tcp://{address}"),
-            Arc::new(|| async { Ok(String::new()) }),
-            Duration::from_secs(1),
-            8,
-            ReconnectPolicy {
+        let connection = AsyncConnection::spawn(AsyncConnectionOptions {
+            endpoint: format!("tcp://{address}"),
+            token_provider: Arc::new(|| async { Ok(String::new()) }),
+            timeout: Duration::from_secs(1),
+            max_queued: 8,
+            reconnect: ReconnectPolicy {
                 enabled: false,
                 ..ReconnectPolicy::default()
             },
+            retry: RetryPolicy::default(),
+            heartbeat: HeartbeatOptions::default(),
+            observability: FitzObservability::default(),
             state,
-        );
+        });
         connection.connect().await.unwrap();
 
         // Act

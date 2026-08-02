@@ -36,7 +36,11 @@ impl QueueClient {
         }
         let response = self
             .connection
-            .request(message_type::QUEUE_ENQUEUE, encoder.finish())
+            .request_confirmed_negative(
+                message_type::QUEUE_ENQUEUE,
+                encoder.finish(),
+                is_retryable_enqueue_rejection,
+            )
             .await?;
         let mut decoder = success_decoder(&response, "ENQUEUE")?;
         if decoder.is_empty() {
@@ -124,6 +128,12 @@ impl QueueClient {
             closed: false,
         })
     }
+}
+
+fn is_retryable_enqueue_rejection(response: &[u8]) -> bool {
+    let mut decoder = PayloadDecoder::new(response);
+    decoder.get_u8().is_ok_and(|status| status == 1)
+        && decoder.get_u32().is_ok_and(|code| code == 4005)
 }
 
 pub struct QueueItem {

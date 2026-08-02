@@ -4,9 +4,33 @@ use crate::domains::routes::validate_fixed_route;
 use crate::protocol::message_type;
 use crate::{FitzError, Result};
 use futures_core::Stream;
+use futures_util::FutureExt;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio_stream::wrappers::BroadcastStream;
+use tokio_util::sync::CancellationToken;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LeaseExecutionOptions {
+    pub wait_for_availability: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LeaseExecutionError<E> {
+    #[error("lease acquisition failed: {0}")]
+    Acquisition(FitzError),
+    #[error("lease callback failed")]
+    Callback(E),
+    #[error("lease ownership lost: {0}")]
+    OwnershipLost(FitzError),
+    #[error("lease release failed: {0}")]
+    Release(FitzError),
+    #[error("lease lifecycle and callback both failed")]
+    Combined { lifecycle: FitzError, callback: E },
+}
 #[derive(Clone)]
 pub struct LeaseClient {
     connection: AsyncConnection,
@@ -54,7 +78,7 @@ impl LeaseClient {
         e.put_string(route);
         let response = self
             .connection
-            .request(message_type::LEASE_QUERY, e.finish())
+            .request_replayable(message_type::LEASE_QUERY, e.finish())
             .await?;
         let mut d = success(&response, "QUERY")?;
         let held = d.get_u8()? == 1;
@@ -105,6 +129,117 @@ impl LeaseClient {
             closed: false,
         })
     }
+
+    /// Runs a callback while the lease is owned and supervised.
+    ///
+    /// # Errors
+    /// Returns typed acquisition, callback, ownership-loss, release, or combined failures.
+    pub async fn with_lease<F, Fut, T, E>(
+        &self,
+        route: &str,
+        owner_id: &str,
+        ttl_secs: u64,
+        callback: F,
+    ) -> std::result::Result<T, LeaseExecutionError<E>>
+    where
+        F: FnOnce(CancellationToken) -> Fut + Send + 'static,
+        Fut: Future<Output = std::result::Result<T, E>> + Send + 'static,
+        T: Send + 'static,
+        E: Send + 'static,
+    {
+        self.with_lease_with_options(
+            route,
+            owner_id,
+            ttl_secs,
+            callback,
+            LeaseExecutionOptions::default(),
+        )
+        .await
+    }
+
+    /// Runs a callback while the lease is owned with explicit acquisition behavior.
+    ///
+    /// # Errors
+    /// Returns typed acquisition, callback, ownership-loss, release, or combined failures.
+    pub async fn with_lease_with_options<F, Fut, T, E>(
+        &self,
+        route: &str,
+        owner_id: &str,
+        ttl_secs: u64,
+        callback: F,
+        options: LeaseExecutionOptions,
+    ) -> std::result::Result<T, LeaseExecutionError<E>>
+    where
+        F: FnOnce(CancellationToken) -> Fut + Send + 'static,
+        Fut: Future<Output = std::result::Result<T, E>> + Send + 'static,
+        T: Send + 'static,
+        E: Send + 'static,
+    {
+        validate_fixed_route(route, "lease", 3).map_err(LeaseExecutionError::Acquisition)?;
+        if ttl_secs == 0 || ttl_secs > u64::from(u32::MAX) / 1_000 {
+            return Err(LeaseExecutionError::Acquisition(FitzError::Protocol(
+                "lease TTL must be positive and schedulable".into(),
+            )));
+        }
+        let mut delay = Duration::from_millis(50);
+        let mut handle = loop {
+            match self.acquire(route, owner_id, ttl_secs).await {
+                Ok(handle) => break handle,
+                Err(error) if options.wait_for_availability && is_contention(&error) => {
+                    tokio::time::sleep(delay).await;
+                    delay = delay.saturating_mul(2).min(Duration::from_secs(1));
+                }
+                Err(error) => return Err(LeaseExecutionError::Acquisition(error)),
+            }
+        };
+
+        let cancellation = CancellationToken::new();
+        let callback_task =
+            tokio::spawn(AssertUnwindSafe(callback(cancellation.clone())).catch_unwind());
+        tokio::pin!(callback_task);
+        let renewal = tokio::time::sleep(Duration::from_secs(ttl_secs) / 3);
+        tokio::pin!(renewal);
+        loop {
+            tokio::select! {
+                biased;
+                callback_result = &mut callback_task => {
+                    let outcome = callback_result.map_err(|error| LeaseExecutionError::Acquisition(FitzError::Connection(error.to_string())))?;
+                    let release_result = handle.release().await;
+                    let callback_result = match outcome {
+                        Ok(result) => result,
+                        Err(panic) => std::panic::resume_unwind(panic),
+                    };
+                    return match (callback_result, release_result) {
+                        (Ok(value), Ok(())) => Ok(value),
+                        (Err(error), Ok(())) => Err(LeaseExecutionError::Callback(error)),
+                        (Ok(_), Err(error)) => Err(LeaseExecutionError::Release(error)),
+                        (Err(callback), Err(lifecycle)) => Err(LeaseExecutionError::Combined { lifecycle, callback }),
+                    };
+                }
+                () = &mut renewal => {
+                    match handle.extend(ttl_secs).await {
+                        Ok(()) => renewal.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(ttl_secs) / 3),
+                        Err(error) => {
+                            cancellation.cancel();
+                            let outcome = callback_task.await.map_err(|join| LeaseExecutionError::OwnershipLost(FitzError::Connection(join.to_string())))?;
+                            let callback_result = match outcome {
+                                Ok(result) => result,
+                                Err(panic) => std::panic::resume_unwind(panic),
+                            };
+                            return match callback_result {
+                                Ok(_) => Err(LeaseExecutionError::OwnershipLost(error)),
+                                Err(callback) => Err(LeaseExecutionError::Combined { lifecycle: error, callback }),
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn is_contention(error: &FitzError) -> bool {
+    matches!(error, FitzError::Domain { code: 5001, .. })
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaseInfo {

@@ -33,6 +33,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 url = "2"
 parking_lot = "0.12"
+socket2 = "0.6"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -54,6 +55,10 @@ harness = false
 [[test]]
 name = "conformance"
 path = "tests/conformance.rs"
+
+[[test]]
+name = "conformance_legacy"
+path = "tests/conformance_legacy.rs"
 required-features = ["legacy-blocking"]
 
 [[test]]

@@ -13,7 +13,7 @@
 //! client.connect().await?;
 //!
 //! // Routes are opaque strings — the client never parses them.
-//! let tx = client.kv()?.begin("kv://my-realm/app/users", TransactionMode::ReadWrite).await?;
+//! let tx = client.kv()?.begin("kv://my-realm/app/users", TransactionMode::ReadWrite, KvDurability::Buffered).await?;
 //! tx.put(b"user:1", b"alice").await?;
 //! tx.commit().await?;
 //!
@@ -31,15 +31,28 @@ pub mod domains;
 #[cfg(not(feature = "legacy-blocking"))]
 mod domains;
 mod error;
+mod observability;
 mod protocol;
 #[cfg(feature = "legacy-blocking")]
 mod transport;
 
 pub use error::error_code;
 pub use error::{FitzError, FitzErrorKind, Result};
+pub use observability::{
+    FitzAttributes, FitzLifecycleEvent, FitzLogger, FitzMeter, FitzObservability, FitzSpan,
+    FitzTracer,
+};
 pub use protocol::TransactionMode;
 
-use async_connection::AsyncConnection;
+/// Durability requested for a KV transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum KvDurability {
+    Buffered = 0,
+    Sync = 1,
+}
+
+use async_connection::{AsyncConnection, AsyncConnectionOptions};
 use async_trait::async_trait;
 #[cfg(feature = "legacy-blocking")]
 use connection::{FitzConnection, SharedConnection};
@@ -95,7 +108,65 @@ impl Default for ReconnectPolicy {
             base_delay: Duration::from_millis(100),
             multiplier: 2.0,
             maximum_delay: Duration::from_secs(30),
-            maximum_attempts: 10,
+            maximum_attempts: 0,
+        }
+    }
+}
+
+/// Bounded readiness wait for [`Client::connect_when_ready`].
+#[derive(Debug, Clone)]
+pub struct ConnectWhenReadyOptions {
+    pub timeout: Duration,
+    pub initial_delay: Duration,
+    pub maximum_delay: Duration,
+    pub cancellation: CancellationToken,
+}
+
+impl Default for ConnectWhenReadyOptions {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(30),
+            initial_delay: Duration::from_millis(250),
+            maximum_delay: Duration::from_secs(2),
+            cancellation: CancellationToken::new(),
+        }
+    }
+}
+
+/// Retry policy for the SDK's narrow replay-safe operation allowlist.
+#[derive(Debug, Clone)]
+pub struct RetryPolicy {
+    pub enabled: bool,
+    pub maximum_attempts: usize,
+    pub base_delay: Duration,
+    pub maximum_delay: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            maximum_attempts: 3,
+            base_delay: Duration::from_millis(100),
+            maximum_delay: Duration::from_secs(1),
+        }
+    }
+}
+
+/// Idle transport liveness configuration.
+#[derive(Debug, Clone)]
+pub struct HeartbeatOptions {
+    pub enabled: bool,
+    pub idle_interval: Duration,
+    pub timeout: Duration,
+}
+
+impl Default for HeartbeatOptions {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            idle_interval: Duration::from_secs(10),
+            timeout: Duration::from_secs(30),
         }
     }
 }
@@ -133,6 +204,9 @@ pub struct ClientBuilder {
     timeout: Duration,
     max_in_flight: usize,
     reconnect: ReconnectPolicy,
+    retry: RetryPolicy,
+    heartbeat: HeartbeatOptions,
+    observability: FitzObservability,
 }
 
 impl ClientBuilder {
@@ -151,6 +225,21 @@ impl ClientBuilder {
         self.reconnect = policy;
         self
     }
+    #[must_use]
+    pub fn retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry = policy;
+        self
+    }
+    #[must_use]
+    pub fn heartbeat_options(mut self, options: HeartbeatOptions) -> Self {
+        self.heartbeat = options;
+        self
+    }
+    #[must_use]
+    pub fn observability(mut self, observability: FitzObservability) -> Self {
+        self.observability = observability;
+        self
+    }
     ///
     /// # Errors
     /// Returns an error when validation, encoding, transport, or broker processing fails.
@@ -163,6 +252,9 @@ impl ClientBuilder {
                 timeout: self.timeout,
                 max_in_flight: self.max_in_flight,
                 reconnect: self.reconnect,
+                retry: self.retry,
+                heartbeat: self.heartbeat,
+                observability: self.observability,
                 state_tx,
                 connection: Mutex::new(None),
             }),
@@ -176,6 +268,9 @@ struct ClientInner {
     timeout: Duration,
     max_in_flight: usize,
     reconnect: ReconnectPolicy,
+    retry: RetryPolicy,
+    heartbeat: HeartbeatOptions,
+    observability: FitzObservability,
     state_tx: watch::Sender<ConnectionState>,
     connection: Mutex<Option<AsyncConnection>>,
 }
@@ -198,6 +293,9 @@ impl Client {
             timeout: Duration::from_secs(30),
             max_in_flight: 256,
             reconnect: ReconnectPolicy::default(),
+            retry: RetryPolicy::default(),
+            heartbeat: HeartbeatOptions::default(),
+            observability: FitzObservability::default(),
         }
     }
     #[must_use]
@@ -208,6 +306,9 @@ impl Client {
             timeout: Duration::from_secs(30),
             max_in_flight: 256,
             reconnect: ReconnectPolicy::default(),
+            retry: RetryPolicy::default(),
+            heartbeat: HeartbeatOptions::default(),
+            observability: FitzObservability::default(),
         }
     }
     #[must_use]
@@ -286,20 +387,50 @@ impl Client {
         let connection = {
             let mut slot = self.inner.connection.lock();
             slot.get_or_insert_with(|| {
-                AsyncConnection::spawn(
-                    self.inner.endpoint.clone(),
-                    Arc::clone(&self.inner.token_provider),
-                    self.inner.timeout,
-                    self.inner.max_in_flight,
-                    self.inner.reconnect.clone(),
-                    self.inner.state_tx.clone(),
-                )
+                AsyncConnection::spawn(AsyncConnectionOptions {
+                    endpoint: self.inner.endpoint.clone(),
+                    token_provider: Arc::clone(&self.inner.token_provider),
+                    timeout: self.inner.timeout,
+                    max_queued: self.inner.max_in_flight,
+                    reconnect: self.inner.reconnect.clone(),
+                    retry: self.inner.retry.clone(),
+                    heartbeat: self.inner.heartbeat.clone(),
+                    observability: self.inner.observability.clone(),
+                    state: self.inner.state_tx.clone(),
+                })
             })
             .clone()
         };
         connection.connect().await?;
         tracing::info!(endpoint = %self.inner.endpoint, "fitz client authenticated");
         Ok(())
+    }
+    /// Waits for startup readiness with bounded exponential backoff.
+    ///
+    /// # Errors
+    /// Returns immediately for authentication failures, cancellation, closure, or timeout.
+    pub async fn connect_when_ready(&self, options: ConnectWhenReadyOptions) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + options.timeout;
+        let mut delay = options.initial_delay;
+        loop {
+            tokio::select! {
+                () = options.cancellation.cancelled() => return Err(FitzError::Canceled),
+                result = self.connect() => match result {
+                    Ok(()) => return Ok(()),
+                    Err(error) if error.is_auth_failure() || matches!(error, FitzError::Closed) => return Err(error),
+                    Err(_) => {}
+                }
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(FitzError::Timeout);
+            }
+            tokio::select! {
+                () = options.cancellation.cancelled() => return Err(FitzError::Canceled),
+                () = tokio::time::sleep(delay.min(remaining)) => {}
+            }
+            delay = delay.saturating_mul(2).min(options.maximum_delay);
+        }
     }
     ///
     /// # Errors

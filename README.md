@@ -70,8 +70,8 @@ identity `1`.
 Run the broker-backed tests explicitly:
 
 ```console
-cargo test --test integration_kv_tcp --test integration_kv_websocket --test integration_domains --test integration_multiprotocol --test integration_rpc --test integration_stream -- --ignored
-CONFORMANCE_TRANSPORT=tcp CONFORMANCE_AUTH_MODE=anonymous cargo test --test conformance conformance_suite -- --ignored --nocapture
+cargo test --features legacy-blocking --test integration_kv_tcp --test integration_kv_websocket --test integration_domains --test integration_multiprotocol --test integration_rpc --test integration_stream -- --ignored
+CONFORMANCE_TRANSPORT=tcp CONFORMANCE_AUTH_MODE=anonymous cargo test --test conformance -- --nocapture
 docker compose down --volumes
 ```
 
@@ -90,9 +90,9 @@ successful `extend`, and must treat any uncertain renewal as ownership loss.
 ## Development
 
 ```console
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings -D clippy::pedantic
+cargo test --locked --workspace --all-targets --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 cargo package --allow-dirty
 ```

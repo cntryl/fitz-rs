@@ -2,6 +2,10 @@
 
 ## 0.1.0 - Unreleased
 
+- Breaking: `Client::connect()` is one-shot; use `connect_when_ready` for bounded startup retry.
+- Breaking: `KvClient::begin` now requires `KvDurability::Buffered` or `KvDurability::Sync`.
+- Reconnect attempts now default to unlimited (`maximum_attempts == 0`).
+- Add managed leases, replay-safe retry configuration, idle heartbeat configuration, and dependency-light observability callbacks to the default async client.
 - Replace the blocking client surface with one Tokio-native `Client`; the
   previous synchronous API is no longer part of the default feature set.
 - Add bounded, cancellation-safe request multiplexing and typed async streams.

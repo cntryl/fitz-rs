@@ -3,7 +3,7 @@ use crate::async_connection::{AsyncConnection, RestorableRegistration};
 use crate::codec::{PayloadDecoder, PayloadEncoder};
 use crate::domains::routes::{validate_fixed_route, validate_registration_pattern};
 use crate::protocol::{TransactionMode, message_type};
-use crate::{FitzError, Result};
+use crate::{FitzError, KvDurability, Result};
 use futures_core::Stream;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -23,10 +23,18 @@ impl KvClient {
     ///
     /// # Errors
     /// Returns an error when validation, transport, or broker processing fails.
-    pub async fn begin(&self, route: &str, mode: TransactionMode) -> Result<KvTransaction> {
+    pub async fn begin(
+        &self,
+        route: &str,
+        mode: TransactionMode,
+        durability: KvDurability,
+    ) -> Result<KvTransaction> {
         validate_fixed_route(route, "kv", 3)?;
         let mut encoder = PayloadEncoder::new();
-        encoder.put_string(route).put_u8(mode as u8).put_u8(0);
+        encoder
+            .put_string(route)
+            .put_u8(mode as u8)
+            .put_u8(durability as u8);
         let response = self
             .connection
             .request(message_type::KV_BEGIN, encoder.finish())
@@ -144,7 +152,7 @@ impl KvTransaction {
         self.ensure_open()?;
         let response = self
             .connection
-            .request(message_type::KV_GET, self.key_payload(key))
+            .request_replayable(message_type::KV_GET, self.key_payload(key))
             .await?;
         let mut decoder = PayloadDecoder::new(&response);
         match decoder.get_u8()? {
@@ -262,7 +270,7 @@ impl KvTransaction {
         encoder.put_u8(u8::from(options.reverse));
         let response = self
             .connection
-            .request(message_type::KV_SCAN, encoder.finish())
+            .request_replayable(message_type::KV_SCAN, encoder.finish())
             .await?;
         let mut decoder = PayloadDecoder::new(&response);
         if decoder.get_u8()? != 0 {
