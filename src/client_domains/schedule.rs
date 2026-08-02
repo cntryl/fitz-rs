@@ -59,14 +59,13 @@ impl ScheduleClient {
             .connection
             .request(message_type::SCHEDULE_CREATE, e.finish())
             .await?;
-        let mut d = success(&response, "CREATE")?;
-        if d.is_empty() {
-            Ok(route.into())
-        } else if d.get_u8()? == 1 {
-            d.get_string()
-        } else {
-            Ok(route.into())
+        let d = success(&response, "CREATE")?;
+        if !d.is_empty() {
+            return Err(FitzError::Protocol(
+                "schedule CREATE response has trailing bytes".into(),
+            ));
         }
+        Ok(route.into())
     }
     /// Performs the operation asynchronously.
     ///

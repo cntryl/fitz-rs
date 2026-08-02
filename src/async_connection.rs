@@ -192,6 +192,16 @@ impl AsyncConnection {
         message_type: u16,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>> {
+        self.request_replayable_in_generation(message_type, payload, None)
+            .await
+    }
+
+    pub(crate) async fn request_replayable_in_generation(
+        &self,
+        message_type: u16,
+        payload: Vec<u8>,
+        expected_generation: Option<u64>,
+    ) -> Result<Vec<u8>> {
         let attempts = if self.retry.enabled {
             self.retry.maximum_attempts.max(1)
         } else {
@@ -199,10 +209,19 @@ impl AsyncConnection {
         };
         let mut delay = self.retry.base_delay;
         for attempt in 1..=attempts {
+            if expected_generation.is_some_and(|generation| self.generation() != generation) {
+                return Err(FitzError::StaleHandle);
+            }
             match self.request(message_type, payload.clone()).await {
                 Ok(response) => return Ok(response),
                 Err(error) if attempt == attempts || !error.is_retryable() => return Err(error),
-                Err(_) => tokio::time::sleep(delay).await,
+                Err(_) => {
+                    if expected_generation.is_some_and(|generation| self.generation() != generation)
+                    {
+                        return Err(FitzError::StaleHandle);
+                    }
+                    tokio::time::sleep(delay).await;
+                }
             }
             delay = delay.saturating_mul(2).min(self.retry.maximum_delay);
         }

@@ -3,6 +3,7 @@
 use super::Transport;
 use futures_util::sink::SinkExt;
 use futures_util::stream::StreamExt;
+use std::future::Future;
 use std::io;
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -22,7 +23,7 @@ impl WebSocketTransport {
     pub fn connect(url: &str) -> io::Result<Self> {
         let rt = tokio::runtime::Runtime::new()?;
 
-        let ws = rt.block_on(async {
+        let ws = block_on_runtime(&rt, async {
             match tokio_tungstenite::connect_async(url).await {
                 Ok((ws, _)) => Ok(ws),
                 Err(e) => Err(io::Error::new(io::ErrorKind::ConnectionRefused, e)),
@@ -47,11 +48,28 @@ impl WebSocketTransport {
     }
 }
 
+fn block_on_runtime<F>(runtime: &tokio::runtime::Runtime, future: F) -> F::Output
+where
+    F: Future + Send,
+    F::Output: Send,
+{
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| runtime.block_on(future))
+                .join()
+                .expect("WebSocket runtime worker panicked")
+        })
+    } else {
+        runtime.block_on(future)
+    }
+}
+
 impl Transport for WebSocketTransport {
     fn send_frame(&mut self, frame: &[u8]) -> io::Result<()> {
         let timeout = self.write_timeout;
         let payload = frame.to_vec();
-        self.rt.block_on(async {
+        block_on_runtime(&self.rt, async {
             // WebSocket: send as binary message (no length prefix)
             match timeout {
                 Some(duration) => {
@@ -73,7 +91,7 @@ impl Transport for WebSocketTransport {
 
     fn recv_frame(&mut self) -> io::Result<Vec<u8>> {
         let timeout = self.read_timeout;
-        self.rt.block_on(async {
+        block_on_runtime(&self.rt, async {
             let next_message = async {
                 loop {
                     match self.ws.next().await {

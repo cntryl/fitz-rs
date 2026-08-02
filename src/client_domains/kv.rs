@@ -152,7 +152,11 @@ impl KvTransaction {
         self.ensure_open()?;
         let response = self
             .connection
-            .request_replayable(message_type::KV_GET, self.key_payload(key))
+            .request_replayable_in_generation(
+                message_type::KV_GET,
+                self.key_payload(key),
+                Some(self.generation),
+            )
             .await?;
         let mut decoder = PayloadDecoder::new(&response);
         match decoder.get_u8()? {
@@ -270,7 +274,11 @@ impl KvTransaction {
         encoder.put_u8(u8::from(options.reverse));
         let response = self
             .connection
-            .request_replayable(message_type::KV_SCAN, encoder.finish())
+            .request_replayable_in_generation(
+                message_type::KV_SCAN,
+                encoder.finish(),
+                Some(self.generation),
+            )
             .await?;
         let mut decoder = PayloadDecoder::new(&response);
         if decoder.get_u8()? != 0 {

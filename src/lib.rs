@@ -57,6 +57,7 @@ use async_trait::async_trait;
 #[cfg(feature = "legacy-blocking")]
 use connection::{FitzConnection, SharedConnection};
 use parking_lot::Mutex;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -74,6 +75,25 @@ impl Default for OperationOptions {
         Self {
             timeout: Duration::from_secs(30),
             cancellation: CancellationToken::new(),
+        }
+    }
+}
+
+impl OperationOptions {
+    /// Runs one domain operation with this call's timeout and cancellation token.
+    ///
+    /// # Errors
+    /// Returns [`FitzError::Timeout`] when the deadline expires or
+    /// [`FitzError::Canceled`] when the cancellation token is triggered.
+    pub async fn run<T, F>(&self, operation: F) -> Result<T>
+    where
+        F: Future<Output = Result<T>>,
+    {
+        tokio::select! {
+            () = self.cancellation.cancelled() => Err(FitzError::Canceled),
+            result = tokio::time::timeout(self.timeout, operation) => {
+                result.map_err(|_| FitzError::Timeout)?
+            }
         }
     }
 }
@@ -995,6 +1015,43 @@ mod tests {
         assert_eq!(second_response, vec![0xBB]);
 
         server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn should_bound_individual_operation_given_operation_timeout() {
+        // Arrange
+        let options = OperationOptions {
+            timeout: Duration::from_millis(1),
+            cancellation: CancellationToken::new(),
+        };
+
+        // Act
+        let result = options
+            .run(async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Ok(())
+            })
+            .await;
+
+        // Assert
+        assert!(matches!(result, Err(FitzError::Timeout)));
+    }
+
+    #[tokio::test]
+    async fn should_cancel_individual_operation_given_cancellation_token() {
+        // Arrange
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let options = OperationOptions {
+            timeout: Duration::from_secs(1),
+            cancellation,
+        };
+
+        // Act
+        let result = options.run(async { Ok(()) }).await;
+
+        // Assert
+        assert!(matches!(result, Err(FitzError::Canceled)));
     }
 
     fn write_length_prefixed_frame(stream: &mut std::net::TcpStream, frame: &[u8]) {
