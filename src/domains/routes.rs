@@ -122,29 +122,17 @@ pub fn validate_fixed_route(route: &str, scheme: &str, segments: usize) -> Resul
     Ok(())
 }
 
-///
-/// # Errors
-/// Returns an error when validation, encoding, transport, or broker processing fails.
-pub fn validate_selector_route(
+pub(crate) fn validate_response_fixed_route(
     route: &str,
     scheme: &str,
     segments: usize,
-    realm_wildcard: bool,
+    operation: &str,
 ) -> Result<()> {
-    let shape = scan(route, scheme)?;
-    if shape.segments != segments || shape.first_wildcard == Some(0) {
-        return invalid("selector has the wrong shape");
-    }
-    let Some(first) = shape.first_wildcard else {
-        return Ok(());
-    };
-    if shape.double_wildcard || !shape.wildcard_suffix {
-        return invalid("selector has invalid wildcard placement");
-    }
-    if first == segments - 1 || (realm_wildcard && first == 1) {
-        return Ok(());
-    }
-    invalid("selector has invalid wildcard placement")
+    validate_fixed_route(route, scheme, segments).map_err(|_| {
+        FitzError::Protocol(format!(
+            "{operation} response contains invalid concrete {scheme} route: {route}"
+        ))
+    })
 }
 
 fn scan(route: &str, scheme: &str) -> Result<Shape> {
@@ -222,18 +210,6 @@ mod tests {
     }
 
     #[test]
-    fn should_accept_selector_routes_given_terminal_wildcards_when_validation_runs() {
-        // Arrange
-        let selectors = ["queue://realm/area/*", "queue://realm/*/*"];
-
-        // Act
-        let results = selectors.map(|route| validate_selector_route(route, "queue", 3, true));
-
-        // Assert
-        assert!(results.iter().all(Result::is_ok));
-    }
-
-    #[test]
     fn should_reject_wrong_scheme_given_domain_route_when_validation_runs() {
         // Arrange
         let route = "notice://realm/area/resource";
@@ -252,18 +228,6 @@ mod tests {
 
         // Act
         let result = validate_fixed_route(route, "queue", 3);
-
-        // Assert
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn should_reject_nonterminal_wildcard_given_selector_wildcard_in_middle_when_validation_runs() {
-        // Arrange
-        let route = "queue://realm/*/resource";
-
-        // Act
-        let result = validate_selector_route(route, "queue", 3, true);
 
         // Assert
         assert!(result.is_err());

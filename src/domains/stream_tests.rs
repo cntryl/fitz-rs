@@ -1,5 +1,10 @@
 use super::*;
 
+fn push_string(buf: &mut Vec<u8>, value: &str) {
+    buf.extend_from_slice(&(u32::try_from(value.len()).unwrap()).to_be_bytes());
+    buf.extend_from_slice(value.as_bytes());
+}
+
 #[test]
 fn should_decode_begin_response_with_session_id() {
     // Arrange
@@ -32,6 +37,7 @@ fn should_parse_count_prefixed_stream_records() {
     // Arrange
     let mut buf = Vec::new();
     buf.extend_from_slice(&(2u32).to_be_bytes());
+    push_string(&mut buf, "stream://realm/area/resource");
     buf.push(0);
     buf.extend_from_slice(&1u64.to_be_bytes());
     buf.push(1);
@@ -44,6 +50,7 @@ fn should_parse_count_prefixed_stream_records() {
     buf.extend_from_slice(&(2u32).to_be_bytes());
     buf.extend_from_slice(b"m1");
     buf.extend_from_slice(&111u64.to_be_bytes());
+    push_string(&mut buf, "stream://realm/area/resource");
     buf.push(0);
     buf.extend_from_slice(&2u64.to_be_bytes());
     buf.push(0);
@@ -63,12 +70,14 @@ fn should_parse_count_prefixed_stream_records() {
     let records = flatten_stream_read_items(&page.items);
     // Assert
     assert_eq!(records.len(), 2);
+    assert_eq!(records[0].route, "stream://realm/area/resource");
     assert_eq!(records[0].offset, 1);
     assert_eq!(records[0].area_offset, Some(10));
     assert_eq!(records[0].realm_offset, Some(20));
     assert_eq!(records[0].metadata.as_deref(), Some(&b"m1"[..]));
     assert_eq!(records[0].timestamp, 111);
     assert_eq!(records[1].body, b"b");
+    assert_eq!(records[1].route, "stream://realm/area/resource");
     assert_eq!(records[1].offset, 2);
     assert_eq!(records[1].timestamp, 222);
     assert_eq!(page.cursor.last_resource_offset, 2);
@@ -82,6 +91,7 @@ fn should_parse_filtered_stream_read_page() {
     // Arrange
     let mut buf = Vec::new();
     buf.extend_from_slice(&(3u32).to_be_bytes());
+    push_string(&mut buf, "stream://realm/area/resource");
     buf.push(0);
     buf.extend_from_slice(&41u64.to_be_bytes());
     buf.push(1);
@@ -91,9 +101,11 @@ fn should_parse_filtered_stream_read_page() {
     buf.extend_from_slice(b"a");
     buf.push(0);
     buf.extend_from_slice(&111u64.to_be_bytes());
+    push_string(&mut buf, "stream://realm/area/resource");
     buf.push(1);
     buf.extend_from_slice(&42u64.to_be_bytes());
     buf.push(1);
+    push_string(&mut buf, "stream://realm/area/resource");
     buf.push(2);
     buf.extend_from_slice(&43u64.to_be_bytes());
     buf.extend_from_slice(&45u64.to_be_bytes());
@@ -117,6 +129,7 @@ fn should_parse_filtered_stream_read_page() {
     assert_eq!(
         page.items[1],
         StreamReadItem::Filtered {
+            route: "stream://realm/area/resource".to_string(),
             offset: 42,
             reason: Some(StreamFilteredReason::ServerFilter),
         }
@@ -124,6 +137,7 @@ fn should_parse_filtered_stream_read_page() {
     assert_eq!(
         page.items[2],
         StreamReadItem::FilteredRange {
+            route: "stream://realm/area/resource".to_string(),
             from_offset: 43,
             to_offset: 45,
             reason: Some(StreamFilteredReason::Permission),
@@ -135,9 +149,64 @@ fn should_parse_filtered_stream_read_page() {
 }
 
 #[test]
+fn should_parse_concrete_routes_given_wildcard_stream_read() {
+    // Arrange
+    let mut encoder = PayloadEncoder::new();
+    encoder
+        .put_u32(1)
+        .put_string("stream://acme/cats/cat-1")
+        .put_u8(1)
+        .put_u64(42)
+        .put_u8(1)
+        .put_u64(42)
+        .put_u8(0)
+        .put_u8(0)
+        .put_u8(0);
+
+    // Act
+    let page = parse_stream_read_page(&encoder.finish()).unwrap();
+
+    // Assert
+    assert_eq!(
+        page.items,
+        vec![StreamReadItem::Filtered {
+            route: "stream://acme/cats/cat-1".to_string(),
+            offset: 42,
+            reason: Some(StreamFilteredReason::ServerFilter),
+        }]
+    );
+}
+
+#[test]
+fn should_reject_wildcard_route_given_stream_read_response() {
+    // Arrange
+    let mut encoder = PayloadEncoder::new();
+    encoder
+        .put_u32(1)
+        .put_string("stream://*/cats/*")
+        .put_u8(1)
+        .put_u64(42)
+        .put_u8(1)
+        .put_u64(42)
+        .put_u8(0)
+        .put_u8(0)
+        .put_u8(0);
+
+    // Act
+    let result = parse_stream_read_page(&encoder.finish());
+
+    // Assert
+    assert!(matches!(
+        result,
+        Err(FitzError::Protocol(message)) if message.contains("READ response")
+    ));
+}
+
+#[test]
 fn should_parse_full_stream_record() {
     // Arrange
     let mut buf = Vec::new();
+    push_string(&mut buf, "stream://realm/area/resource");
     buf.extend_from_slice(&1u64.to_be_bytes());
     buf.push(1);
     buf.extend_from_slice(&2u64.to_be_bytes());
@@ -151,14 +220,28 @@ fn should_parse_full_stream_record() {
     buf.extend_from_slice(&5u64.to_be_bytes());
 
     // Act
-    let record = parse_stream_record(&buf).unwrap().unwrap();
+    let record = parse_stream_last_response(&buf).unwrap().unwrap();
     // Assert
+    assert_eq!(record.route, "stream://realm/area/resource");
     assert_eq!(record.offset, 1);
     assert_eq!(record.area_offset, Some(2));
     assert_eq!(record.realm_offset, Some(3));
     assert_eq!(record.body, b"body");
     assert_eq!(record.metadata.as_deref(), Some(&b"meta"[..]));
     assert_eq!(record.timestamp, 5);
+}
+
+#[test]
+fn should_reject_wildcard_route_in_stream_last_response() {
+    let mut buf = Vec::new();
+    push_string(&mut buf, "stream://*/area/resource");
+
+    let result = parse_stream_last_response(&buf);
+
+    assert!(matches!(
+        result,
+        Err(FitzError::Protocol(message)) if message.contains("LAST response")
+    ));
 }
 
 #[test]

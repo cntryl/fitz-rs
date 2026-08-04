@@ -2,12 +2,12 @@
 
 ## 0.1.0 - Unreleased
 
+- Breaking: Queue reserve, Stream read, and Stream last wire items now require their concrete matched route. `QueueItem`, `StreamReadItem`, and `StreamRecord` expose it, and Queue reserves plus Stream reads/peeks accept arbitrary whole-segment patterns capable of matching three segments.
 - Breaking: `Client::connect()` is one-shot; use `connect_when_ready` for bounded startup retry.
 - Breaking: `KvClient::begin` now requires `KvDurability::Buffered` or `KvDurability::Sync`.
 - Reconnect attempts now default to unlimited (`maximum_attempts == 0`).
 - Add managed leases, replay-safe retry configuration, idle heartbeat configuration, and dependency-light observability callbacks to the default async client.
-- Replace the blocking client surface with one Tokio-native `Client`; the
-  previous synchronous API is no longer part of the default feature set.
+- Remove the synchronous client, transports, domains, feature flag, and test suite; `Client` is exclusively Tokio-native.
 - Add bounded, cancellation-safe request multiplexing and typed async streams.
 - Reconnect with a fresh token, fail stale stateful handles, and restore active
   subscriptions and RPC workers before returning to `Authenticated`.

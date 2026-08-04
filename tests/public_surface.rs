@@ -26,10 +26,9 @@ fn should_keep_root_public_surface_narrow() {
     }
 
     for required in [
+        "mod async_connection;",
         "mod codec;",
-        "mod connection;",
         "mod protocol;",
-        "mod transport;",
         "pub mod client_domains;",
         "pub use error::{FitzError, FitzErrorKind, Result};",
         "pub use protocol::TransactionMode;",
@@ -43,7 +42,7 @@ fn should_keep_root_public_surface_narrow() {
 
 #[test]
 fn should_keep_rpc_correlation_ids_private() {
-    let source = read_source("src/domains/rpc.rs");
+    let source = read_source("src/client_domains/rpc.rs");
     assert!(source.contains("correlation_id: [u8; 16],"));
     assert!(!source.contains("pub correlation_id: [u8; 16],"));
 }
@@ -52,7 +51,7 @@ fn should_keep_rpc_correlation_ids_private() {
 fn should_keep_queue_reservation_tokens_private() {
     // Arrange
     // Act
-    let source = read_source("src/domains/queue.rs");
+    let source = read_source("src/client_domains/queue.rs");
     // Assert
     assert!(source.contains("id: u64,"));
     assert!(source.contains("token: u64,"));

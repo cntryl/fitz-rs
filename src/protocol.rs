@@ -46,8 +46,6 @@ pub mod message_type {
     pub const NOTICE_PUBLISH: u16 = 500;
     pub const NOTICE_SUBSCRIBE: u16 = 501;
     pub const NOTICE_UNSUBSCRIBE: u16 = 502;
-    #[cfg(feature = "legacy-blocking")]
-    pub const NOTICE_UNSUBSCRIBE_ALL: u16 = 503;
     pub const NOTICE_NOTIFY: u16 = 504;
 
     // Stream domain (600-699)

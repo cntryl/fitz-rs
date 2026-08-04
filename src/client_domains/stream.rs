@@ -1,15 +1,13 @@
 use crate::async_connection::{AsyncConnection, RestorableRegistration};
 use crate::codec::{PayloadDecoder, PayloadEncoder};
-use crate::domains::routes::{
-    validate_fixed_route, validate_registration_pattern, validate_selector_route,
-};
+use crate::domains::routes::{validate_fixed_route, validate_registration_pattern};
 pub use crate::domains::stream::{
     StreamCommitMode, StreamCommitNotification, StreamDiscriminator, StreamFilterClause,
     StreamFilterSet, StreamMetadata, StreamReadPage, StreamRecord,
 };
 use crate::domains::stream::{
     decode_stream_metadata, decode_stream_notify, decode_stream_response, encode_stream_filter_set,
-    flatten_stream_read_items, parse_stream_read_page, parse_stream_record,
+    flatten_stream_read_items, parse_stream_last_response, parse_stream_read_page,
 };
 use crate::protocol::message_type;
 use crate::{FitzError, Result};
@@ -64,7 +62,7 @@ impl StreamClient {
         max_bytes: Option<u64>,
         filter: Option<&StreamFilterSet>,
     ) -> Result<StreamReadPage> {
-        validate_selector_route(route, "stream", 3, true)?;
+        validate_registration_pattern(route, "stream", 3)?;
         let mut e = PayloadEncoder::new();
         e.put_string(route).put_u64(start_offset).put_u64(limit);
         optional_u64(&mut e, max_bytes);
@@ -103,14 +101,14 @@ impl StreamClient {
     /// # Errors
     /// Returns an error when validation, transport, or broker processing fails.
     pub async fn peek(&self, route: &str) -> Result<Option<StreamRecord>> {
-        validate_fixed_route(route, "stream", 3)?;
+        validate_registration_pattern(route, "stream", 3)?;
         let mut e = PayloadEncoder::new();
         e.put_string(route);
         let response = self
             .connection
             .request_replayable(message_type::STREAM_LAST, e.finish())
             .await?;
-        parse_stream_record(&decode_stream_response("LAST", &response)?.data)
+        parse_stream_last_response(&decode_stream_response("LAST", &response)?.data)
     }
     /// Performs the operation asynchronously.
     ///

@@ -1,15 +1,8 @@
 //! Stream domain client.
 
 use crate::codec::{PayloadDecoder, PayloadEncoder};
-#[cfg(feature = "legacy-blocking")]
-use crate::connection::SharedConnection;
-#[cfg(feature = "legacy-blocking")]
-use crate::domains::routes::{
-    validate_fixed_route, validate_registration_pattern, validate_selector_route,
-};
+use crate::domains::routes::validate_response_fixed_route;
 use crate::error::{FitzError, Result};
-#[cfg(feature = "legacy-blocking")]
-use crate::protocol::message_type;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +80,7 @@ impl StreamFilterSet {
 /// Stream record payload returned by read and peek operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamRecord {
+    pub route: String,
     pub offset: u64,
     pub body: Vec<u8>,
     pub area_offset: Option<u64>,
@@ -109,10 +103,12 @@ pub enum StreamFilteredReason {
 pub enum StreamReadItem {
     Event(StreamRecord),
     Filtered {
+        route: String,
         offset: u64,
         reason: Option<StreamFilteredReason>,
     },
     FilteredRange {
+        route: String,
         from_offset: u64,
         to_offset: u64,
         reason: Option<StreamFilteredReason>,
@@ -163,215 +159,6 @@ pub struct StreamCommitNotification {
     pub payload: Vec<u8>,
 }
 
-/// Stream domain client for session lifecycle, reads, and subscriptions.
-#[cfg(feature = "legacy-blocking")]
-pub struct StreamClient {
-    conn: SharedConnection,
-}
-
-#[cfg(feature = "legacy-blocking")]
-impl StreamClient {
-    #[must_use]
-    pub fn new(conn: SharedConnection) -> Self {
-        Self { conn }
-    }
-
-    ///
-    /// # Errors
-    /// Returns an error when validation, encoding, transport, or broker processing fails.
-    pub fn begin(&self, route: &str, ingest_metadata: Option<&[u8]>) -> Result<StreamSession> {
-        validate_fixed_route(route, "stream", 3)?;
-
-        let mut enc = PayloadEncoder::new();
-        enc.put_string(route);
-        match ingest_metadata.filter(|metadata| !metadata.is_empty()) {
-            Some(metadata) => {
-                enc.put_u8(1);
-                enc.put_bytes(metadata);
-            }
-            None => {
-                enc.put_u8(0);
-            }
-        }
-
-        let resp = self
-            .conn
-            .send_request(message_type::STREAM_BEGIN, &enc.finish())?;
-        let decoded = decode_stream_response("BEGIN", &resp)?;
-        let session_id = decoded
-            .session_id
-            .ok_or_else(|| FitzError::Protocol("BEGIN response missing session id".to_string()))?;
-
-        Ok(StreamSession {
-            conn: self.conn.clone(),
-            session_id,
-            active: true,
-        })
-    }
-
-    ///
-    /// # Errors
-    /// Returns an error when validation, encoding, transport, or broker processing fails.
-    pub fn read(
-        &self,
-        route: &str,
-        start_offset: u64,
-        limit: u64,
-        max_bytes: Option<u64>,
-        filter: Option<&StreamFilterSet>,
-    ) -> Result<Vec<StreamRecord>> {
-        validate_selector_route(route, "stream", 3, true)?;
-
-        let mut enc = PayloadEncoder::new();
-        enc.put_string(route);
-        enc.put_u64(start_offset);
-        enc.put_u64(limit);
-        match max_bytes {
-            Some(value) => {
-                enc.put_u8(1);
-                enc.put_u64(value);
-            }
-            None => {
-                enc.put_u8(0);
-            }
-        }
-
-        match filter.filter(|filter| !filter.is_empty()) {
-            Some(filter) => {
-                enc.put_u8(1);
-                let filter_bytes = encode_stream_filter_set(filter)?;
-                enc.put_bytes(&filter_bytes);
-            }
-            None => {
-                enc.put_u8(0);
-            }
-        }
-
-        let resp = self
-            .conn
-            .send_request(message_type::STREAM_READ, &enc.finish())?;
-        let decoded = decode_stream_response("READ", &resp)?;
-        Ok(flatten_stream_read_items(
-            &parse_stream_read_page(&decoded.data)?.items,
-        ))
-    }
-
-    ///
-    /// # Errors
-    /// Returns an error when validation, encoding, transport, or broker processing fails.
-    pub fn read_page(
-        &self,
-        route: &str,
-        start_offset: u64,
-        limit: u64,
-        max_bytes: Option<u64>,
-        filter: Option<&StreamFilterSet>,
-    ) -> Result<StreamReadPage> {
-        validate_selector_route(route, "stream", 3, true)?;
-
-        let mut enc = PayloadEncoder::new();
-        enc.put_string(route);
-        enc.put_u64(start_offset);
-        enc.put_u64(limit);
-        match max_bytes {
-            Some(value) => {
-                enc.put_u8(1);
-                enc.put_u64(value);
-            }
-            None => {
-                enc.put_u8(0);
-            }
-        }
-
-        match filter.filter(|filter| !filter.is_empty()) {
-            Some(filter) => {
-                enc.put_u8(1);
-                let filter_bytes = encode_stream_filter_set(filter)?;
-                enc.put_bytes(&filter_bytes);
-            }
-            None => {
-                enc.put_u8(0);
-            }
-        }
-
-        let resp = self
-            .conn
-            .send_request(message_type::STREAM_READ, &enc.finish())?;
-        let decoded = decode_stream_response("READ", &resp)?;
-        parse_stream_read_page(&decoded.data)
-    }
-
-    ///
-    /// # Errors
-    /// Returns an error when validation, encoding, transport, or broker processing fails.
-    pub fn peek(&self, route: &str) -> Result<Option<StreamRecord>> {
-        validate_fixed_route(route, "stream", 3)?;
-
-        let mut enc = PayloadEncoder::new();
-        enc.put_string(route);
-
-        let resp = self
-            .conn
-            .send_request(message_type::STREAM_LAST, &enc.finish())?;
-        let decoded = decode_stream_response("LAST", &resp)?;
-        parse_stream_record(&decoded.data)
-    }
-
-    ///
-    /// # Errors
-    /// Returns an error when validation, encoding, transport, or broker processing fails.
-    pub fn metadata(&self, route: &str) -> Result<StreamMetadata> {
-        validate_fixed_route(route, "stream", 3)?;
-
-        let mut enc = PayloadEncoder::new();
-        enc.put_string(route);
-
-        let resp = self
-            .conn
-            .send_request(message_type::STREAM_GET_METADATA, &enc.finish())?;
-        let decoded = decode_stream_response("METADATA", &resp)?;
-
-        if decoded.data.is_empty() {
-            return Ok(StreamMetadata {
-                first_offset: 0,
-                last_offset: 0,
-                record_count: 0,
-                max_batch_events: 0,
-                max_batch_bytes: 0,
-                ttl_seconds: None,
-                area_watermark: 0,
-                realm_watermark: 0,
-            });
-        }
-
-        decode_stream_metadata(&decoded.data)
-    }
-
-    ///
-    /// # Errors
-    /// Returns an error when validation, encoding, transport, or broker processing fails.
-    pub fn subscribe(&self, pattern: &str) -> Result<StreamSubscription> {
-        validate_registration_pattern(pattern, "stream", 3)?;
-
-        let mut enc = PayloadEncoder::new();
-        enc.put_string(pattern);
-
-        let resp = self
-            .conn
-            .send_request(message_type::STREAM_SUBSCRIBE, &enc.finish())?;
-        let decoded = decode_stream_response("SUBSCRIBE", &resp)?;
-        let subscription_id = decoded.session_id.ok_or_else(|| {
-            FitzError::Protocol("SUBSCRIBE response missing subscription id".to_string())
-        })?;
-
-        Ok(StreamSubscription {
-            conn: self.conn.clone(),
-            pattern: pattern.to_string(),
-            subscription_id,
-        })
-    }
-}
-
 pub(crate) fn encode_stream_filter_set(filter: &StreamFilterSet) -> Result<Vec<u8>> {
     let mut enc = PayloadEncoder::new();
     enc.put_u8(0);
@@ -407,157 +194,6 @@ pub(crate) fn encode_stream_filter_set(filter: &StreamFilterSet) -> Result<Vec<u
         }
     }
     Ok(enc.finish())
-}
-
-#[cfg(feature = "legacy-blocking")]
-pub struct StreamSession {
-    conn: SharedConnection,
-    session_id: u64,
-    active: bool,
-}
-
-#[cfg(feature = "legacy-blocking")]
-impl StreamSession {
-    #[must_use]
-    pub fn session_id(&self) -> u64 {
-        self.session_id
-    }
-
-    ///
-    /// # Errors
-    /// Returns an error when validation, encoding, transport, or broker processing fails.
-    pub fn append(
-        &mut self,
-        expected_offset: u64,
-        body: &[u8],
-        metadata: Option<&[u8]>,
-        discriminator: Option<&StreamDiscriminator>,
-    ) -> Result<Option<u64>> {
-        self.ensure_active("APPEND")?;
-
-        let mut enc = PayloadEncoder::new();
-        enc.put_u64(self.session_id);
-        enc.put_u64(expected_offset);
-        enc.put_bytes(body);
-        match metadata.filter(|value| !value.is_empty()) {
-            Some(value) => {
-                enc.put_u8(1);
-                enc.put_bytes(value);
-            }
-            None => {
-                enc.put_u8(0);
-            }
-        }
-
-        match discriminator.filter(|value| !value.as_str().is_empty()) {
-            Some(value) => {
-                enc.put_u8(1);
-                enc.put_string(value.as_str());
-            }
-            None => {
-                enc.put_u8(0);
-            }
-        }
-
-        let resp = self
-            .conn
-            .send_request(message_type::STREAM_APPEND, &enc.finish())?;
-        let decoded = decode_stream_response("APPEND", &resp)?;
-
-        if decoded.data.len() < 8 {
-            return Ok(None);
-        }
-
-        let mut dec = PayloadDecoder::new(&decoded.data);
-        Ok(Some(dec.get_u64()?))
-    }
-
-    ///
-    /// # Errors
-    /// Returns an error when validation, encoding, transport, or broker processing fails.
-    pub fn commit(mut self, mode: StreamCommitMode) -> Result<()> {
-        self.ensure_active("COMMIT")?;
-
-        let mut enc = PayloadEncoder::new();
-        enc.put_u64(self.session_id);
-        enc.put_u8(mode as u8);
-
-        let resp = self
-            .conn
-            .send_request(message_type::STREAM_COMMIT, &enc.finish())?;
-        decode_stream_response("COMMIT", &resp)?;
-        self.active = false;
-        Ok(())
-    }
-
-    ///
-    /// # Errors
-    /// Returns an error when validation, encoding, transport, or broker processing fails.
-    pub fn rollback(mut self) -> Result<()> {
-        self.ensure_active("ROLLBACK")?;
-
-        let mut enc = PayloadEncoder::new();
-        enc.put_u64(self.session_id);
-
-        let resp = self
-            .conn
-            .send_request(message_type::STREAM_ROLLBACK, &enc.finish())?;
-        decode_stream_response("ROLLBACK", &resp)?;
-        self.active = false;
-        Ok(())
-    }
-
-    fn ensure_active(&self, operation: &str) -> Result<()> {
-        if self.active {
-            return Ok(());
-        }
-
-        Err(FitzError::Protocol(format!(
-            "{operation} cannot be used after session finalization"
-        )))
-    }
-}
-
-#[cfg(feature = "legacy-blocking")]
-pub struct StreamSubscription {
-    conn: SharedConnection,
-    pattern: String,
-    subscription_id: u64,
-}
-
-#[cfg(feature = "legacy-blocking")]
-impl StreamSubscription {
-    #[must_use]
-    pub fn subscription_id(&self) -> u64 {
-        self.subscription_id
-    }
-
-    ///
-    /// # Errors
-    /// Returns an error when validation, encoding, transport, or broker processing fails.
-    pub fn next(&self) -> Result<StreamCommitNotification> {
-        let (_, payload) = self.conn.recv_message_matching(|msg_type, payload| {
-            msg_type == message_type::STREAM_NOTIFY
-                && decode_stream_notify_subscription_id(payload)
-                    .is_ok_and(|subscription_id| subscription_id == self.subscription_id)
-        })?;
-
-        decode_stream_notify(&payload)
-    }
-
-    ///
-    /// # Errors
-    /// Returns an error when validation, encoding, transport, or broker processing fails.
-    pub fn unsubscribe(&self) -> Result<()> {
-        let mut enc = PayloadEncoder::new();
-        enc.put_string(&self.pattern);
-
-        let resp = self
-            .conn
-            .send_request(message_type::STREAM_UNSUBSCRIBE, &enc.finish())?;
-        decode_stream_response("UNSUBSCRIBE", &resp)?;
-        Ok(())
-    }
 }
 
 #[derive(Debug)]
@@ -611,13 +247,21 @@ pub(crate) fn decode_stream_response(operation: &str, buf: &[u8]) -> Result<Stre
     }
 }
 
-pub(crate) fn parse_stream_record(buf: &[u8]) -> Result<Option<StreamRecord>> {
+pub(crate) fn parse_stream_last_response(buf: &[u8]) -> Result<Option<StreamRecord>> {
     if buf.is_empty() {
         return Ok(None);
     }
 
     let mut dec = PayloadDecoder::new(buf);
-    Ok(Some(decode_stream_record(&mut dec)?))
+    let route = dec.get_string()?;
+    validate_response_fixed_route(&route, "stream", 3, "LAST")?;
+    let record = decode_stream_record(&mut dec, &route)?;
+    if !dec.is_empty() {
+        return Err(FitzError::Protocol(
+            "LAST response has trailing bytes".to_string(),
+        ));
+    }
+    Ok(Some(record))
 }
 
 pub(crate) fn parse_stream_read_page(buf: &[u8]) -> Result<StreamReadPage> {
@@ -638,7 +282,9 @@ pub(crate) fn parse_stream_read_page(buf: &[u8]) -> Result<StreamReadPage> {
     let mut items = Vec::with_capacity(count);
 
     for _ in 0..count {
-        items.push(decode_stream_read_item(&mut dec)?);
+        let route = dec.get_string()?;
+        validate_response_fixed_route(&route, "stream", 3, "READ")?;
+        items.push(decode_stream_read_item(&mut dec, route)?);
     }
 
     let cursor = StreamReadCursor {
@@ -681,8 +327,9 @@ pub(crate) fn decode_stream_metadata(buf: &[u8]) -> Result<StreamMetadata> {
     })
 }
 
-fn decode_stream_record(dec: &mut PayloadDecoder<'_>) -> Result<StreamRecord> {
+fn decode_stream_record(dec: &mut PayloadDecoder<'_>, route: &str) -> Result<StreamRecord> {
     Ok(StreamRecord {
+        route: route.to_string(),
         offset: dec.get_u64()?,
         area_offset: decode_optional_u64(dec)?,
         realm_offset: decode_optional_u64(dec)?,
@@ -692,14 +339,16 @@ fn decode_stream_record(dec: &mut PayloadDecoder<'_>) -> Result<StreamRecord> {
     })
 }
 
-fn decode_stream_read_item(dec: &mut PayloadDecoder<'_>) -> Result<StreamReadItem> {
+fn decode_stream_read_item(dec: &mut PayloadDecoder<'_>, route: String) -> Result<StreamReadItem> {
     match dec.get_u8()? {
-        0 => Ok(StreamReadItem::Event(decode_stream_record(dec)?)),
+        0 => Ok(StreamReadItem::Event(decode_stream_record(dec, &route)?)),
         1 => Ok(StreamReadItem::Filtered {
+            route,
             offset: dec.get_u64()?,
             reason: decode_stream_filtered_reason(dec)?,
         }),
         2 => Ok(StreamReadItem::FilteredRange {
+            route,
             from_offset: dec.get_u64()?,
             to_offset: dec.get_u64()?,
             reason: decode_stream_filtered_reason(dec)?,
@@ -752,12 +401,6 @@ fn decode_bool_u8(dec: &mut PayloadDecoder<'_>, field: &str) -> Result<bool> {
             "invalid boolean flag for {field}: {other}"
         ))),
     }
-}
-
-#[cfg(feature = "legacy-blocking")]
-fn decode_stream_notify_subscription_id(payload: &[u8]) -> Result<u64> {
-    let mut dec = PayloadDecoder::new(payload);
-    dec.get_u64()
 }
 
 pub(crate) fn decode_stream_notify(payload: &[u8]) -> Result<StreamCommitNotification> {

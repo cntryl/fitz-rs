@@ -2,7 +2,7 @@ use super::decode_ok;
 use crate::async_connection::{AsyncConnection, RestorableRegistration};
 use crate::codec::{PayloadDecoder, PayloadEncoder};
 use crate::domains::routes::{
-    validate_fixed_route, validate_registration_pattern, validate_selector_route,
+    validate_fixed_route, validate_registration_pattern, validate_response_fixed_route,
 };
 use crate::protocol::message_type;
 use crate::{FitzError, Result};
@@ -61,7 +61,7 @@ impl QueueClient {
         batch_size: u32,
         wait_seconds: Option<u64>,
     ) -> Result<Vec<QueueItem>> {
-        validate_selector_route(route, "queue", 3, false)?;
+        validate_registration_pattern(route, "queue", 3)?;
         let mut encoder = PayloadEncoder::new();
         encoder
             .put_string(route)
@@ -85,10 +85,12 @@ impl QueueClient {
         let generation = self.connection.generation();
         let mut items = Vec::with_capacity(count as usize);
         for _ in 0..count {
+            let route = decoder.get_string()?;
+            validate_response_fixed_route(&route, "queue", 3, "RESERVE")?;
             items.push(QueueItem {
                 connection: self.connection.clone(),
                 generation,
-                route: route.to_owned(),
+                route,
                 id: decoder.get_u64()?,
                 token: decoder.get_u64()?,
                 body: decoder.get_bytes()?,
@@ -139,7 +141,7 @@ fn is_retryable_enqueue_rejection(response: &[u8]) -> bool {
 pub struct QueueItem {
     connection: AsyncConnection,
     generation: u64,
-    route: String,
+    pub route: String,
     id: u64,
     token: u64,
     pub body: Vec<u8>,
