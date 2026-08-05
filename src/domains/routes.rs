@@ -35,6 +35,37 @@ pub fn validate_registration_pattern(
     invalid("registration pattern cannot match the required route depth")
 }
 
+/// Validate the four route shapes shared by Stream READ and SUBSCRIBE.
+pub fn validate_stream_selector(route: &str) -> Result<()> {
+    if route == "stream://**" {
+        return Ok(());
+    }
+    let shape = scan(route, "stream")?;
+    let Some(path) = route.strip_prefix("stream://") else {
+        return invalid("stream selector has the wrong scheme");
+    };
+    let mut segments = path.split('/');
+    let (Some(realm), Some(area), Some(resource), None) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return invalid("stream selector has the wrong shape");
+    };
+    if shape.segments != 3 {
+        return invalid("stream selector has the wrong shape");
+    }
+    let literal = |segment: &str| !segment.contains('*');
+    if literal(realm)
+        && ((literal(area) && (literal(resource) || resource == "*"))
+            || (area == "*" && resource == "*"))
+    {
+        return Ok(());
+    }
+    invalid("stream selector has the wrong shape")
+}
+
 #[must_use]
 pub fn route_matches_pattern(route: &str, pattern: &str) -> bool {
     let Some((route_scheme, route_path)) = route.split_once("://") else {
@@ -287,5 +318,30 @@ mod tests {
 
         // Assert
         assert_eq!(results, cases.map(|(_, _, expected)| expected));
+    }
+
+    #[test]
+    fn should_validate_stream_selectors_given_server_grammar() {
+        // Arrange
+        let valid = [
+            "stream://realm/area/resource",
+            "stream://realm/area/*",
+            "stream://realm/*/*",
+            "stream://**",
+        ];
+        let invalid = [
+            "stream://*/area/*",
+            "stream://realm/*/resource",
+            "stream://realm/**",
+            "stream://realm/area/**",
+        ];
+
+        // Act
+        let valid_results = valid.map(validate_stream_selector);
+        let invalid_results = invalid.map(validate_stream_selector);
+
+        // Assert
+        assert!(valid_results.iter().all(Result::is_ok));
+        assert!(invalid_results.iter().all(Result::is_err));
     }
 }

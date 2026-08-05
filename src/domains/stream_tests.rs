@@ -64,6 +64,7 @@ fn should_parse_count_prefixed_stream_records() {
     buf.push(0);
     buf.push(0);
     buf.push(0);
+    buf.push(0);
 
     let page = parse_stream_read_page(&buf).unwrap();
     // Act
@@ -114,6 +115,7 @@ fn should_parse_filtered_stream_read_page() {
     buf.push(1);
     buf.extend_from_slice(&52u64.to_be_bytes());
     buf.push(0);
+    buf.push(0);
     buf.push(1);
 
     // Act
@@ -159,6 +161,7 @@ fn should_parse_concrete_routes_given_wildcard_stream_read() {
         .put_u64(42)
         .put_u8(1)
         .put_u64(42)
+        .put_u8(0)
         .put_u8(0)
         .put_u8(0)
         .put_u8(0);
@@ -233,11 +236,14 @@ fn should_parse_full_stream_record() {
 
 #[test]
 fn should_reject_wildcard_route_in_stream_last_response() {
+    // Arrange
     let mut buf = Vec::new();
     push_string(&mut buf, "stream://*/area/resource");
 
+    // Act
     let result = parse_stream_last_response(&buf);
 
+    // Assert
     assert!(matches!(
         result,
         Err(FitzError::Protocol(message)) if message.contains("LAST response")

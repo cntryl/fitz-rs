@@ -40,7 +40,7 @@ impl NoticeClient {
     /// # Errors
     /// Returns an error when validation, transport, or broker processing fails.
     pub async fn subscribe(&self, pattern: &str) -> Result<NoticeSubscription> {
-        validate_registration_pattern(pattern, "notice", 3)?;
+        validate_registration_pattern(pattern, "notice", 0)?;
         let mut encoder = PayloadEncoder::new();
         encoder.put_string(pattern);
         let receiver = self

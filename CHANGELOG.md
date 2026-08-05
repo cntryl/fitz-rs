@@ -2,7 +2,8 @@
 
 ## 0.1.0 - Unreleased
 
-- Breaking: Queue reserve, Stream read, and Stream last wire items now require their concrete matched route. `QueueItem`, `StreamReadItem`, and `StreamRecord` expose it, and Queue reserves plus Stream reads/peeks accept arbitrary whole-segment patterns capable of matching three segments.
+- Breaking: Stream READ and SUBSCRIBE now accept only concrete resource, area (`realm/area/*`), realm (`realm/*/*`), or global (`stream://**`) selectors. READ cursors expose `current_realm`, global continuation requests take `resume_realm`, and Stream LAST is concrete-route only. Notice subscriptions now retain the server's flexible route depth.
+- Breaking: Queue reserve, Stream read, and Stream last wire items now require their concrete matched route. `QueueItem`, `StreamReadItem`, and `StreamRecord` expose it.
 - Breaking: `Client::connect()` is one-shot; use `connect_when_ready` for bounded startup retry.
 - Breaking: `KvClient::begin` now requires `KvDurability::Buffered` or `KvDurability::Sync`.
 - Reconnect attempts now default to unlimited (`maximum_attempts == 0`).

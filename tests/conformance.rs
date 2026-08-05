@@ -212,7 +212,7 @@ async fn should_run_scenario(
             assert_eq!(
                 connected
                     .stream()?
-                    .read(&route, 0, 10, None, None)
+                    .read(&route, 0, 10, None, None, None)
                     .await?
                     .len(),
                 1

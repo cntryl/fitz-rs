@@ -1,13 +1,13 @@
 use crate::async_connection::{AsyncConnection, RestorableRegistration};
 use crate::codec::{PayloadDecoder, PayloadEncoder};
-use crate::domains::routes::{validate_fixed_route, validate_registration_pattern};
+use crate::domains::routes::{validate_fixed_route, validate_stream_selector};
 pub use crate::domains::stream::{
     StreamCommitMode, StreamCommitNotification, StreamDiscriminator, StreamFilterClause,
     StreamFilterSet, StreamMetadata, StreamReadPage, StreamRecord,
 };
 use crate::domains::stream::{
     decode_stream_metadata, decode_stream_notify, decode_stream_response, encode_stream_filter_set,
-    flatten_stream_read_items, parse_stream_last_response, parse_stream_read_page,
+    flatten_stream_read_items, parse_stream_last_response, parse_stream_read_page_with_scope,
 };
 use crate::protocol::message_type;
 use crate::{FitzError, Result};
@@ -19,6 +19,16 @@ use tokio_stream::wrappers::BroadcastStream;
 pub struct StreamClient {
     connection: AsyncConnection,
 }
+
+/// Optional bounds, filters, and continuation state for a paged stream read.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StreamReadOptions<'a> {
+    pub max_bytes: Option<u64>,
+    pub filter: Option<&'a StreamFilterSet>,
+    pub cursor_fingerprint: Option<u64>,
+    pub captured_watermark: Option<u64>,
+}
+
 impl StreamClient {
     pub(crate) fn new(connection: AsyncConnection) -> Self {
         Self { connection }
@@ -59,23 +69,27 @@ impl StreamClient {
         route: &str,
         start_offset: u64,
         limit: u64,
-        max_bytes: Option<u64>,
-        filter: Option<&StreamFilterSet>,
+        options: StreamReadOptions<'_>,
     ) -> Result<StreamReadPage> {
-        validate_registration_pattern(route, "stream", 3)?;
+        validate_stream_selector(route)?;
         let mut e = PayloadEncoder::new();
         e.put_string(route).put_u64(start_offset).put_u64(limit);
-        optional_u64(&mut e, max_bytes);
-        if let Some(filter) = filter.filter(|v| !v.is_empty()) {
+        optional_u64(&mut e, options.max_bytes);
+        if let Some(filter) = options.filter.filter(|v| !v.is_empty()) {
             e.put_u8(1).put_bytes(&encode_stream_filter_set(filter)?);
         } else {
             e.put_u8(0);
         }
+        optional_u64(&mut e, options.cursor_fingerprint);
+        optional_u64(&mut e, options.captured_watermark);
         let response = self
             .connection
             .request_replayable(message_type::STREAM_READ, e.finish())
             .await?;
-        parse_stream_read_page(&decode_stream_response("READ", &response)?.data)
+        parse_stream_read_page_with_scope(
+            &decode_stream_response("READ", &response)?.data,
+            route == "stream://**" || route.starts_with("stream://*/"),
+        )
     }
     /// Performs the operation asynchronously.
     ///
@@ -88,10 +102,21 @@ impl StreamClient {
         limit: u64,
         max_bytes: Option<u64>,
         filter: Option<&StreamFilterSet>,
+        cursor_fingerprint: Option<u64>,
     ) -> Result<Vec<StreamRecord>> {
         Ok(flatten_stream_read_items(
             &self
-                .read_page(route, start_offset, limit, max_bytes, filter)
+                .read_page(
+                    route,
+                    start_offset,
+                    limit,
+                    StreamReadOptions {
+                        max_bytes,
+                        filter,
+                        cursor_fingerprint,
+                        captured_watermark: None,
+                    },
+                )
                 .await?
                 .items,
         ))
@@ -101,7 +126,7 @@ impl StreamClient {
     /// # Errors
     /// Returns an error when validation, transport, or broker processing fails.
     pub async fn peek(&self, route: &str) -> Result<Option<StreamRecord>> {
-        validate_registration_pattern(route, "stream", 3)?;
+        validate_fixed_route(route, "stream", 3)?;
         let mut e = PayloadEncoder::new();
         e.put_string(route);
         let response = self
@@ -143,7 +168,7 @@ impl StreamClient {
     /// # Errors
     /// Returns an error when validation, transport, or broker processing fails.
     pub async fn subscribe(&self, pattern: &str) -> Result<StreamSubscription> {
-        validate_registration_pattern(pattern, "stream", 3)?;
+        validate_stream_selector(pattern)?;
         let receiver = self
             .connection
             .notifications(message_type::STREAM_NOTIFY, 64);

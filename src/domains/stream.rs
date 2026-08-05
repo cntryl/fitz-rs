@@ -121,6 +121,10 @@ pub struct StreamReadCursor {
     pub last_resource_offset: u64,
     pub last_area_offset: Option<u64>,
     pub last_realm_offset: Option<u64>,
+    pub current_realm: Option<String>,
+    pub last_global_offset: Option<u64>,
+    pub cursor_fingerprint: Option<u64>,
+    pub captured_watermark: Option<u64>,
     pub has_more: bool,
 }
 
@@ -264,7 +268,15 @@ pub(crate) fn parse_stream_last_response(buf: &[u8]) -> Result<Option<StreamReco
     Ok(Some(record))
 }
 
+#[cfg(test)]
 pub(crate) fn parse_stream_read_page(buf: &[u8]) -> Result<StreamReadPage> {
+    parse_stream_read_page_with_scope(buf, false)
+}
+
+pub(crate) fn parse_stream_read_page_with_scope(
+    buf: &[u8],
+    global: bool,
+) -> Result<StreamReadPage> {
     if buf.is_empty() {
         return Ok(StreamReadPage {
             items: Vec::new(),
@@ -272,6 +284,10 @@ pub(crate) fn parse_stream_read_page(buf: &[u8]) -> Result<StreamReadPage> {
                 last_resource_offset: 0,
                 last_area_offset: None,
                 last_realm_offset: None,
+                current_realm: None,
+                last_global_offset: None,
+                cursor_fingerprint: None,
+                captured_watermark: None,
                 has_more: false,
             },
         });
@@ -291,7 +307,23 @@ pub(crate) fn parse_stream_read_page(buf: &[u8]) -> Result<StreamReadPage> {
         last_resource_offset: dec.get_u64()?,
         last_area_offset: decode_optional_u64(&mut dec)?,
         last_realm_offset: decode_optional_u64(&mut dec)?,
+        current_realm: decode_optional_string(&mut dec)?,
+        last_global_offset: if global {
+            decode_optional_u64(&mut dec)?
+        } else {
+            None
+        },
         has_more: decode_bool_u8(&mut dec, "stream read cursor has_more")?,
+        cursor_fingerprint: if global {
+            decode_optional_u64(&mut dec)?
+        } else {
+            None
+        },
+        captured_watermark: if global {
+            decode_optional_u64(&mut dec)?
+        } else {
+            None
+        },
     };
 
     if !dec.is_empty() {
@@ -379,6 +411,16 @@ fn decode_optional_u64(dec: &mut PayloadDecoder<'_>) -> Result<Option<u64>> {
         1 => Ok(Some(dec.get_u64()?)),
         other => Err(FitzError::Protocol(format!(
             "invalid optional u64 flag: {other}"
+        ))),
+    }
+}
+
+fn decode_optional_string(dec: &mut PayloadDecoder<'_>) -> Result<Option<String>> {
+    match dec.get_u8()? {
+        0 => Ok(None),
+        1 => dec.get_string().map(Some),
+        other => Err(FitzError::Protocol(format!(
+            "invalid optional string flag: {other}"
         ))),
     }
 }

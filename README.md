@@ -54,8 +54,10 @@ exact `lease://realm/area/resource` route.
 
 Notifications expose the exact concrete route. Queue availability
 notifications additionally report ready, delayed, and inflight message counts.
-Queue reserves and Stream reads/peeks accept the same whole-segment patterns as
-subscriptions. Each returned `QueueItem` and `StreamReadItem` exposes the
+Queue reserves accept general whole-segment patterns capable of matching three
+segments. Stream READ and SUBSCRIBE accept concrete resources, `realm/area/*`,
+`realm/*/*`, or `stream://**`; Stream LAST is concrete-route only. Each returned
+`QueueItem` and `StreamReadItem` exposes the
 concrete matched route, including `StreamRecord::route` for event records.
 Route-less reserve/read/last responses are not supported. If any item contains an
 invalid concrete route, the entire response fails closed; the client never
