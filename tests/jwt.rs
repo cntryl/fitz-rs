@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};

@@ -86,10 +86,7 @@ impl StreamClient {
             .connection
             .request_replayable(message_type::STREAM_READ, e.finish())
             .await?;
-        parse_stream_read_page_with_scope(
-            &decode_stream_response("READ", &response)?.data,
-            route == "stream://**" || route.starts_with("stream://*/"),
-        )
+        parse_stream_read_page_with_scope(&decode_stream_response("READ", &response)?.data, route)
     }
     /// Performs the operation asynchronously.
     ///

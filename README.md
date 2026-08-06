@@ -63,6 +63,10 @@ Route-less reserve/read/last responses are not supported. If any item contains a
 invalid concrete route, the entire response fails closed; the client never
 returns a partial reservation or read batch.
 
+Schedule listing is cursor-based: call `list_page` (message 707) and pass its
+continuation to the next page. Global stream continuations reuse the returned
+fingerprint and captured-watermark pair.
+
 ## Local broker
 
 ```console

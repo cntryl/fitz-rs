@@ -25,9 +25,10 @@ pub struct ScheduleEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScheduleListResult {
+pub struct ScheduleListPage {
     pub entries: Vec<ScheduleEntry>,
-    pub total_count: u64,
+    pub has_more: bool,
+    pub continuation: Option<String>,
 }
 
 #[derive(Clone)]
@@ -88,92 +89,66 @@ impl ScheduleClient {
     ///
     /// # Errors
     /// Returns an error when validation, transport, or broker processing fails.
-    pub async fn list(
+    pub async fn list_page(
         &self,
-        offset: Option<u64>,
+        cursor: Option<&str>,
         limit: Option<u64>,
-    ) -> Result<ScheduleListResult> {
+    ) -> Result<ScheduleListPage> {
+        if limit.is_some_and(|value| !(1..=1000).contains(&value)) {
+            return Err(FitzError::Protocol(
+                "schedule LIST_PAGE limit must be between 1 and 1000".into(),
+            ));
+        }
         let mut e = PayloadEncoder::new();
-        optional_u64(&mut e, offset);
-        optional_u64(&mut e, limit);
+        match cursor {
+            Some(value) => e.put_u8(1).put_string(value),
+            None => e.put_u8(0),
+        };
+        match limit {
+            Some(value) => e.put_u8(1).put_u64(value),
+            None => e.put_u8(0),
+        };
         let response = self
             .connection
-            .request(message_type::SCHEDULE_LIST, e.finish())
+            .request(message_type::SCHEDULE_LIST_PAGE, e.finish())
             .await?;
-        let mut d = success(&response, "LIST")?;
+        let d = success(&response, "LIST_PAGE")?;
         if d.is_empty() {
-            return Ok(ScheduleListResult {
+            return Ok(ScheduleListPage {
                 entries: Vec::new(),
-                total_count: 0,
+                has_more: false,
+                continuation: None,
             });
         }
-        let total_count = d.get_u64()?;
-        let mut entries = Vec::new();
-        while !d.is_empty() {
-            if d.get_u8()? == 0 {
-                break;
-            }
-            let route = d.get_string()?;
-            let cron = d.get_string()?;
-            let delivery_mode = match d.get_u8()? {
-                0 => ScheduleDeliveryMode::Broadcast,
-                1 => ScheduleDeliveryMode::Single,
-                v => {
-                    return Err(FitzError::Protocol(format!(
-                        "invalid schedule delivery mode {v}"
-                    )));
-                }
-            };
-            entries.push(ScheduleEntry {
-                route,
-                cron,
-                delivery_mode,
-                payload: d.get_bytes()?,
-            });
-        }
-        Ok(ScheduleListResult {
-            entries,
-            total_count,
-        })
+        decode_list_page(d)
     }
+
     /// Performs the operation asynchronously.
     ///
     /// # Errors
     /// Returns an error when validation, transport, or broker processing fails.
-    pub async fn list_by_selector(
-        &self,
-        selector: &str,
-        offset: u64,
-        limit: u64,
-    ) -> Result<ScheduleListResult> {
+    pub async fn list_by_selector(&self, selector: &str) -> Result<Vec<ScheduleEntry>> {
         validate_registration_pattern(selector, "schedule", 4)?;
-        let mut source = 0;
         let mut matches = Vec::new();
-        let mut total = 0;
+        let mut cursor: Option<String> = None;
         loop {
-            let page = self.list(Some(source), Some(100)).await?;
-            if page.entries.is_empty() {
-                break;
-            }
+            let page = self.list_page(cursor.as_deref(), Some(100)).await?;
             for entry in &page.entries {
                 if route_matches_pattern(&entry.route, selector) {
-                    let below_limit =
-                        usize::try_from(limit).map_or(true, |limit| matches.len() < limit);
-                    if total >= offset && (limit == 0 || below_limit) {
-                        matches.push(entry.clone());
-                    }
-                    total += 1;
+                    matches.push(entry.clone());
                 }
             }
-            source += page.entries.len() as u64;
-            if source >= page.total_count {
+            if !page.has_more {
                 break;
             }
+            cursor = page.continuation;
+            if cursor.is_none() {
+                return Err(FitzError::Protocol(
+                    "schedule LIST_PAGE response missing continuation".into(),
+                ));
+            }
         }
-        Ok(ScheduleListResult {
-            entries: matches,
-            total_count: total,
-        })
+        Ok(matches)
     }
     /// Performs the operation asynchronously.
     ///
@@ -207,13 +182,72 @@ impl ScheduleClient {
         })
     }
 }
-fn optional_u64(e: &mut PayloadEncoder, value: Option<u64>) {
-    if let Some(v) = value {
-        e.put_u8(1).put_u64(v);
-    } else {
-        e.put_u8(0);
+
+fn decode_list_page(mut d: PayloadDecoder<'_>) -> Result<ScheduleListPage> {
+    if d.get_u8()? != 1 {
+        return Err(FitzError::Protocol(
+            "schedule LIST_PAGE response has unsupported version".into(),
+        ));
     }
+    let has_more = match d.get_u8()? {
+        0 => false,
+        1 => true,
+        value => {
+            return Err(FitzError::Protocol(format!(
+                "invalid has_more flag {value}"
+            )));
+        }
+    };
+    let continuation = match d.get_u8()? {
+        0 => None,
+        1 => Some(d.get_string()?),
+        value => {
+            return Err(FitzError::Protocol(format!(
+                "invalid continuation flag {value}"
+            )));
+        }
+    };
+    let mut entries = Vec::new();
+    loop {
+        match d.get_u8()? {
+            0 => break,
+            1 => {}
+            value => {
+                return Err(FitzError::Protocol(format!(
+                    "invalid entry sentinel {value}"
+                )));
+            }
+        }
+        let route = d.get_string()?;
+        let cron = d.get_string()?;
+        let delivery_mode = match d.get_u8()? {
+            0 => ScheduleDeliveryMode::Broadcast,
+            1 => ScheduleDeliveryMode::Single,
+            v => {
+                return Err(FitzError::Protocol(format!(
+                    "invalid schedule delivery mode {v}"
+                )));
+            }
+        };
+        entries.push(ScheduleEntry {
+            route,
+            cron,
+            delivery_mode,
+            payload: d.get_bytes()?,
+        });
+    }
+    if !d.is_empty() {
+        return Err(FitzError::Protocol(
+            "schedule LIST_PAGE response has trailing bytes".into(),
+        ));
+    }
+    Ok(ScheduleListPage {
+        entries,
+        has_more,
+        continuation,
+    })
 }
+
 fn success<'a>(response: &'a [u8], operation: &str) -> Result<PayloadDecoder<'a>> {
     let mut d = PayloadDecoder::new(response);
     match d.get_u8()? {
@@ -300,4 +334,54 @@ fn decode_subscription_id(response: &[u8]) -> Result<u64> {
         let _ = decoder.get_u8()?;
     }
     decoder.get_u64()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_decode_schedule_list_page_given_valid_wire_payload() {
+        // Arrange
+        let mut encoder = PayloadEncoder::new();
+        encoder
+            .put_u8(1)
+            .put_u8(1)
+            .put_u8(1)
+            .put_string("cursor-2")
+            .put_u8(1)
+            .put_string("schedule://realm/area/job")
+            .put_string("*/5 * * * *")
+            .put_u8(ScheduleDeliveryMode::Single as u8)
+            .put_bytes(b"payload")
+            .put_u8(0);
+        let payload = encoder.finish();
+
+        // Act
+        let page = decode_list_page(PayloadDecoder::new(&payload)).unwrap();
+
+        // Assert
+        assert!(page.has_more);
+        assert_eq!(page.continuation.as_deref(), Some("cursor-2"));
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].route, "schedule://realm/area/job");
+        assert_eq!(page.entries[0].delivery_mode, ScheduleDeliveryMode::Single);
+        assert_eq!(page.entries[0].payload, b"payload");
+    }
+
+    #[test]
+    fn should_reject_schedule_list_page_given_trailing_bytes() {
+        // Arrange
+        let mut encoder = PayloadEncoder::new();
+        encoder.put_u8(1).put_u8(0).put_u8(0).put_u8(0).put_u8(9);
+        let payload = encoder.finish();
+
+        // Act
+        let result = decode_list_page(PayloadDecoder::new(&payload));
+
+        // Assert
+        assert!(
+            matches!(result, Err(FitzError::Protocol(message)) if message.contains("trailing"))
+        );
+    }
 }

@@ -64,9 +64,8 @@ fn should_parse_count_prefixed_stream_records() {
     buf.push(0);
     buf.push(0);
     buf.push(0);
-    buf.push(0);
 
-    let page = parse_stream_read_page(&buf).unwrap();
+    let page = parse_stream_read_page_with_scope(&buf, "stream://realm/area/resource").unwrap();
     // Act
     let records = flatten_stream_read_items(&page.items);
     // Assert
@@ -115,11 +114,10 @@ fn should_parse_filtered_stream_read_page() {
     buf.push(1);
     buf.extend_from_slice(&52u64.to_be_bytes());
     buf.push(0);
-    buf.push(0);
     buf.push(1);
 
     // Act
-    let page = parse_stream_read_page(&buf).unwrap();
+    let page = parse_stream_read_page_with_scope(&buf, "stream://realm/area/resource").unwrap();
 
     // Assert
     assert_eq!(page.cursor.last_resource_offset, 45);
@@ -163,11 +161,11 @@ fn should_parse_concrete_routes_given_wildcard_stream_read() {
         .put_u64(42)
         .put_u8(0)
         .put_u8(0)
-        .put_u8(0)
         .put_u8(0);
 
     // Act
-    let page = parse_stream_read_page(&encoder.finish()).unwrap();
+    let page = parse_stream_read_page_with_scope(&encoder.finish(), "stream://realm/area/resource")
+        .unwrap();
 
     // Assert
     assert_eq!(
@@ -191,12 +189,11 @@ fn should_reject_wildcard_route_given_stream_read_response() {
         .put_u64(42)
         .put_u8(1)
         .put_u64(42)
-        .put_u8(0)
-        .put_u8(0)
         .put_u8(0);
 
     // Act
-    let result = parse_stream_read_page(&encoder.finish());
+    let result =
+        parse_stream_read_page_with_scope(&encoder.finish(), "stream://realm/area/resource");
 
     // Assert
     assert!(matches!(
