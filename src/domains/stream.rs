@@ -85,6 +85,7 @@ pub struct StreamRecord {
     pub body: Vec<u8>,
     pub area_offset: Option<u64>,
     pub realm_offset: Option<u64>,
+    pub global_offset: Option<u64>,
     pub metadata: Option<Vec<u8>>,
     pub timestamp: u64,
 }
@@ -210,35 +211,34 @@ pub(crate) fn decode_stream_response(operation: &str, buf: &[u8]) -> Result<Stre
     let status = dec.get_u8()?;
     match status {
         0 => {
-            if dec.is_empty() {
-                return Ok(StreamResponsePayload {
-                    session_id: None,
-                    data: Vec::new(),
-                });
-            }
-
-            let has_session_id = dec.get_u8()?;
-            let session_id = match has_session_id {
-                0 => None,
-                1 => Some(dec.get_u64()?),
-                other => {
-                    return Err(FitzError::Protocol(format!(
-                        "{operation} response has invalid optional-id flag: {other}"
-                    )));
+            let (session_id, data) = match operation {
+                "BEGIN" => (Some(dec.get_u64()?), dec.get_bytes()?),
+                "APPEND" | "COMMIT" => (None, dec.get_bytes()?),
+                "ROLLBACK" | "UNSUBSCRIBE" => (None, Vec::new()),
+                "LAST" | "METADATA" => (None, buf[1..].to_vec()),
+                _ => {
+                    let has_session_id = dec.get_u8()?;
+                    let session_id = match has_session_id {
+                        0 => None,
+                        1 => Some(dec.get_u64()?),
+                        other => {
+                            return Err(FitzError::Protocol(format!(
+                                "{operation} response has invalid optional-id flag: {other}"
+                            )));
+                        }
+                    };
+                    (session_id, dec.get_bytes()?)
                 }
-            };
-
-            let data = if dec.is_empty() {
-                Vec::new()
-            } else {
-                dec.get_bytes()?
             };
 
             Ok(StreamResponsePayload { session_id, data })
         }
         1 => {
-            let code = dec.get_u32()?;
-            let message = dec.get_string()?;
+            let (code, message) = if operation == "READ" {
+                (dec.get_u32()?, dec.get_string()?)
+            } else {
+                (0, dec.get_string()?)
+            };
             Err(FitzError::Domain {
                 code,
                 message: format!("{operation} failed: {message}"),
@@ -250,15 +250,14 @@ pub(crate) fn decode_stream_response(operation: &str, buf: &[u8]) -> Result<Stre
     }
 }
 
-pub(crate) fn parse_stream_last_response(buf: &[u8]) -> Result<Option<StreamRecord>> {
+pub(crate) fn parse_stream_last_response(buf: &[u8], route: &str) -> Result<Option<StreamRecord>> {
     if buf.is_empty() {
         return Ok(None);
     }
 
     let mut dec = PayloadDecoder::new(buf);
-    let route = dec.get_string()?;
-    validate_response_fixed_route(&route, "stream", 3, "LAST")?;
-    let record = decode_stream_record(&mut dec, &route)?;
+    validate_response_fixed_route(route, "stream", 3, "LAST")?;
+    let record = decode_stream_record(&mut dec, route, false)?;
     if !dec.is_empty() {
         return Err(FitzError::Protocol(
             "LAST response has trailing bytes".to_string(),
@@ -271,7 +270,7 @@ pub(crate) fn parse_stream_read_page_with_scope(
     buf: &[u8],
     selector: &str,
 ) -> Result<StreamReadPage> {
-    let global = selector == "stream://**";
+    let global = matches!(selector, "stream://**" | "stream://*/*/*");
     if buf.is_empty() {
         return Ok(StreamReadPage {
             items: Vec::new(),
@@ -294,7 +293,7 @@ pub(crate) fn parse_stream_read_page_with_scope(
     for _ in 0..count {
         let route = dec.get_string()?;
         validate_response_fixed_route(&route, "stream", 3, "READ")?;
-        items.push(decode_stream_read_item(&mut dec, route)?);
+        items.push(decode_stream_read_item(&mut dec, route, global)?);
     }
 
     let cursor = StreamReadCursor {
@@ -352,21 +351,36 @@ pub(crate) fn decode_stream_metadata(buf: &[u8]) -> Result<StreamMetadata> {
     })
 }
 
-fn decode_stream_record(dec: &mut PayloadDecoder<'_>, route: &str) -> Result<StreamRecord> {
+fn decode_stream_record(
+    dec: &mut PayloadDecoder<'_>,
+    route: &str,
+    global: bool,
+) -> Result<StreamRecord> {
     Ok(StreamRecord {
         route: route.to_string(),
         offset: dec.get_u64()?,
         area_offset: decode_optional_u64(dec)?,
         realm_offset: decode_optional_u64(dec)?,
+        global_offset: if global {
+            decode_optional_u64(dec)?
+        } else {
+            None
+        },
         body: dec.get_bytes()?,
         metadata: decode_optional_bytes(dec)?,
         timestamp: dec.get_u64()?,
     })
 }
 
-fn decode_stream_read_item(dec: &mut PayloadDecoder<'_>, route: String) -> Result<StreamReadItem> {
+fn decode_stream_read_item(
+    dec: &mut PayloadDecoder<'_>,
+    route: String,
+    global: bool,
+) -> Result<StreamReadItem> {
     match dec.get_u8()? {
-        0 => Ok(StreamReadItem::Event(decode_stream_record(dec, &route)?)),
+        0 => Ok(StreamReadItem::Event(decode_stream_record(
+            dec, &route, global,
+        )?)),
         1 => Ok(StreamReadItem::Filtered {
             route,
             offset: dec.get_u64()?,
@@ -434,7 +448,9 @@ pub(crate) fn decode_stream_notify(payload: &[u8]) -> Result<StreamCommitNotific
     let route = dec.get_string()?;
     let body = dec.get_bytes()?;
 
-    let parsed = serde_json::from_slice::<DecodedStreamNotifyPayload>(&body).unwrap_or_default();
+    let parsed = serde_json::from_slice::<DecodedStreamNotifyPayload>(&body).map_err(|error| {
+        FitzError::Protocol(format!("invalid stream notification JSON: {error}"))
+    })?;
 
     Ok(StreamCommitNotification {
         route,

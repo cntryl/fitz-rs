@@ -18,7 +18,12 @@
 //! tx.commit().await?;
 //!
 //! // Leases
-//! let grant = client.lease()?.acquire("lease://my-realm/locks/leader", "node-1", 30).await?;
+//! let grant = client.lease()?.acquire(
+//!     "lease://my-realm/locks/leader",
+//!     "node-1",
+//!     30,
+//!     cntryl_fitz::client_domains::lease::LeaseAcquireOptions::default(),
+//! ).await?;
 //! ```
 
 mod async_connection;

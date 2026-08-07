@@ -6,7 +6,7 @@ supports TCP and binary WebSocket transports.
 
 ```toml
 [dependencies]
-cntryl-fitz = "0.1"
+cntryl-fitz = "0.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -55,17 +55,17 @@ exact `lease://realm/area/resource` route.
 Notifications expose the exact concrete route. Queue availability
 notifications additionally report ready, delayed, and inflight message counts.
 Queue reserves accept general whole-segment patterns capable of matching three
-segments. Stream READ and SUBSCRIBE accept concrete resources, `realm/area/*`,
-`realm/*/*`, or `stream://**`; Stream LAST is concrete-route only. Each returned
+segments. Stream READ and SUBSCRIBE accept the complete documented selector
+matrix; Stream LAST is concrete-route only. Each returned
 `QueueItem` and `StreamReadItem` exposes the
 concrete matched route, including `StreamRecord::route` for event records.
 Route-less reserve/read/last responses are not supported. If any item contains an
 invalid concrete route, the entire response fails closed; the client never
 returns a partial reservation or read batch.
 
-Schedule listing is cursor-based: call `list_page` (message 707) and pass its
-continuation to the next page. Global stream continuations reuse the returned
-fingerprint and captured-watermark pair.
+Schedule listing uses `list(offset, limit)` on message 702 and returns
+`total_count`. Global stream continuations reuse the returned fingerprint and
+captured-watermark pair.
 
 ## Local broker
 

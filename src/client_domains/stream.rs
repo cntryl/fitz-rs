@@ -12,12 +12,19 @@ use crate::domains::stream::{
 use crate::protocol::message_type;
 use crate::{FitzError, Result};
 use futures_core::Stream;
+use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio_stream::wrappers::BroadcastStream;
 #[derive(Clone)]
 pub struct StreamClient {
     connection: AsyncConnection,
+    subscriptions: Arc<tokio::sync::Mutex<HashMap<String, SharedStreamSubscription>>>,
+}
+struct SharedStreamSubscription {
+    registration: Arc<RestorableRegistration>,
+    references: usize,
 }
 
 /// Optional bounds, filters, and continuation state for a paged stream read.
@@ -31,7 +38,10 @@ pub struct StreamReadOptions<'a> {
 
 impl StreamClient {
     pub(crate) fn new(connection: AsyncConnection) -> Self {
-        Self { connection }
+        Self {
+            connection,
+            subscriptions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        }
     }
     /// Performs the operation asynchronously.
     ///
@@ -130,7 +140,7 @@ impl StreamClient {
             .connection
             .request_replayable(message_type::STREAM_LAST, e.finish())
             .await?;
-        parse_stream_last_response(&decode_stream_response("LAST", &response)?.data)
+        parse_stream_last_response(&decode_stream_response("LAST", &response)?.data, route)
     }
     /// Performs the operation asynchronously.
     ///
@@ -169,22 +179,38 @@ impl StreamClient {
         let receiver = self
             .connection
             .notifications(message_type::STREAM_NOTIFY, 64);
-        let mut e = PayloadEncoder::new();
-        e.put_string(pattern);
-        let payload = e.finish();
-        let response = self
-            .connection
-            .request(message_type::STREAM_SUBSCRIBE, payload.clone())
-            .await?;
-        let subscription_id = decode_subscription_id(&response)?;
-        let registration = self.connection.register_restorable(
-            message_type::STREAM_SUBSCRIBE,
-            payload,
-            subscription_id,
-            decode_subscription_id,
-        );
+        let mut subscriptions = self.subscriptions.lock().await;
+        let registration = if let Some(shared) = subscriptions.get_mut(pattern) {
+            shared.references += 1;
+            Arc::clone(&shared.registration)
+        } else {
+            let mut e = PayloadEncoder::new();
+            e.put_string(pattern);
+            let payload = e.finish();
+            let response = self
+                .connection
+                .request(message_type::STREAM_SUBSCRIBE, payload.clone())
+                .await?;
+            let subscription_id = decode_subscription_id(&response)?;
+            let registration = Arc::new(self.connection.register_restorable(
+                message_type::STREAM_SUBSCRIBE,
+                payload,
+                subscription_id,
+                decode_subscription_id,
+            ));
+            subscriptions.insert(
+                pattern.into(),
+                SharedStreamSubscription {
+                    registration: Arc::clone(&registration),
+                    references: 1,
+                },
+            );
+            registration
+        };
+        drop(subscriptions);
         Ok(StreamSubscription {
             connection: self.connection.clone(),
+            subscriptions: Arc::clone(&self.subscriptions),
             pattern: pattern.into(),
             registration,
             receiver: BroadcastStream::new(receiver),
@@ -278,8 +304,9 @@ impl StreamSession {
 }
 pub struct StreamSubscription {
     connection: AsyncConnection,
+    subscriptions: Arc<tokio::sync::Mutex<HashMap<String, SharedStreamSubscription>>>,
     pattern: String,
-    registration: RestorableRegistration,
+    registration: Arc<RestorableRegistration>,
     receiver: BroadcastStream<Vec<u8>>,
     closed: bool,
 }
@@ -290,7 +317,14 @@ impl StreamSubscription {
     /// Returns an error when validation, transport, or broker processing fails.
     pub async fn unsubscribe(mut self) -> Result<()> {
         self.closed = true;
-        self.registration.deactivate();
+        let mut subscriptions = self.subscriptions.lock().await;
+        let Some(shared) = subscriptions.get_mut(&self.pattern) else {
+            return Ok(());
+        };
+        if shared.references > 1 {
+            shared.references -= 1;
+            return Ok(());
+        }
         let mut e = PayloadEncoder::new();
         e.put_string(&self.pattern);
         decode_stream_response(
@@ -300,6 +334,8 @@ impl StreamSubscription {
                 .request(message_type::STREAM_UNSUBSCRIBE, e.finish())
                 .await?,
         )?;
+        self.registration.deactivate();
+        subscriptions.remove(&self.pattern);
         Ok(())
     }
 }
@@ -350,5 +386,60 @@ fn optional_u64(e: &mut PayloadEncoder, value: Option<u64>) {
         e.put_u8(1).put_u64(v);
     } else {
         e.put_u8(0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::async_connection::AsyncConnectionOptions;
+    use crate::{
+        ConnectionState, FitzObservability, HeartbeatOptions, ReconnectPolicy, RetryPolicy,
+    };
+    use std::time::Duration;
+    use tokio::sync::watch;
+
+    #[tokio::test]
+    async fn should_retain_stream_wire_subscription_until_last_local_handle() {
+        let (state, _) = watch::channel(ConnectionState::Disconnected);
+        let connection = AsyncConnection::spawn(AsyncConnectionOptions {
+            endpoint: "tcp://127.0.0.1:1".into(),
+            token_provider: Arc::new(|| async { Ok(String::new()) }),
+            timeout: Duration::from_millis(20),
+            max_queued: 4,
+            reconnect: ReconnectPolicy {
+                enabled: false,
+                ..ReconnectPolicy::default()
+            },
+            retry: RetryPolicy::default(),
+            heartbeat: HeartbeatOptions::default(),
+            observability: FitzObservability::default(),
+            state,
+        });
+        let pattern = "stream://realm/area/*".to_string();
+        let registration = Arc::new(connection.register_restorable(
+            message_type::STREAM_SUBSCRIBE,
+            vec![],
+            42,
+            decode_subscription_id,
+        ));
+        let subscriptions = Arc::new(tokio::sync::Mutex::new(HashMap::from([(
+            pattern.clone(),
+            SharedStreamSubscription {
+                registration: Arc::clone(&registration),
+                references: 2,
+            },
+        )])));
+        let receiver = connection.notifications(message_type::STREAM_NOTIFY, 1);
+        let handle = StreamSubscription {
+            connection,
+            subscriptions: Arc::clone(&subscriptions),
+            pattern: pattern.clone(),
+            registration,
+            receiver: BroadcastStream::new(receiver),
+            closed: false,
+        };
+        handle.unsubscribe().await.unwrap();
+        assert_eq!(subscriptions.lock().await[&pattern].references, 1);
     }
 }

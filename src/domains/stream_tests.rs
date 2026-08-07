@@ -8,8 +8,9 @@ fn push_string(buf: &mut Vec<u8>, value: &str) {
 #[test]
 fn should_decode_begin_response_with_session_id() {
     // Arrange
-    let mut buf = vec![0, 1];
+    let mut buf = vec![0];
     buf.extend_from_slice(&9u64.to_be_bytes());
+    buf.extend_from_slice(&0u32.to_be_bytes());
 
     // Act
     let decoded = decode_stream_response("BEGIN", &buf).unwrap();
@@ -21,7 +22,7 @@ fn should_decode_begin_response_with_session_id() {
 #[test]
 fn should_decode_stream_append_offset_payload() {
     // Arrange
-    let mut buf = vec![0, 0];
+    let mut buf = vec![0];
     buf.extend_from_slice(&(8u32).to_be_bytes());
     buf.extend_from_slice(&17u64.to_be_bytes());
 
@@ -84,6 +85,53 @@ fn should_parse_count_prefixed_stream_records() {
     assert_eq!(page.cursor.last_area_offset, None);
     assert_eq!(page.cursor.last_realm_offset, None);
     assert!(!page.cursor.has_more);
+}
+
+#[test]
+fn should_decode_global_offsets_given_each_global_selector_alias() {
+    // Arrange
+    let mut encoder = PayloadEncoder::new();
+    encoder
+        .put_u32(1)
+        .put_string("stream://realm/area/resource")
+        .put_u8(0)
+        .put_u64(7)
+        .put_u8(1)
+        .put_u64(8)
+        .put_u8(1)
+        .put_u64(9)
+        .put_u8(1)
+        .put_u64(10)
+        .put_bytes(b"body")
+        .put_u8(0)
+        .put_u64(11)
+        .put_u64(7)
+        .put_u8(1)
+        .put_u64(8)
+        .put_u8(1)
+        .put_u64(9)
+        .put_u8(1)
+        .put_u64(10)
+        .put_u8(0)
+        .put_u8(1)
+        .put_u64(12)
+        .put_u8(1)
+        .put_u64(13);
+    let payload = encoder.finish();
+
+    for selector in ["stream://**", "stream://*/*/*"] {
+        // Act
+        let page = parse_stream_read_page_with_scope(&payload, selector).unwrap();
+
+        // Assert
+        let StreamReadItem::Event(record) = &page.items[0] else {
+            panic!("expected event record");
+        };
+        assert_eq!(record.global_offset, Some(10));
+        assert_eq!(page.cursor.last_global_offset, Some(10));
+        assert_eq!(page.cursor.cursor_fingerprint, Some(12));
+        assert_eq!(page.cursor.captured_watermark, Some(13));
+    }
 }
 
 #[test]
@@ -206,7 +254,6 @@ fn should_reject_wildcard_route_given_stream_read_response() {
 fn should_parse_full_stream_record() {
     // Arrange
     let mut buf = Vec::new();
-    push_string(&mut buf, "stream://realm/area/resource");
     buf.extend_from_slice(&1u64.to_be_bytes());
     buf.push(1);
     buf.extend_from_slice(&2u64.to_be_bytes());
@@ -220,7 +267,9 @@ fn should_parse_full_stream_record() {
     buf.extend_from_slice(&5u64.to_be_bytes());
 
     // Act
-    let record = parse_stream_last_response(&buf).unwrap().unwrap();
+    let record = parse_stream_last_response(&buf, "stream://realm/area/resource")
+        .unwrap()
+        .unwrap();
     // Assert
     assert_eq!(record.route, "stream://realm/area/resource");
     assert_eq!(record.offset, 1);
@@ -232,13 +281,13 @@ fn should_parse_full_stream_record() {
 }
 
 #[test]
-fn should_reject_wildcard_route_in_stream_last_response() {
+fn should_reject_wildcard_requested_route_in_stream_last_response() {
     // Arrange
     let mut buf = Vec::new();
-    push_string(&mut buf, "stream://*/area/resource");
+    buf.extend_from_slice(&1u64.to_be_bytes());
 
     // Act
-    let result = parse_stream_last_response(&buf);
+    let result = parse_stream_last_response(&buf, "stream://*/area/resource");
 
     // Assert
     assert!(matches!(
@@ -295,6 +344,26 @@ fn should_decode_stream_notify_payload() {
     assert_eq!(notification.event, "committed");
     assert_eq!(notification.last_resource_offset, 5);
     assert_eq!(notification.batch_size, 2);
+}
+
+#[test]
+fn should_surface_malformed_stream_notify_json() {
+    // Arrange
+    let mut encoder = PayloadEncoder::new();
+    encoder
+        .put_u64(42)
+        .put_string("stream://realm/area/x")
+        .put_bytes(b"not-json");
+
+    // Act
+    let error = decode_stream_notify(&encoder.finish()).unwrap_err();
+
+    // Assert
+    assert!(
+        error
+            .to_string()
+            .contains("invalid stream notification JSON")
+    );
 }
 
 #[test]

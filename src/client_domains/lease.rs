@@ -8,6 +8,7 @@ use futures_util::FutureExt;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio_stream::wrappers::BroadcastStream;
@@ -15,7 +16,12 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LeaseExecutionOptions {
-    pub wait_for_availability: bool,
+    pub wait_seconds: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LeaseAcquireOptions {
+    pub wait_seconds: u32,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -34,37 +40,69 @@ pub enum LeaseExecutionError<E> {
 #[derive(Clone)]
 pub struct LeaseClient {
     connection: AsyncConnection,
+    acquisition_gate: Arc<tokio::sync::Mutex<()>>,
 }
 impl LeaseClient {
     pub(crate) fn new(connection: AsyncConnection) -> Self {
-        Self { connection }
+        Self {
+            connection,
+            acquisition_gate: Arc::new(tokio::sync::Mutex::new(())),
+        }
     }
     /// Performs the operation asynchronously.
     ///
     /// # Errors
     /// Returns an error when validation, transport, or broker processing fails.
-    pub async fn acquire(&self, route: &str, owner_id: &str, ttl_secs: u64) -> Result<LeaseHandle> {
+    pub async fn acquire(
+        &self,
+        route: &str,
+        owner_id: &str,
+        ttl_secs: u64,
+        options: LeaseAcquireOptions,
+    ) -> Result<LeaseHandle> {
         validate_fixed_route(route, "lease", 3)?;
+        let _acquisition_guard = self.acquisition_gate.lock().await;
+        let mut deferred = self
+            .connection
+            .notifications(message_type::LEASE_ACQUIRE, 16);
         let mut e = PayloadEncoder::new();
-        e.put_string(route).put_string(owner_id).put_u64(ttl_secs);
+        e.put_string(route)
+            .put_string(owner_id)
+            .put_u64(ttl_secs)
+            .put_u32(options.wait_seconds);
         let response = self
             .connection
             .request(message_type::LEASE_ACQUIRE, e.finish())
             .await?;
-        let mut d = success(&response, "ACQUIRE")?;
+        let mut d = plain_success(&response, "ACQUIRE")?;
         let kind = d.get_u8()?;
-        if kind >= 2 {
+        let fencing_token = if kind < 2 {
+            d.get_u64()?
+        } else if kind <= 3 && options.wait_seconds > 0 {
+            let payload = deferred
+                .recv()
+                .await
+                .map_err(|_| FitzError::ConnectionClosed)?;
+            let mut completion = plain_success(&payload, "ACQUIRE")?;
+            let completion_kind = completion.get_u8()?;
+            if completion_kind > 1 {
+                return Err(FitzError::Protocol(
+                    "deferred ACQUIRE remained queued".into(),
+                ));
+            }
+            completion.get_u64()?
+        } else {
             return Err(FitzError::Domain {
                 code: 5001,
                 message: "lease acquisition queued".into(),
             });
-        }
+        };
         Ok(LeaseHandle {
             connection: self.connection.clone(),
             generation: self.connection.generation(),
             route: route.into(),
             owner_id: owner_id.into(),
-            fencing_token: d.get_u64()?,
+            fencing_token,
             released: false,
         })
     }
@@ -80,7 +118,7 @@ impl LeaseClient {
             .connection
             .request_replayable(message_type::LEASE_QUERY, e.finish())
             .await?;
-        let mut d = success(&response, "QUERY")?;
+        let mut d = plain_success(&response, "QUERY")?;
         let held = d.get_u8()? == 1;
         if held {
             Ok(LeaseInfo {
@@ -181,21 +219,20 @@ impl LeaseClient {
                 "lease TTL must be positive and schedulable".into(),
             )));
         }
-        let mut delay = Duration::from_millis(50);
-        let mut handle = loop {
-            match self.acquire(route, owner_id, ttl_secs).await {
-                Ok(handle) => break handle,
-                Err(error) if options.wait_for_availability && is_contention(&error) => {
-                    tokio::time::sleep(delay).await;
-                    delay = delay.saturating_mul(2).min(Duration::from_secs(1));
-                }
-                Err(error) => return Err(LeaseExecutionError::Acquisition(error)),
-            }
-        };
+        let mut handle = self
+            .acquire(
+                route,
+                owner_id,
+                ttl_secs,
+                LeaseAcquireOptions {
+                    wait_seconds: options.wait_seconds,
+                },
+            )
+            .await
+            .map_err(LeaseExecutionError::Acquisition)?;
 
         let cancellation = CancellationToken::new();
-        let callback_task =
-            tokio::spawn(AssertUnwindSafe(callback(cancellation.clone())).catch_unwind());
+        let callback_task = AssertUnwindSafe(callback(cancellation.clone())).catch_unwind();
         tokio::pin!(callback_task);
         let renewal = tokio::time::sleep(Duration::from_secs(ttl_secs) / 3);
         tokio::pin!(renewal);
@@ -203,7 +240,7 @@ impl LeaseClient {
             tokio::select! {
                 biased;
                 callback_result = &mut callback_task => {
-                    let outcome = callback_result.map_err(|error| LeaseExecutionError::Acquisition(FitzError::Connection(error.to_string())))?;
+                    let outcome = callback_result;
                     let release_result = handle.release().await;
                     let callback_result = match outcome {
                         Ok(result) => result,
@@ -221,7 +258,7 @@ impl LeaseClient {
                         Ok(()) => renewal.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(ttl_secs) / 3),
                         Err(error) => {
                             cancellation.cancel();
-                            let outcome = callback_task.await.map_err(|join| LeaseExecutionError::OwnershipLost(FitzError::Connection(join.to_string())))?;
+                            let outcome = callback_task.await;
                             let callback_result = match outcome {
                                 Ok(result) => result,
                                 Err(panic) => std::panic::resume_unwind(panic),
@@ -238,9 +275,6 @@ impl LeaseClient {
     }
 }
 
-fn is_contention(error: &FitzError) -> bool {
-    matches!(error, FitzError::Domain { code: 5001, .. })
-}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaseInfo {
     pub held: bool,
@@ -279,7 +313,7 @@ impl LeaseHandle {
             .connection
             .request(message_type::LEASE_RENEW, e.finish())
             .await?;
-        let mut d = success(&response, "RENEW")?;
+        let mut d = plain_success(&response, "RENEW")?;
         self.fencing_token = d.get_u64()?;
         Ok(())
     }
@@ -293,7 +327,7 @@ impl LeaseHandle {
         e.put_string(&self.route)
             .put_string(&self.owner_id)
             .put_u64(self.fencing_token);
-        success(
+        plain_success(
             &self
                 .connection
                 .request(message_type::LEASE_RELEASE, e.finish())
@@ -302,6 +336,30 @@ impl LeaseHandle {
         )?;
         self.released = true;
         Ok(())
+    }
+}
+
+impl Drop for LeaseHandle {
+    fn drop(&mut self) {
+        if self.released || self.connection.generation() != self.generation {
+            return;
+        }
+        self.released = true;
+        let connection = self.connection.clone();
+        let route = self.route.clone();
+        let owner_id = self.owner_id.clone();
+        let fencing_token = self.fencing_token;
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let mut e = PayloadEncoder::new();
+                e.put_string(&route)
+                    .put_string(&owner_id)
+                    .put_u64(fencing_token);
+                let _ = connection
+                    .request(message_type::LEASE_RELEASE, e.finish())
+                    .await;
+            });
+        }
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -325,7 +383,7 @@ impl LeaseSubscription {
         self.registration.deactivate();
         let mut e = PayloadEncoder::new();
         e.put_string(&self.route);
-        success(
+        plain_success(
             &self
                 .connection
                 .request(message_type::LEASE_UNSUBSCRIBE, e.finish())
@@ -368,19 +426,115 @@ impl Stream for LeaseSubscription {
         }
     }
 }
+
 fn decode_subscription_id(response: &[u8]) -> Result<u64> {
-    success(response, "SUBSCRIBE")?.get_u64()
+    let mut decoder = plain_success(response, "SUBSCRIBE")?;
+    let subscription_id = decoder.get_u64()?;
+    if !decoder.is_empty() {
+        return Err(FitzError::Protocol(
+            "lease SUBSCRIBE response has trailing bytes".into(),
+        ));
+    }
+    Ok(subscription_id)
 }
-fn success<'a>(response: &'a [u8], operation: &str) -> Result<PayloadDecoder<'a>> {
+fn plain_success<'a>(response: &'a [u8], operation: &str) -> Result<PayloadDecoder<'a>> {
     let mut d = PayloadDecoder::new(response);
     match d.get_u8()? {
         0 => Ok(d),
-        1 => Err(FitzError::Domain {
-            code: d.get_u32()?,
-            message: d.get_string()?,
-        }),
+        1 => {
+            let message = d.get_string()?;
+            if !d.is_empty() {
+                return Err(FitzError::Protocol(format!(
+                    "Lease {operation} error response has trailing bytes"
+                )));
+            }
+            Err(FitzError::Domain { code: 0, message })
+        }
         v => Err(FitzError::Protocol(format!(
             "Lease {operation} returned status {v}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::async_connection::AsyncConnectionOptions;
+    use crate::{
+        ConnectionState, FitzObservability, HeartbeatOptions, ReconnectPolicy, RetryPolicy,
+    };
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::watch;
+
+    async fn read_frame(stream: &mut TcpStream) -> (u16, Vec<u8>) {
+        let len = stream.read_u32().await.unwrap() as usize;
+        let mut frame = vec![0; len];
+        stream.read_exact(&mut frame).await.unwrap();
+        let (kind, start) = crate::codec::decode_message_frame(&frame).unwrap();
+        (kind, frame[start..].to_vec())
+    }
+    async fn write_frame(stream: &mut TcpStream, kind: u16, payload: &[u8]) {
+        let frame = crate::codec::try_encode_message_frame(kind, payload).unwrap();
+        stream
+            .write_u32(u32::try_from(frame.len()).unwrap())
+            .await
+            .unwrap();
+        stream.write_all(&frame).await.unwrap();
+        stream.flush().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn should_complete_deferred_acquire_and_release_when_handle_dropped() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert_eq!(read_frame(&mut stream).await.0, message_type::CONNECT);
+            let (kind, payload) = read_frame(&mut stream).await;
+            assert_eq!(kind, message_type::LEASE_ACQUIRE);
+            assert_eq!(
+                u32::from_be_bytes(payload[payload.len() - 4..].try_into().unwrap()),
+                7
+            );
+            let mut queued = PayloadEncoder::new();
+            queued.put_u8(0).put_u8(2).put_u64(0);
+            write_frame(&mut stream, message_type::LEASE_ACQUIRE, &queued.finish()).await;
+            let mut acquired = PayloadEncoder::new();
+            acquired.put_u8(0).put_u8(0).put_u64(42);
+            write_frame(&mut stream, message_type::LEASE_ACQUIRE, &acquired.finish()).await;
+            assert_eq!(read_frame(&mut stream).await.0, message_type::LEASE_RELEASE);
+            write_frame(&mut stream, message_type::LEASE_RELEASE, &[0]).await;
+        });
+        let (state, _) = watch::channel(ConnectionState::Disconnected);
+        let connection = AsyncConnection::spawn(AsyncConnectionOptions {
+            endpoint: format!("tcp://{address}"),
+            token_provider: Arc::new(|| async { Ok(String::new()) }),
+            timeout: Duration::from_secs(1),
+            max_queued: 8,
+            reconnect: ReconnectPolicy {
+                enabled: false,
+                ..ReconnectPolicy::default()
+            },
+            retry: RetryPolicy::default(),
+            heartbeat: HeartbeatOptions::default(),
+            observability: FitzObservability::default(),
+            state,
+        });
+        connection.connect().await.unwrap();
+        let client = LeaseClient::new(connection.clone());
+        let handle = client
+            .acquire(
+                "lease://realm/area/resource",
+                "worker-1",
+                30,
+                LeaseAcquireOptions { wait_seconds: 7 },
+            )
+            .await
+            .unwrap();
+        drop(handle);
+        server.await.unwrap();
+        connection.close().await;
     }
 }

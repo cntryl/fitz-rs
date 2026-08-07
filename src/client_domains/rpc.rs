@@ -103,23 +103,12 @@ impl Stream for RpcResponseStream {
                     if id != self.correlation_id {
                         continue;
                     }
-                    let sequence = match d.get_u64() {
-                        Ok(v) => v,
-                        Err(e) => return Poll::Ready(Some(Err(e))),
-                    };
-                    let end = match d.get_u8() {
-                        Ok(v) => v != 0,
-                        Err(e) => return Poll::Ready(Some(Err(e))),
-                    };
-                    let body = match d.get_bytes() {
+                    let (sequence, end, body) = match decode_rpc_response_frame(&mut d) {
                         Ok(v) => v,
                         Err(e) => return Poll::Ready(Some(Err(e))),
                     };
                     if end {
                         self.finished = true;
-                        if body.is_empty() {
-                            return Poll::Ready(None);
-                        }
                     }
                     return Poll::Ready(Some(Ok(RpcResponseFrame { body, sequence })));
                 }
@@ -135,6 +124,19 @@ impl Stream for RpcResponseStream {
         }
     }
 }
+
+fn decode_rpc_response_frame(decoder: &mut PayloadDecoder<'_>) -> Result<(u64, bool, Vec<u8>)> {
+    let sequence = decoder.get_u64()?;
+    let end = decoder.get_u8()? != 0;
+    let body = decoder.get_bytes()?;
+    if !decoder.is_empty() {
+        return Err(FitzError::Protocol(
+            "RPC response frame has trailing bytes".into(),
+        ));
+    }
+    Ok((sequence, end, body))
+}
+
 pub struct RpcWorker {
     connection: AsyncConnection,
     pattern: String,
@@ -250,5 +252,27 @@ impl RpcRequest {
         } else {
             self.respond(&[], true).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_preserve_empty_terminal_rpc_response_frame() {
+        // Arrange
+        let mut encoder = PayloadEncoder::new();
+        encoder.put_u64(7).put_u8(1).put_bytes(&[]);
+        let payload = encoder.finish();
+        let mut decoder = PayloadDecoder::new(&payload);
+
+        // Act
+        let (sequence, end, body) = decode_rpc_response_frame(&mut decoder).unwrap();
+
+        // Assert
+        assert_eq!(sequence, 7);
+        assert!(end);
+        assert!(body.is_empty());
     }
 }

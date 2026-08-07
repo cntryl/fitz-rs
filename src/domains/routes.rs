@@ -35,16 +35,23 @@ pub fn validate_registration_pattern(
     invalid("registration pattern cannot match the required route depth")
 }
 
-/// Validate the four route shapes shared by Stream READ and SUBSCRIBE.
+/// Validate the full selector matrix shared by Stream READ and SUBSCRIBE.
 pub fn validate_stream_selector(route: &str) -> Result<()> {
     if route == "stream://**" {
         return Ok(());
     }
-    let shape = scan(route, "stream")?;
+    scan(route, "stream")?;
     let Some(path) = route.strip_prefix("stream://") else {
         return invalid("stream selector has the wrong scheme");
     };
-    let mut segments = path.split('/');
+    let parts = path.split('/').collect::<Vec<_>>();
+    if let [realm, "**"] = parts.as_slice()
+        && !realm.is_empty()
+        && !realm.contains('*')
+    {
+        return Ok(());
+    }
+    let mut segments = parts.into_iter();
     let (Some(realm), Some(area), Some(resource), None) = (
         segments.next(),
         segments.next(),
@@ -53,13 +60,10 @@ pub fn validate_stream_selector(route: &str) -> Result<()> {
     ) else {
         return invalid("stream selector has the wrong shape");
     };
-    if shape.segments != 3 {
-        return invalid("stream selector has the wrong shape");
-    }
     let literal = |segment: &str| !segment.contains('*');
-    if literal(realm)
-        && ((literal(area) && (literal(resource) || resource == "*"))
-            || (area == "*" && resource == "*"))
+    if (literal(realm) || realm == "*")
+        && (literal(area) || area == "*")
+        && (literal(resource) || resource == "*")
     {
         return Ok(());
     }
@@ -326,14 +330,19 @@ mod tests {
         let valid = [
             "stream://realm/area/resource",
             "stream://realm/area/*",
+            "stream://realm/*/resource",
             "stream://realm/*/*",
+            "stream://realm/**",
+            "stream://*/area/resource",
+            "stream://*/area/*",
+            "stream://*/*/resource",
+            "stream://*/*/*",
             "stream://**",
         ];
         let invalid = [
-            "stream://*/area/*",
-            "stream://realm/*/resource",
-            "stream://realm/**",
             "stream://realm/area/**",
+            "stream://*/**",
+            "stream://realm/area",
         ];
 
         // Act

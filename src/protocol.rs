@@ -63,7 +63,7 @@ pub mod message_type {
     // Schedule domain (700-799)
     pub const SCHEDULE_CREATE: u16 = 700;
     pub const SCHEDULE_CANCEL: u16 = 701;
-    pub const SCHEDULE_LIST_PAGE: u16 = 707;
+    pub const SCHEDULE_LIST_PAGE: u16 = 702;
     pub const SCHEDULE_SUBSCRIBE: u16 = 703;
     pub const SCHEDULE_UNSUBSCRIBE: u16 = 704;
     pub const SCHEDULE_NOTIFY: u16 = 705; // Server -> Client only

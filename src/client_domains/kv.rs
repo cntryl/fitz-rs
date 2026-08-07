@@ -66,7 +66,7 @@ impl KvClient {
         validate_registration_pattern(pattern, "kv", 3)?;
         let mut encoder = PayloadEncoder::new();
         encoder.put_string(pattern);
-        let mut receiver = self.connection.notifications(message_type::KV_NOTIFY, 64);
+        let receiver = self.connection.notifications(message_type::KV_NOTIFY, 64);
         let payload = encoder.finish();
         let response = self
             .connection
@@ -79,7 +79,6 @@ impl KvClient {
             subscription_id,
             decode_subscription_id,
         );
-        receiver = receiver.resubscribe();
         Ok(KvSubscription {
             connection: self.connection.clone(),
             pattern: pattern.to_owned(),
@@ -230,11 +229,6 @@ impl KvTransaction {
     /// Returns an error when validation, transport, or broker processing fails.
     pub async fn delete_range(&self, start_key: &[u8], end_key: &[u8]) -> Result<()> {
         self.ensure_open()?;
-        if start_key >= end_key {
-            return Err(FitzError::Protocol(
-                "range start must be less than range end".into(),
-            ));
-        }
         let mut encoder = PayloadEncoder::new();
         encoder
             .put_u64(self.transaction_id)
@@ -256,10 +250,10 @@ impl KvTransaction {
     pub async fn scan(&self, options: &KvScanOptions) -> Result<KvScanPage> {
         self.ensure_open()?;
         if let (Some(start), Some(end)) = (&options.start_key, &options.end_key)
-            && start >= end
+            && ((!options.reverse && start > end) || (options.reverse && start < end))
         {
             return Err(FitzError::Protocol(
-                "range start must be less than range end".into(),
+                "scan bounds do not match the requested direction".into(),
             ));
         }
         let mut encoder = PayloadEncoder::new();

@@ -5,18 +5,29 @@ use crate::domains::routes::{validate_fixed_route, validate_registration_pattern
 use crate::protocol::message_type;
 use crate::{FitzError, Result};
 use futures_core::Stream;
+use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio_stream::wrappers::BroadcastStream;
 
 #[derive(Clone)]
 pub struct NoticeClient {
     connection: AsyncConnection,
+    subscriptions: Arc<tokio::sync::Mutex<HashMap<String, SharedNoticeSubscription>>>,
+}
+
+struct SharedNoticeSubscription {
+    registration: Arc<RestorableRegistration>,
+    references: usize,
 }
 
 impl NoticeClient {
     pub(crate) fn new(connection: AsyncConnection) -> Self {
-        Self { connection }
+        Self {
+            connection,
+            subscriptions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        }
     }
 
     /// Performs the operation asynchronously.
@@ -41,25 +52,42 @@ impl NoticeClient {
     /// Returns an error when validation, transport, or broker processing fails.
     pub async fn subscribe(&self, pattern: &str) -> Result<NoticeSubscription> {
         validate_registration_pattern(pattern, "notice", 0)?;
-        let mut encoder = PayloadEncoder::new();
-        encoder.put_string(pattern);
         let receiver = self
             .connection
             .notifications(message_type::NOTICE_NOTIFY, 64);
-        let payload = encoder.finish();
-        let response = self
-            .connection
-            .request(message_type::NOTICE_SUBSCRIBE, payload.clone())
-            .await?;
-        let subscription_id = decode_subscription_id(&response)?;
-        let registration = self.connection.register_restorable(
-            message_type::NOTICE_SUBSCRIBE,
-            payload,
-            subscription_id,
-            decode_subscription_id,
-        );
+        let mut subscriptions = self.subscriptions.lock().await;
+        let registration = if let Some(shared) = subscriptions.get_mut(pattern) {
+            shared.references += 1;
+            Arc::clone(&shared.registration)
+        } else {
+            let mut encoder = PayloadEncoder::new();
+            encoder.put_string(pattern);
+            let payload = encoder.finish();
+            let response = self
+                .connection
+                .request(message_type::NOTICE_SUBSCRIBE, payload.clone())
+                .await?;
+            let subscription_id = decode_subscription_id(&response)?;
+            let registration = Arc::new(self.connection.register_restorable(
+                message_type::NOTICE_SUBSCRIBE,
+                payload,
+                subscription_id,
+                decode_subscription_id,
+            ));
+            subscriptions.insert(
+                pattern.into(),
+                SharedNoticeSubscription {
+                    registration: Arc::clone(&registration),
+                    references: 1,
+                },
+            );
+            registration
+        };
+        drop(subscriptions);
         Ok(NoticeSubscription {
             connection: self.connection.clone(),
+            subscriptions: Arc::clone(&self.subscriptions),
+            pattern: pattern.into(),
             registration,
             receiver: BroadcastStream::new(receiver),
             closed: false,
@@ -99,7 +127,9 @@ pub struct NoticeMessage {
 
 pub struct NoticeSubscription {
     connection: AsyncConnection,
-    registration: RestorableRegistration,
+    subscriptions: Arc<tokio::sync::Mutex<HashMap<String, SharedNoticeSubscription>>>,
+    pattern: String,
+    registration: Arc<RestorableRegistration>,
     receiver: BroadcastStream<Vec<u8>>,
     closed: bool,
 }
@@ -111,8 +141,15 @@ impl NoticeSubscription {
     /// Returns an error when validation, transport, or broker processing fails.
     pub async fn unsubscribe(mut self) -> Result<()> {
         self.closed = true;
+        let mut subscriptions = self.subscriptions.lock().await;
+        let Some(shared) = subscriptions.get_mut(&self.pattern) else {
+            return Ok(());
+        };
+        if shared.references > 1 {
+            shared.references -= 1;
+            return Ok(());
+        }
         let subscription_id = self.registration.wire_id();
-        self.registration.deactivate();
         let mut encoder = PayloadEncoder::new();
         encoder.put_u64(subscription_id);
         decode_ok(
@@ -120,7 +157,10 @@ impl NoticeSubscription {
                 .connection
                 .request(message_type::NOTICE_UNSUBSCRIBE, encoder.finish())
                 .await?,
-        )
+        )?;
+        self.registration.deactivate();
+        subscriptions.remove(&self.pattern);
+        Ok(())
     }
 }
 
@@ -161,5 +201,82 @@ impl Stream for NoticeSubscription {
                 Poll::Pending => return Poll::Pending,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::async_connection::AsyncConnectionOptions;
+    use crate::{
+        ConnectionState, FitzObservability, HeartbeatOptions, ReconnectPolicy, RetryPolicy,
+    };
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::watch;
+
+    async fn read_frame(stream: &mut TcpStream) -> (u16, Vec<u8>) {
+        let len = stream.read_u32().await.unwrap() as usize;
+        let mut frame = vec![0; len];
+        stream.read_exact(&mut frame).await.unwrap();
+        let (kind, start) = crate::codec::decode_message_frame(&frame).unwrap();
+        (kind, frame[start..].to_vec())
+    }
+
+    async fn write_frame(stream: &mut TcpStream, kind: u16, payload: &[u8]) {
+        let frame = crate::codec::try_encode_message_frame(kind, payload).unwrap();
+        stream
+            .write_u32(u32::try_from(frame.len()).unwrap())
+            .await
+            .unwrap();
+        stream.write_all(&frame).await.unwrap();
+        stream.flush().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn should_reference_count_duplicate_notice_subscriptions() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert_eq!(read_frame(&mut stream).await.0, message_type::CONNECT);
+            let (subscribe, _) = read_frame(&mut stream).await;
+            assert_eq!(subscribe, message_type::NOTICE_SUBSCRIBE);
+            let mut response = PayloadEncoder::new();
+            response.put_u8(0).put_u64(42);
+            write_frame(
+                &mut stream,
+                message_type::NOTICE_SUBSCRIBE,
+                &response.finish(),
+            )
+            .await;
+            let (unsubscribe, _) = read_frame(&mut stream).await;
+            assert_eq!(unsubscribe, message_type::NOTICE_UNSUBSCRIBE);
+            write_frame(&mut stream, message_type::NOTICE_UNSUBSCRIBE, &[0]).await;
+        });
+        let (state, _) = watch::channel(ConnectionState::Disconnected);
+        let connection = AsyncConnection::spawn(AsyncConnectionOptions {
+            endpoint: format!("tcp://{address}"),
+            token_provider: Arc::new(|| async { Ok(String::new()) }),
+            timeout: Duration::from_secs(1),
+            max_queued: 8,
+            reconnect: ReconnectPolicy {
+                enabled: false,
+                ..ReconnectPolicy::default()
+            },
+            retry: RetryPolicy::default(),
+            heartbeat: HeartbeatOptions::default(),
+            observability: FitzObservability::default(),
+            state,
+        });
+        connection.connect().await.unwrap();
+        let client = NoticeClient::new(connection.clone());
+        let first = client.subscribe("notice://realm/area/*").await.unwrap();
+        let second = client.subscribe("notice://realm/area/*").await.unwrap();
+        first.unsubscribe().await.unwrap();
+        second.unsubscribe().await.unwrap();
+        server.await.unwrap();
+        connection.close().await;
     }
 }

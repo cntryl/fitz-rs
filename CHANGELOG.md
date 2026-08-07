@@ -1,9 +1,13 @@
 # Changelog
 
-## 0.1.0 - Unreleased
+## 0.2.0 - Unreleased
 
-- Breaking: Stream READ and SUBSCRIBE now accept only concrete resource, area (`realm/area/*`), realm (`realm/*/*`), or global (`stream://**`) selectors. Global continuation reuses the returned fingerprint and watermark pair, and Stream LAST is concrete-route only. Notice subscriptions now retain the server's flexible route depth.
-- Breaking: Schedule listing uses `list_page` and message 707; offset-based listing was removed.
+- Breaking: Schedule listing uses canonical message 702 with offset/limit and `total_count`.
+- Breaking: Queue delays are expressed in wire-shaped seconds, and Lease acquisition exposes `wait_seconds`.
+- Breaking: Queue notifications expose the canonical opaque length-prefixed payload.
+- Stream selectors accept the full documented matrix and global records expose their global offsets.
+- Duplicate Notice, Schedule, and Stream subscriptions are locally reference counted.
+- Reconnect generation fencing, best-effort registration restoration, refreshed-token auth retry, and cancellation-safe Lease cleanup prevent stale replay and leaked work.
 - Breaking: Queue reserve, Stream read, and Stream last wire items now require their concrete matched route. `QueueItem`, `StreamReadItem`, and `StreamRecord` expose it.
 - Breaking: `Client::connect()` is one-shot; use `connect_when_ready` for bounded startup retry.
 - Breaking: `KvClient::begin` now requires `KvDurability::Buffered` or `KvDurability::Sync`.

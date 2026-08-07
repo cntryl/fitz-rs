@@ -6,7 +6,7 @@ use crate::{
 use futures_util::{SinkExt, StreamExt};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -29,7 +29,7 @@ pub(crate) struct RestorableRegistration {
     key: u64,
     wire_id: Arc<AtomicU64>,
     registrations: Arc<parking_lot::Mutex<HashMap<u64, Registration>>>,
-    active: bool,
+    active: AtomicBool,
 }
 
 impl RestorableRegistration {
@@ -37,10 +37,9 @@ impl RestorableRegistration {
         self.wire_id.load(Ordering::Acquire)
     }
 
-    pub(crate) fn deactivate(&mut self) {
-        if self.active {
+    pub(crate) fn deactivate(&self) {
+        if self.active.swap(false, Ordering::AcqRel) {
             self.registrations.lock().remove(&self.key);
-            self.active = false;
         }
     }
 }
@@ -60,11 +59,13 @@ enum Command {
     Connect(oneshot::Sender<Result<()>>),
     Request {
         id: u64,
+        generation: u64,
         message_type: u16,
         payload: Vec<u8>,
         response: Response,
     },
     Send {
+        generation: u64,
         message_type: u16,
         payload: Vec<u8>,
         response: oneshot::Sender<Result<()>>,
@@ -78,6 +79,7 @@ pub(crate) struct AsyncConnection {
     cancellations: mpsc::UnboundedSender<u64>,
     next_request_id: Arc<AtomicU64>,
     generation: Arc<AtomicU64>,
+    close_requested: Arc<AtomicBool>,
     notifications: Arc<parking_lot::Mutex<HashMap<u16, broadcast::Sender<Vec<u8>>>>>,
     registrations: Arc<parking_lot::Mutex<HashMap<u64, Registration>>>,
     next_registration_id: Arc<AtomicU64>,
@@ -114,6 +116,7 @@ impl AsyncConnection {
         let (cancellations, cancellation_rx) = mpsc::unbounded_channel();
         let notifications = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let generation = Arc::new(AtomicU64::new(0));
+        let close_requested = Arc::new(AtomicBool::new(false));
         let registrations = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         tokio::spawn(supervise(Supervisor {
             endpoint,
@@ -127,6 +130,7 @@ impl AsyncConnection {
             cancellations: cancellation_rx,
             notifications: Arc::clone(&notifications),
             generation: Arc::clone(&generation),
+            close_requested: Arc::clone(&close_requested),
             registrations: Arc::clone(&registrations),
         }));
         Self {
@@ -134,6 +138,7 @@ impl AsyncConnection {
             cancellations,
             next_request_id: Arc::new(AtomicU64::new(1)),
             generation,
+            close_requested,
             notifications,
             registrations,
             next_registration_id: Arc::new(AtomicU64::new(1)),
@@ -143,12 +148,16 @@ impl AsyncConnection {
     }
 
     pub(crate) async fn connect(&self) -> Result<()> {
+        self.close_requested.store(false, Ordering::Release);
         let (tx, rx) = oneshot::channel();
-        self.commands
-            .send(Command::Connect(tx))
+        tokio::time::timeout(self.timeout, self.commands.send(Command::Connect(tx)))
             .await
+            .map_err(|_| FitzError::Timeout)?
             .map_err(|_| FitzError::Closed)?;
-        rx.await.map_err(|_| FitzError::Closed)?
+        tokio::time::timeout(self.timeout, rx)
+            .await
+            .map_err(|_| FitzError::Timeout)?
+            .map_err(|_| FitzError::Closed)?
     }
 
     pub(crate) async fn request(&self, message_type: u16, payload: Vec<u8>) -> Result<Vec<u8>> {
@@ -160,6 +169,7 @@ impl AsyncConnection {
             self.commands
                 .try_send(Command::Request {
                     id,
+                    generation: self.generation(),
                     message_type,
                     payload,
                     response: tx,
@@ -255,6 +265,7 @@ impl AsyncConnection {
         let (tx, rx) = oneshot::channel();
         self.commands
             .try_send(Command::Send {
+                generation: self.generation(),
                 message_type,
                 payload,
                 response: tx,
@@ -284,9 +295,14 @@ impl AsyncConnection {
     }
 
     pub(crate) async fn close(&self) {
+        self.close_requested.store(true, Ordering::Release);
         let (tx, rx) = oneshot::channel();
-        let _ = self.commands.send(Command::Close(tx)).await;
-        let _ = rx.await;
+        if tokio::time::timeout(self.timeout, self.commands.send(Command::Close(tx)))
+            .await
+            .is_ok()
+        {
+            let _ = tokio::time::timeout(self.timeout, rx).await;
+        }
     }
 
     pub(crate) fn generation(&self) -> u64 {
@@ -315,7 +331,7 @@ impl AsyncConnection {
             key,
             wire_id,
             registrations: Arc::clone(&self.registrations),
-            active: true,
+            active: AtomicBool::new(true),
         }
     }
 }
@@ -346,6 +362,7 @@ struct Supervisor {
     cancellations: mpsc::UnboundedReceiver<u64>,
     notifications: Arc<parking_lot::Mutex<HashMap<u16, broadcast::Sender<Vec<u8>>>>>,
     generation: Arc<AtomicU64>,
+    close_requested: Arc<AtomicBool>,
     registrations: Arc<parking_lot::Mutex<HashMap<u64, Registration>>>,
 }
 
@@ -379,13 +396,19 @@ async fn connect_and_run(
     emit_lifecycle(supervisor, "connect_start");
     let mut attempts = 0_usize;
     loop {
+        if supervisor.close_requested.load(Ordering::Acquire) {
+            supervisor.state.send_replace(ConnectionState::Closed);
+            return Ok(());
+        }
         match open_session(supervisor).await {
             Ok(session) => {
+                if supervisor.close_requested.load(Ordering::Acquire) {
+                    supervisor.state.send_replace(ConnectionState::Closed);
+                    return Ok(());
+                }
                 let mut session = session;
-                if let Err(error) = restore_registrations(supervisor, &mut session).await {
-                    tracing::warn!(%error, "fitz registration restoration failed");
-                    supervisor.generation.fetch_add(1, Ordering::AcqRel);
-                } else {
+                {
+                    restore_registrations(supervisor, &mut session).await;
                     let reconnected = initial_response.is_none();
                     supervisor
                         .state
@@ -602,17 +625,22 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    let session_generation = supervisor.generation.load(Ordering::Acquire);
     let mut pending: HashMap<u16, VecDeque<PendingRequest>> = HashMap::new();
     let mut canceled = HashSet::new();
     loop {
         tokio::select! {
             command = supervisor.commands.recv() => match command {
-                Some(Command::Request { id, message_type, payload, response }) => {
+                Some(Command::Request { id, generation, message_type, payload, response }) => {
+                    if generation != session_generation { let _ = response.send(Err(FitzError::ConnectionClosed)); continue; }
                     let response = (!canceled.remove(&id)).then_some(response);
                     pending.entry(message_type).or_default().push_back(PendingRequest { id, response });
                     if write_tcp(&mut writer, message_type, payload).await.is_err() { fail_pending(&mut pending); return SessionResult::Disconnected; }
                 }
-                Some(Command::Send { message_type, payload, response }) => { let _ = response.send(write_tcp(&mut writer, message_type, payload).await); }
+                Some(Command::Send { generation, message_type, payload, response }) => {
+                    if generation != session_generation { let _ = response.send(Err(FitzError::ConnectionClosed)); continue; }
+                    let _ = response.send(write_tcp(&mut writer, message_type, payload).await);
+                }
                 Some(Command::Connect(response)) => { let _ = response.send(Ok(())); }
                 Some(Command::Close(response)) => { let _ = writer.shutdown().await; let _=response.send(()); fail_pending(&mut pending); supervisor.state.send_replace(ConnectionState::Closed); emit_lifecycle(supervisor, "closed"); return SessionResult::Closed; }
                 None => { let _ = writer.shutdown().await; fail_pending(&mut pending); return SessionResult::Closed; }
@@ -632,6 +660,7 @@ async fn run_websocket(
     supervisor: &mut Supervisor,
     socket: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
 ) -> SessionResult {
+    let session_generation = supervisor.generation.load(Ordering::Acquire);
     let (mut writer, mut reader) = socket.split();
     let mut pending: HashMap<u16, VecDeque<PendingRequest>> = HashMap::new();
     let mut canceled = HashSet::new();
@@ -644,7 +673,8 @@ async fn run_websocket(
     loop {
         tokio::select! {
             command = supervisor.commands.recv() => match command {
-                Some(Command::Request { id, message_type, payload, response }) => {
+                Some(Command::Request { id, generation, message_type, payload, response }) => {
+                    if generation != session_generation { let _ = response.send(Err(FitzError::ConnectionClosed)); continue; }
                     let response = (!canceled.remove(&id)).then_some(response);
                     pending.entry(message_type).or_default().push_back(PendingRequest { id, response });
                     let frame = try_encode_message_frame(message_type, &payload);
@@ -652,7 +682,10 @@ async fn run_websocket(
                     awaiting_pong = false;
                     heartbeat.as_mut().reset(tokio::time::Instant::now() + heartbeat_idle);
                 }
-                Some(Command::Send { message_type, payload, response }) => { let result = async { let frame=try_encode_message_frame(message_type,&payload)?; writer.send(Message::Binary(frame.into())).await.map_err(|e| FitzError::Transport(e.to_string())) }.await; let _=response.send(result); }
+                Some(Command::Send { generation, message_type, payload, response }) => {
+                    if generation != session_generation { let _ = response.send(Err(FitzError::ConnectionClosed)); continue; }
+                    let result = async { let frame=try_encode_message_frame(message_type,&payload)?; writer.send(Message::Binary(frame.into())).await.map_err(|e| FitzError::Transport(e.to_string())) }.await; let _=response.send(result);
+                }
                 Some(Command::Connect(response)) => { let _ = response.send(Ok(())); }
                 Some(Command::Close(response)) => { let _=writer.close().await; let _=response.send(()); fail_pending(&mut pending); supervisor.state.send_replace(ConnectionState::Closed); emit_lifecycle(supervisor, "closed"); return SessionResult::Closed; }
                 None => { let _=writer.close().await; fail_pending(&mut pending); return SessionResult::Closed; }
@@ -703,7 +736,7 @@ async fn write_session(session: &mut Session, message_type: u16, payload: Vec<u8
     }
 }
 
-async fn restore_registrations(supervisor: &Supervisor, session: &mut Session) -> Result<()> {
+async fn restore_registrations(supervisor: &Supervisor, session: &mut Session) {
     let registrations = supervisor
         .registrations
         .lock()
@@ -711,14 +744,21 @@ async fn restore_registrations(supervisor: &Supervisor, session: &mut Session) -
         .cloned()
         .collect::<Vec<_>>();
     for registration in registrations {
-        let response = round_trip_session(
+        let restored = round_trip_session(
             supervisor,
             session,
             registration.message_type,
             registration.payload.clone(),
         )
-        .await?;
-        let wire_id = (registration.decoder)(&response)?;
+        .await
+        .and_then(|response| (registration.decoder)(&response));
+        let Ok(wire_id) = restored else {
+            tracing::warn!(
+                message_type = registration.message_type,
+                "fitz registration restore failed; continuing session"
+            );
+            continue;
+        };
         registration.wire_id.store(wire_id, Ordering::Release);
         tracing::info!(
             message_type = registration.message_type,
@@ -726,7 +766,6 @@ async fn restore_registrations(supervisor: &Supervisor, session: &mut Session) -
             "fitz registration restored"
         );
     }
-    Ok(())
 }
 
 async fn round_trip_session(
@@ -827,6 +866,7 @@ fn fail_pending(pending: &mut HashMap<u16, VecDeque<PendingRequest>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
     use tokio::net::TcpListener;
 
     #[tokio::test]
@@ -873,6 +913,160 @@ mod tests {
 
         // Assert
         assert_eq!(response, b"second");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn should_allow_connect_retry_with_refreshed_token_after_auth_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let _ = read_tcp(&mut first).await.unwrap();
+            drop(first);
+            let (mut second, _) = listener.accept().await.unwrap();
+            let _ = read_tcp(&mut second).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        });
+        let token_calls = Arc::new(AtomicUsize::new(0));
+        let provider_calls = Arc::clone(&token_calls);
+        let (state, _) = watch::channel(ConnectionState::Disconnected);
+        let connection = AsyncConnection::spawn(AsyncConnectionOptions {
+            endpoint: format!("tcp://{address}"),
+            token_provider: Arc::new(move || {
+                let calls = Arc::clone(&provider_calls);
+                async move { Ok(format!("token-{}", calls.fetch_add(1, Ordering::AcqRel))) }
+            }),
+            timeout: Duration::from_secs(1),
+            max_queued: 8,
+            reconnect: ReconnectPolicy {
+                enabled: false,
+                ..ReconnectPolicy::default()
+            },
+            retry: RetryPolicy::default(),
+            heartbeat: HeartbeatOptions::default(),
+            observability: FitzObservability::default(),
+            state,
+        });
+
+        assert!(matches!(
+            connection.connect().await,
+            Err(FitzError::Authentication { .. })
+        ));
+        connection.connect().await.unwrap();
+        assert_eq!(token_calls.load(Ordering::Acquire), 2);
+        connection.close().await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn should_fail_stale_queued_command_instead_of_replaying_on_new_generation() {
+        let (commands_tx, commands) = mpsc::channel(4);
+        let (_cancellations_tx, cancellations) = mpsc::unbounded_channel();
+        let (state, _) = watch::channel(ConnectionState::Authenticated);
+        let generation = Arc::new(AtomicU64::new(1));
+        let mut supervisor = Supervisor {
+            endpoint: "tcp://unused".into(),
+            token_provider: Arc::new(|| async { Ok(String::new()) }),
+            timeout: Duration::from_secs(1),
+            reconnect: ReconnectPolicy::default(),
+            heartbeat: HeartbeatOptions::default(),
+            observability: FitzObservability::default(),
+            state,
+            commands,
+            cancellations,
+            notifications: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            generation,
+            close_requested: Arc::new(AtomicBool::new(false)),
+            registrations: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        };
+        let (io, _peer) = tokio::io::duplex(64);
+        let (reader, writer) = tokio::io::split(io);
+        let task = tokio::spawn(async move { run_io(&mut supervisor, reader, writer).await });
+        let (response_tx, response_rx) = oneshot::channel();
+        commands_tx
+            .send(Command::Request {
+                id: 1,
+                generation: 0,
+                message_type: 100,
+                payload: vec![1],
+                response: response_tx,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            response_rx.await.unwrap(),
+            Err(FitzError::ConnectionClosed)
+        ));
+        let (close_tx, close_rx) = oneshot::channel();
+        commands_tx.send(Command::Close(close_tx)).await.unwrap();
+        close_rx.await.unwrap();
+        assert!(matches!(task.await.unwrap(), SessionResult::Closed));
+    }
+
+    #[tokio::test]
+    async fn should_continue_restoring_registrations_after_one_restore_fails() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            for _ in 0..2 {
+                let (kind, _) = read_tcp(&mut socket).await.unwrap();
+                let payload = if kind == 501 {
+                    vec![]
+                } else {
+                    99_u64.to_be_bytes().to_vec()
+                };
+                write_tcp(&mut socket, kind, payload).await.unwrap();
+            }
+        });
+        let mut session = Session::Tcp(TcpStream::connect(address).await.unwrap());
+        let good_wire_id = Arc::new(AtomicU64::new(1));
+        let registrations = Arc::new(parking_lot::Mutex::new(HashMap::from([
+            (
+                1,
+                Registration {
+                    message_type: 501,
+                    payload: vec![],
+                    wire_id: Arc::new(AtomicU64::new(1)),
+                    decoder: Arc::new(|_| Err(FitzError::Protocol("restore rejected".into()))),
+                },
+            ),
+            (
+                2,
+                Registration {
+                    message_type: 703,
+                    payload: vec![],
+                    wire_id: Arc::clone(&good_wire_id),
+                    decoder: Arc::new(|payload| {
+                        if payload.len() != 8 {
+                            return Err(FitzError::Protocol("bad id".into()));
+                        }
+                        Ok(u64::from_be_bytes(payload.try_into().unwrap()))
+                    }),
+                },
+            ),
+        ])));
+        let (_commands_tx, commands) = mpsc::channel(1);
+        let (_cancel_tx, cancellations) = mpsc::unbounded_channel();
+        let (state, _) = watch::channel(ConnectionState::Authenticated);
+        let supervisor = Supervisor {
+            endpoint: "tcp://unused".into(),
+            token_provider: Arc::new(|| async { Ok(String::new()) }),
+            timeout: Duration::from_secs(1),
+            reconnect: ReconnectPolicy::default(),
+            heartbeat: HeartbeatOptions::default(),
+            observability: FitzObservability::default(),
+            state,
+            commands,
+            cancellations,
+            notifications: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            generation: Arc::new(AtomicU64::new(0)),
+            close_requested: Arc::new(AtomicBool::new(false)),
+            registrations,
+        };
+        restore_registrations(&supervisor, &mut session).await;
+        assert_eq!(good_wire_id.load(Ordering::Acquire), 99);
         server.await.unwrap();
     }
 }
