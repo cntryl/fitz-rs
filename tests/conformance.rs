@@ -1,8 +1,11 @@
 mod jwt;
 
 use cntryl_fitz::client_domains::kv::KvGetResult;
+use cntryl_fitz::client_domains::lease::LeaseAcquireOptions;
+use cntryl_fitz::client_domains::schedule::ScheduleDeliveryMode;
 use cntryl_fitz::client_domains::stream::StreamCommitMode;
 use cntryl_fitz::{Client, FitzError, KvDurability, TransactionMode};
+use futures_util::StreamExt;
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -135,37 +138,81 @@ async fn kv_round_trip(client: &Client, durability: KvDurability) -> Result<(), 
     transaction.commit().await
 }
 
+async fn reject_invalid_jwt(transport: Transport) -> Result<(), FitzError> {
+    let secret =
+        std::env::var("FITZ_BROKER_JWT_HMAC_SECRET").unwrap_or_else(|_| "dev-test-secret".into());
+    let token = jwt::make_invalid_jwt("test-realm", &secret);
+    let invalid = Client::builder(endpoint(transport, AuthMode::ValidJwt), move || {
+        let token = token.clone();
+        async move { Ok(token) }
+    })
+    .request_timeout(Duration::from_secs(2))
+    .build()?;
+    if invalid.connect().await.is_ok() {
+        let result = invalid
+            .kv()?
+            .begin(
+                &unique_route("kv"),
+                TransactionMode::ReadWrite,
+                KvDurability::Buffered,
+            )
+            .await;
+        assert!(result.is_err(), "invalid JWT must reject the first request");
+        invalid.close().await?;
+    }
+    Ok(())
+}
+
+async fn reject_held_lease(
+    connected: &Client,
+    transport: Transport,
+    auth_mode: AuthMode,
+) -> Result<(), FitzError> {
+    let route = unique_route("lease");
+    let owner = connected
+        .lease()?
+        .acquire(&route, "owner", 30, LeaseAcquireOptions::default())
+        .await?;
+    let contender = client(transport, auth_mode);
+    contender.connect().await?;
+    let result = contender
+        .lease()?
+        .acquire(&route, "contender", 30, LeaseAcquireOptions::default())
+        .await;
+    let Err(error) = result else {
+        panic!("held lease must reject a competing acquisition");
+    };
+    assert!(matches!(error, FitzError::Domain { code: 5001, .. }));
+    contender.close().await?;
+    owner.release().await
+}
+
+async fn stream_round_trip(connected: &Client) -> Result<(), FitzError> {
+    let route = unique_route("stream");
+    let mut session = connected.stream()?.begin(&route, None).await?;
+    session.append(0, b"one", None, None).await?;
+    session.commit(StreamCommitMode::Sync).await?;
+    assert_eq!(
+        connected
+            .stream()?
+            .read(&route, 0, 10, None, None, None)
+            .await?
+            .len(),
+        1
+    );
+    Ok(())
+}
+
 async fn should_run_scenario(
     id: u8,
     connected: &Client,
     transport: Transport,
+    auth_mode: AuthMode,
 ) -> Result<Vec<String>, FitzError> {
     match id {
         1 | 3 => kv_round_trip(connected, KvDurability::Buffered).await?,
-        2 => {
-            let secret = std::env::var("FITZ_BROKER_JWT_HMAC_SECRET")
-                .unwrap_or_else(|_| "dev-test-secret".into());
-            let token = jwt::make_invalid_jwt("test-realm", &secret);
-            let invalid = Client::builder(endpoint(transport, AuthMode::ValidJwt), move || {
-                let token = token.clone();
-                async move { Ok(token) }
-            })
-            .request_timeout(Duration::from_secs(2))
-            .build()?;
-            if invalid.connect().await.is_ok() {
-                let result = invalid
-                    .kv()?
-                    .begin(
-                        &unique_route("kv"),
-                        TransactionMode::ReadWrite,
-                        KvDurability::Buffered,
-                    )
-                    .await;
-                assert!(result.is_err(), "invalid JWT must reject the first request");
-                invalid.close().await?;
-            }
-        }
-        4..=6 => {
+        2 => reject_invalid_jwt(transport).await?,
+        4 | 5 => {
             let result = connected
                 .kv()?
                 .begin(
@@ -179,6 +226,7 @@ async fn should_run_scenario(
             };
             assert!(matches!(error, FitzError::Protocol(_)));
         }
+        6 => reject_held_lease(connected, transport, auth_mode).await?,
         7 => {
             let unavailable = Client::anonymous("tcp://127.0.0.1:1")
                 .request_timeout(Duration::from_millis(100))
@@ -204,20 +252,7 @@ async fn should_run_scenario(
             probe.close().await?;
             assert!(probe.kv().is_err());
         }
-        11..=13 => {
-            let route = unique_route("stream");
-            let mut session = connected.stream()?.begin(&route, None).await?;
-            session.append(0, b"one", None, None).await?;
-            session.commit(StreamCommitMode::Sync).await?;
-            assert_eq!(
-                connected
-                    .stream()?
-                    .read(&route, 0, 10, None, None, None)
-                    .await?
-                    .len(),
-                1
-            );
-        }
+        11..=13 => stream_round_trip(connected).await?,
         14 | 15 => {
             let (left, right) = tokio::join!(
                 kv_round_trip(connected, KvDurability::Buffered),
@@ -275,7 +310,7 @@ async fn should_complete_default_async_conformance_suite() {
     // Act
     for id in 1..=17 {
         let started = Instant::now();
-        let evidence = should_run_scenario(id, &connected, transport)
+        let evidence = should_run_scenario(id, &connected, transport, auth_mode)
             .await
             .unwrap_or_else(|error| panic!("CS-{id:03} failed: {error}"));
         scenarios.push(ScenarioResult {
@@ -323,4 +358,188 @@ async fn should_complete_default_async_conformance_suite() {
     // Assert
     assert_eq!(aggregate.scenarios.len(), 17);
     assert!(aggregate.scenarios.iter().all(|row| row.verdict == "pass"));
+}
+
+async fn exercise_queue_workflow(connected: &Client) {
+    let queue_route = unique_route("queue");
+    connected
+        .queue()
+        .expect("queue client")
+        .enqueue(&queue_route, b"queued", None)
+        .await
+        .expect("enqueue");
+    let mut items = connected
+        .queue()
+        .expect("queue client")
+        .reserve(&queue_route, 30, 1, Some(1))
+        .await
+        .expect("reserve");
+    assert_eq!(items.len(), 1);
+    let item = items.pop().expect("reserved item");
+    assert_eq!(item.body, b"queued");
+    item.complete().await.expect("complete queue item");
+}
+
+async fn exercise_lease_workflow(connected: &Client) {
+    let lease_route = unique_route("lease");
+    let mut lease = connected
+        .lease()
+        .expect("lease client")
+        .acquire(
+            &lease_route,
+            "domain-workflow",
+            30,
+            LeaseAcquireOptions::default(),
+        )
+        .await
+        .expect("acquire lease");
+    assert!(
+        connected
+            .lease()
+            .expect("lease client")
+            .query(&lease_route)
+            .await
+            .expect("query held lease")
+            .held
+    );
+    lease.extend(45).await.expect("extend lease");
+    lease.release().await.expect("release lease");
+}
+
+async fn exercise_notice_workflow(connected: &Client) {
+    let notice_route = unique_route("notice");
+    let mut notice_subscription = connected
+        .notice()
+        .expect("notice client")
+        .subscribe("notice://test-realm/conformance/*")
+        .await
+        .expect("subscribe notice");
+    connected
+        .notice()
+        .expect("notice client")
+        .publish(&notice_route, b"notice")
+        .await
+        .expect("publish notice");
+    let notice = tokio::time::timeout(Duration::from_secs(2), notice_subscription.next())
+        .await
+        .expect("notice timeout")
+        .expect("notice subscription ended")
+        .expect("notice decode");
+    assert_eq!(notice.route, notice_route);
+    assert_eq!(notice.body, b"notice");
+    notice_subscription
+        .unsubscribe()
+        .await
+        .expect("unsubscribe notice");
+}
+
+async fn exercise_rpc_workflow(connected: &Client) {
+    let rpc_route = unique_route("rpc");
+    let mut worker = connected
+        .rpc()
+        .expect("rpc client")
+        .register_worker(&rpc_route, 1)
+        .await
+        .expect("register worker");
+    let mut responses = connected
+        .rpc()
+        .expect("rpc client")
+        .call(&rpc_route, b"ping")
+        .await
+        .expect("call rpc");
+    let mut request = tokio::time::timeout(Duration::from_secs(2), worker.next())
+        .await
+        .expect("worker request timeout")
+        .expect("worker stream ended")
+        .expect("worker request decode");
+    assert_eq!(request.body, b"ping");
+    request.respond(b"pong", true).await.expect("respond rpc");
+    let response = tokio::time::timeout(Duration::from_secs(2), responses.next())
+        .await
+        .expect("rpc response timeout")
+        .expect("rpc response stream ended")
+        .expect("rpc response decode");
+    assert_eq!(response.body, b"pong");
+    worker.deregister().await.expect("deregister worker");
+}
+
+async fn exercise_schedule_workflow(connected: &Client) {
+    let schedule_route = format!("{}/run", unique_route("schedule"));
+    connected
+        .schedule()
+        .expect("schedule client")
+        .create(
+            &schedule_route,
+            "*/5 * * * *",
+            ScheduleDeliveryMode::Broadcast,
+            b"scheduled",
+        )
+        .await
+        .expect("create schedule");
+    let page = connected
+        .schedule()
+        .expect("schedule client")
+        .list(Some(0), Some(1000))
+        .await
+        .expect("list schedules");
+    assert!(
+        page.entries
+            .iter()
+            .any(|entry| entry.route == schedule_route)
+    );
+    connected
+        .schedule()
+        .expect("schedule client")
+        .cancel(&schedule_route)
+        .await
+        .expect("cancel schedule");
+}
+
+async fn exercise_stream_workflow(connected: &Client) {
+    let stream_route = unique_route("stream");
+    let mut stream = connected
+        .stream()
+        .expect("stream client")
+        .begin(&stream_route, None)
+        .await
+        .expect("begin stream");
+    stream
+        .append(0, b"stream", None, None)
+        .await
+        .expect("append stream");
+    stream
+        .commit(StreamCommitMode::Sync)
+        .await
+        .expect("commit stream");
+    assert_eq!(
+        connected
+            .stream()
+            .expect("stream client")
+            .read(&stream_route, 0, 10, None, None, None)
+            .await
+            .expect("read stream")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires fitz-auth and fitz-anon from compose.yml"]
+async fn should_complete_domain_workflows_given_live_broker_when_clients_exercised() {
+    // Arrange: connect one client using the selected transport and auth leg.
+    let transport = Transport::from_env();
+    let auth_mode = AuthMode::from_env();
+    let connected = client(transport, auth_mode);
+    connected.connect().await.expect("broker connection");
+
+    // Act: exercise every domain's canonical request/response shapes.
+    exercise_queue_workflow(&connected).await;
+    exercise_lease_workflow(&connected).await;
+    exercise_notice_workflow(&connected).await;
+    exercise_rpc_workflow(&connected).await;
+    exercise_schedule_workflow(&connected).await;
+    exercise_stream_workflow(&connected).await;
+
+    // Assert: every workflow completed and the shared connection closes cleanly.
+    connected.close().await.expect("close client");
 }

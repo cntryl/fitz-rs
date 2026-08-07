@@ -36,19 +36,7 @@ jobs:
       - name: Start broker stack
         run: docker compose up -d
 
-      - name: Run broker integration tests
-        run: |
-          cargo test \
-            --features legacy-blocking \
-            --test integration_kv_tcp \
-            --test integration_kv_websocket \
-            --test integration_domains \
-            --test integration_multiprotocol \
-            --test integration_rpc \
-            --test integration_stream \
-            -- --ignored --nocapture
-
-      - name: Run conformance matrix
+      - name: Run broker-backed conformance and domain matrix
         shell: bash
         run: |
           for transport in tcp ws; do
@@ -57,7 +45,7 @@ jobs:
               CONFORMANCE_TRANSPORT="$transport" \
                 CONFORMANCE_AUTH_MODE="$auth_mode" \
                 CONFORMANCE_OUTPUT="$output" \
-                cargo test --test conformance should_complete_default_async_conformance_suite -- --ignored --nocapture
+                cargo test --test conformance -- --ignored --nocapture
             done
           done
 

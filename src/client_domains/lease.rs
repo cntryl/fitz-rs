@@ -74,7 +74,7 @@ impl LeaseClient {
             .connection
             .request(message_type::LEASE_ACQUIRE, e.finish())
             .await?;
-        let mut d = plain_success(&response, "ACQUIRE")?;
+        let mut d = lease_success(&response, "ACQUIRE")?;
         let kind = d.get_u8()?;
         let fencing_token = if kind < 2 {
             d.get_u64()?
@@ -83,7 +83,7 @@ impl LeaseClient {
                 .recv()
                 .await
                 .map_err(|_| FitzError::ConnectionClosed)?;
-            let mut completion = plain_success(&payload, "ACQUIRE")?;
+            let mut completion = lease_success(&payload, "ACQUIRE")?;
             let completion_kind = completion.get_u8()?;
             if completion_kind > 1 {
                 return Err(FitzError::Protocol(
@@ -118,7 +118,7 @@ impl LeaseClient {
             .connection
             .request_replayable(message_type::LEASE_QUERY, e.finish())
             .await?;
-        let mut d = plain_success(&response, "QUERY")?;
+        let mut d = lease_success(&response, "QUERY")?;
         let held = d.get_u8()? == 1;
         if held {
             Ok(LeaseInfo {
@@ -313,7 +313,7 @@ impl LeaseHandle {
             .connection
             .request(message_type::LEASE_RENEW, e.finish())
             .await?;
-        let mut d = plain_success(&response, "RENEW")?;
+        let mut d = lease_success(&response, "RENEW")?;
         self.fencing_token = d.get_u64()?;
         Ok(())
     }
@@ -327,7 +327,7 @@ impl LeaseHandle {
         e.put_string(&self.route)
             .put_string(&self.owner_id)
             .put_u64(self.fencing_token);
-        plain_success(
+        lease_success(
             &self
                 .connection
                 .request(message_type::LEASE_RELEASE, e.finish())
@@ -383,7 +383,7 @@ impl LeaseSubscription {
         self.registration.deactivate();
         let mut e = PayloadEncoder::new();
         e.put_string(&self.route);
-        plain_success(
+        lease_success(
             &self
                 .connection
                 .request(message_type::LEASE_UNSUBSCRIBE, e.finish())
@@ -428,7 +428,7 @@ impl Stream for LeaseSubscription {
 }
 
 fn decode_subscription_id(response: &[u8]) -> Result<u64> {
-    let mut decoder = plain_success(response, "SUBSCRIBE")?;
+    let mut decoder = lease_success(response, "SUBSCRIBE")?;
     let subscription_id = decoder.get_u64()?;
     if !decoder.is_empty() {
         return Err(FitzError::Protocol(
@@ -437,18 +437,19 @@ fn decode_subscription_id(response: &[u8]) -> Result<u64> {
     }
     Ok(subscription_id)
 }
-fn plain_success<'a>(response: &'a [u8], operation: &str) -> Result<PayloadDecoder<'a>> {
+fn lease_success<'a>(response: &'a [u8], operation: &str) -> Result<PayloadDecoder<'a>> {
     let mut d = PayloadDecoder::new(response);
     match d.get_u8()? {
         0 => Ok(d),
         1 => {
+            let code = d.get_u32()?;
             let message = d.get_string()?;
             if !d.is_empty() {
                 return Err(FitzError::Protocol(format!(
                     "Lease {operation} error response has trailing bytes"
                 )));
             }
-            Err(FitzError::Domain { code: 0, message })
+            Err(FitzError::Domain { code, message })
         }
         v => Err(FitzError::Protocol(format!(
             "Lease {operation} returned status {v}"
@@ -483,6 +484,24 @@ mod tests {
             .unwrap();
         stream.write_all(&frame).await.unwrap();
         stream.flush().await.unwrap();
+    }
+
+    #[test]
+    fn should_preserve_domain_code_given_typed_error_when_decoding_lease_response() {
+        // Arrange: build the server's canonical typed Lease error envelope.
+        let mut response = PayloadEncoder::new();
+        response
+            .put_u8(1)
+            .put_u32(5001)
+            .put_string("HeldByOther: worker-1");
+
+        // Act: decode the response through the shared Lease status parser.
+        let Err(error) = lease_success(&response.finish(), "ACQUIRE") else {
+            panic!("typed Lease error decoded as success");
+        };
+
+        // Assert: retain the numeric domain code used by retry and callers.
+        assert!(matches!(error, FitzError::Domain { code: 5001, .. }));
     }
 
     #[tokio::test]
