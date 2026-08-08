@@ -141,25 +141,42 @@ async fn kv_round_trip(client: &Client, durability: KvDurability) -> Result<(), 
 async fn reject_invalid_jwt(transport: Transport) -> Result<(), FitzError> {
     let secret =
         std::env::var("FITZ_BROKER_JWT_HMAC_SECRET").unwrap_or_else(|_| "dev-test-secret".into());
-    let token = jwt::make_invalid_jwt("test-realm", &secret);
-    let invalid = Client::builder(endpoint(transport, AuthMode::ValidJwt), move || {
+    for token in [
+        jwt::make_invalid_jwt("test-realm", &secret),
+        jwt::make_expired_jwt("test-realm", &secret),
+    ] {
+        let rejected = Client::builder(endpoint(transport, AuthMode::ValidJwt), move || {
+            let token = token.clone();
+            async move { Ok(token) }
+        })
+        .request_timeout(Duration::from_secs(2))
+        .build()?;
+        assert!(
+            matches!(
+                rejected.connect().await,
+                Err(FitzError::Authentication { .. })
+            ),
+            "invalid or expired JWT must reject connect"
+        );
+    }
+
+    let token = jwt::make_scoped_jwt("test-realm", &secret, vec!["queue://**#read".to_string()]);
+    let read_only = Client::builder(endpoint(transport, AuthMode::ValidJwt), move || {
         let token = token.clone();
         async move { Ok(token) }
     })
     .request_timeout(Duration::from_secs(2))
     .build()?;
-    if invalid.connect().await.is_ok() {
-        let result = invalid
-            .kv()?
-            .begin(
-                &unique_route("kv"),
-                TransactionMode::ReadWrite,
-                KvDurability::Buffered,
-            )
-            .await;
-        assert!(result.is_err(), "invalid JWT must reject the first request");
-        invalid.close().await?;
-    }
+    read_only.connect().await?;
+    assert!(
+        read_only
+            .queue()?
+            .enqueue(&unique_route("queue"), b"unauthorized", None)
+            .await
+            .is_err(),
+        "read-only JWT must reject queue enqueue"
+    );
+    read_only.close().await?;
     Ok(())
 }
 

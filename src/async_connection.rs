@@ -585,21 +585,30 @@ async fn settle_authentication(session: &mut Session) -> Result<()> {
             }
         }
         Session::WebSocket(socket) => {
-            match tokio::time::timeout(SETTLE_DELAY, socket.next()).await {
-                Err(_) => Ok(()),
-                Ok(Some(Ok(Message::Ping(payload)))) => {
-                    socket
+            let deadline = tokio::time::Instant::now() + SETTLE_DELAY;
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Ok(());
+                }
+                match tokio::time::timeout(remaining, socket.next()).await {
+                    Err(_) => return Ok(()),
+                    Ok(Some(Ok(Message::Ping(payload)))) => socket
                         .send(Message::Pong(payload))
                         .await
-                        .map_err(|error| FitzError::Transport(error.to_string()))?;
-                    Ok(())
+                        .map_err(|error| FitzError::Transport(error.to_string()))?,
+                    Ok(Some(Ok(Message::Pong(_)))) => {}
+                    Ok(Some(Ok(_)) | None) => {
+                        return Err(FitzError::Authentication {
+                            message: "broker closed the connection during authentication".into(),
+                        });
+                    }
+                    Ok(Some(Err(error))) => {
+                        return Err(FitzError::Authentication {
+                            message: error.to_string(),
+                        });
+                    }
                 }
-                Ok(Some(Ok(_)) | None) => Err(FitzError::Authentication {
-                    message: "broker closed the connection during authentication".into(),
-                }),
-                Ok(Some(Err(error))) => Err(FitzError::Authentication {
-                    message: error.to_string(),
-                }),
             }
         }
     }
