@@ -15,15 +15,42 @@ struct TestTokenClaims {
 
 #[must_use]
 pub fn make_test_jwt(realm: &str, secret: &str) -> String {
-    make_signed_jwt(realm, secret)
+    make_signed_jwt(realm, secret, 3600, all_permissions())
 }
 
 #[must_use]
 pub fn make_invalid_jwt(realm: &str, secret: &str) -> String {
-    make_signed_jwt(realm, &format!("{secret}-invalid"))
+    make_signed_jwt(realm, &format!("{secret}-invalid"), 3600, all_permissions())
 }
 
-fn make_signed_jwt(_realm: &str, secret: &str) -> String {
+#[must_use]
+pub fn make_expired_jwt(realm: &str, secret: &str) -> String {
+    make_signed_jwt(realm, secret, -60, all_permissions())
+}
+
+#[must_use]
+pub fn make_scoped_jwt(realm: &str, secret: &str, permissions: Vec<String>) -> String {
+    make_signed_jwt(realm, secret, 3600, permissions)
+}
+
+fn all_permissions() -> Vec<String> {
+    vec![
+        "kv://**#*".to_string(),
+        "queue://**#*".to_string(),
+        "rpc://**#*".to_string(),
+        "notice://**#*".to_string(),
+        "lease://**#*".to_string(),
+        "stream://**#*".to_string(),
+        "schedule://**#*".to_string(),
+    ]
+}
+
+fn make_signed_jwt(
+    _realm: &str,
+    secret: &str,
+    expires_in_seconds: i64,
+    permissions: Vec<String>,
+) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock drift")
@@ -35,17 +62,9 @@ fn make_signed_jwt(_realm: &str, secret: &str) -> String {
         aud: audience,
         sub: "fitz-rs-tests".to_string(),
         tid: std::env::var("FITZ_BROKER_JWT_TENANT").unwrap_or_else(|_| "dev".to_string()),
-        exp: now + 3600,
+        exp: now.saturating_add_signed(expires_in_seconds),
         iat: now,
-        permissions: vec![
-            "kv://**#*".to_string(),
-            "queue://**#*".to_string(),
-            "rpc://**#*".to_string(),
-            "notice://**#*".to_string(),
-            "lease://**#*".to_string(),
-            "stream://**#*".to_string(),
-            "schedule://**#*".to_string(),
-        ],
+        permissions,
     };
 
     encode(

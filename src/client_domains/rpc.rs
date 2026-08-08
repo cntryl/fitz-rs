@@ -46,11 +46,7 @@ impl RpcClient {
     /// Returns an error when validation, transport, or broker processing fails.
     pub async fn register_worker(&self, pattern: &str, max_concurrency: u32) -> Result<RpcWorker> {
         validate_registration_pattern(pattern, "rpc", 0)?;
-        if max_concurrency == 0 {
-            return Err(FitzError::Protocol(
-                "max_concurrency must be positive".into(),
-            ));
-        }
+        validate_worker_concurrency(max_concurrency)?;
         let receiver = self.connection.notifications(message_type::RPC_REQUEST, 64);
         let mut e = PayloadEncoder::new();
         e.put_string(pattern).put_u32(max_concurrency);
@@ -74,6 +70,16 @@ impl RpcClient {
             registration,
             closed: false,
         })
+    }
+}
+
+fn validate_worker_concurrency(max_concurrency: u32) -> Result<()> {
+    if (1..=1024).contains(&max_concurrency) {
+        Ok(())
+    } else {
+        Err(FitzError::Protocol(
+            "max_concurrency must be between 1 and 1024".into(),
+        ))
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -274,5 +280,32 @@ mod tests {
         assert_eq!(sequence, 7);
         assert!(end);
         assert!(body.is_empty());
+    }
+
+    #[test]
+    fn should_accept_worker_concurrency_at_wire_boundaries() {
+        // Arrange
+        let valid = [1, 1024];
+
+        // Act
+        let results = valid.map(validate_worker_concurrency);
+
+        // Assert
+        assert!(results.into_iter().all(|result| result.is_ok()));
+    }
+
+    #[test]
+    fn should_reject_worker_concurrency_outside_wire_range() {
+        // Arrange
+        let invalid = [0, 1025, u32::MAX];
+
+        // Act
+        let results = invalid.map(validate_worker_concurrency);
+
+        // Assert
+        assert!(results.into_iter().all(|result| matches!(
+            result,
+            Err(FitzError::Protocol(message)) if message == "max_concurrency must be between 1 and 1024"
+        )));
     }
 }
