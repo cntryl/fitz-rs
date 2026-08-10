@@ -7,6 +7,7 @@ use cntryl_fitz::client_domains::stream::StreamCommitMode;
 use cntryl_fitz::{Client, FitzError, KvDurability, TransactionMode};
 use futures_util::StreamExt;
 use serde::Serialize;
+use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -559,4 +560,43 @@ async fn should_complete_domain_workflows_given_live_broker_when_clients_exercis
 
     // Assert: every workflow completed and the shared connection closes cleanly.
     connected.close().await.expect("close client");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires fitz-auth and fitz-anon from compose.yml"]
+async fn should_increase_managed_lease_authority_after_handoff() {
+    // Arrange: connect independent owners over the selected transport and auth matrix leg.
+    let transport = Transport::from_env();
+    let auth_mode = AuthMode::from_env();
+    let first = client(transport, auth_mode);
+    let successor = client(transport, auth_mode);
+    first.connect().await.expect("first broker connection");
+    successor
+        .connect()
+        .await
+        .expect("successor broker connection");
+    let route = unique_route("lease");
+
+    // Act: release one managed owner before admitting its successor on the same route.
+    let first_token = first
+        .lease()
+        .expect("first lease client")
+        .with_lease_authority(&route, "first", 30, |_, authority| async move {
+            Ok::<u64, Infallible>(authority.fencing_token)
+        })
+        .await
+        .expect("first managed lease");
+    let successor_token = successor
+        .lease()
+        .expect("successor lease client")
+        .with_lease_authority(&route, "successor", 30, |_, authority| async move {
+            Ok::<u64, Infallible>(authority.fencing_token)
+        })
+        .await
+        .expect("successor managed lease");
+
+    // Assert: each new ownership receives a strictly greater admission fence.
+    assert!(successor_token > first_token);
+    first.close().await.expect("close first client");
+    successor.close().await.expect("close successor client");
 }

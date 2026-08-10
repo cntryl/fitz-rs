@@ -95,9 +95,41 @@ must recover on the same `Client` instance.
 ## Managed leases
 
 `LeaseClient::with_lease` and `with_lease_with_options` supervise acquisition, renewal,
-callback cancellation, and release without blocking Tokio executor threads. The low-level
-API remains deliberately stateless: callers must replace the fencing token after every
-successful `extend`, and must treat any uncertain renewal as ownership loss.
+callback cancellation, and release without blocking Tokio executor threads. Their original
+one-argument callback shape remains supported. Use `with_lease_authority` or
+`with_lease_authority_with_options` when application code also needs the broker-issued
+admission fence:
+
+```rust,no_run
+# use cntryl_fitz::Client;
+# async fn run(client: &Client) {
+client
+    .lease()
+    .expect("lease client")
+    .with_lease_authority(
+        "lease://my-realm/locks/leader",
+        "worker-1",
+        30,
+        |cancellation, authority| async move {
+            while !cancellation.is_cancelled() {
+                perform_fenced_step(authority.fencing_token).await?;
+            }
+            Ok::<(), &'static str>(())
+        },
+    )
+    .await
+    .expect("managed lease");
+# }
+# async fn perform_fenced_step(_fencing_token: u64) -> Result<(), &'static str> { Ok(()) }
+```
+
+`LeaseAuthority::fencing_token` is copied from the final successful ACQUIRE response and
+stays fixed for that callback even when managed renewal rotates the handle's live credential.
+Tokens are ordered only across successive ownership of the same exact lease route. External
+stores should atomically retain the greatest accepted token and reject lower values; do not
+compare the admission snapshot for equality with a later live broker token. Low-level lease
+handles rotate their private live credential after every successful `extend` and become stale
+after an uncertain renewal.
 
 ## Development
 

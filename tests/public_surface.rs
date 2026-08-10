@@ -1,5 +1,7 @@
 use std::fs;
 
+use cntryl_fitz::client_domains::lease::LeaseAuthority;
+
 fn read_source(path: &str) -> String {
     fs::read_to_string(path).expect("failed to read source file")
 }
@@ -57,4 +59,17 @@ fn should_keep_queue_reservation_tokens_private() {
     assert!(source.contains("token: u64,"));
     assert!(!source.contains("pub id: u64,"));
     assert!(!source.contains("pub token: u64,"));
+}
+
+#[test]
+fn should_export_copy_lease_authority() {
+    // Arrange: construct the public admission-authority value.
+    let authority = LeaseAuthority { fencing_token: 42 };
+
+    // Act: copy the snapshot without borrowing mutable lease state.
+    let copied = authority;
+
+    // Assert: the public field retains the exact admission fencing epoch.
+    assert_eq!(authority.fencing_token, 42);
+    assert_eq!(copied, authority);
 }
