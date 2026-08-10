@@ -2,6 +2,7 @@
 
 ## 0.2.0 - Unreleased
 
+- Add authority-aware managed lease methods with a stable broker-issued admission fencing token.
 - Breaking: Schedule listing uses canonical message 702 with offset/limit and `total_count`.
 - Breaking: Queue delays are expressed in wire-shaped seconds, and Lease acquisition exposes `wait_seconds`.
 - Breaking: Queue notifications expose the canonical opaque length-prefixed payload.
