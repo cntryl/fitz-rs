@@ -119,7 +119,13 @@ fn should_decode_global_offsets_given_each_global_selector_alias() {
         .put_u64(13);
     let payload = encoder.finish();
 
-    for selector in ["stream://**", "stream://*/*/*"] {
+    for selector in [
+        "stream://*/area/resource",
+        "stream://*/area/*",
+        "stream://*/*/resource",
+        "stream://*/*/*",
+        "stream://**",
+    ] {
         // Act
         let page = parse_stream_read_page_with_scope(&payload, selector).unwrap();
 

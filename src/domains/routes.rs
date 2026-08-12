@@ -35,24 +35,24 @@ pub fn validate_registration_pattern(
     invalid("registration pattern cannot match the required route depth")
 }
 
-/// Validate the full selector matrix shared by Stream READ and SUBSCRIBE.
-pub fn validate_stream_selector(route: &str) -> Result<()> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StreamSelectorScope {
+    Resource,
+    Area,
+    Realm,
+    Global,
+}
+
+pub(crate) fn classify_stream_selector(route: &str) -> Result<StreamSelectorScope> {
     if route == "stream://**" {
-        return Ok(());
+        return Ok(StreamSelectorScope::Global);
     }
     scan(route, "stream")?;
     let Some(path) = route.strip_prefix("stream://") else {
         return invalid("stream selector has the wrong scheme");
     };
-    let parts = path.split('/').collect::<Vec<_>>();
-    if let [realm, "**"] = parts.as_slice()
-        && !realm.is_empty()
-        && !realm.contains('*')
-    {
-        return Ok(());
-    }
-    let mut segments = parts.into_iter();
-    let (Some(realm), Some(area), Some(resource), None) = (
+    let mut segments = path.split('/');
+    let (Some(realm), Some(area), resource, None) = (
         segments.next(),
         segments.next(),
         segments.next(),
@@ -60,14 +60,33 @@ pub fn validate_stream_selector(route: &str) -> Result<()> {
     ) else {
         return invalid("stream selector has the wrong shape");
     };
+    if resource.is_none() && area == "**" && !realm.is_empty() && !realm.contains('*') {
+        return Ok(StreamSelectorScope::Realm);
+    }
+    let Some(resource) = resource else {
+        return invalid("stream selector has the wrong shape");
+    };
     let literal = |segment: &str| !segment.contains('*');
     if (literal(realm) || realm == "*")
         && (literal(area) || area == "*")
         && (literal(resource) || resource == "*")
     {
-        return Ok(());
+        return Ok(if realm == "*" {
+            StreamSelectorScope::Global
+        } else if area == "*" {
+            StreamSelectorScope::Realm
+        } else if resource == "*" {
+            StreamSelectorScope::Area
+        } else {
+            StreamSelectorScope::Resource
+        });
     }
     invalid("stream selector has the wrong shape")
+}
+
+/// Validate the full selector matrix shared by Stream READ and SUBSCRIBE.
+pub fn validate_stream_selector(route: &str) -> Result<()> {
+    classify_stream_selector(route).map(|_| ())
 }
 
 #[must_use]

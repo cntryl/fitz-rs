@@ -270,7 +270,8 @@ pub(crate) fn parse_stream_read_page_with_scope(
     buf: &[u8],
     selector: &str,
 ) -> Result<StreamReadPage> {
-    let global = matches!(selector, "stream://**" | "stream://*/*/*");
+    let global = crate::domains::routes::classify_stream_selector(selector)?
+        == crate::domains::routes::StreamSelectorScope::Global;
     if buf.is_empty() {
         return Ok(StreamReadPage {
             items: Vec::new(),
