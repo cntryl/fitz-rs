@@ -67,6 +67,10 @@ Schedule listing uses `list(offset, limit)` on message 702 and returns
 `total_count`. Global stream continuations reuse the returned fingerprint and
 captured-watermark pair.
 
+Schedule backend unavailability and broker saturation use the distinct coded
+error `error_code::SCHEDULE_BACKEND_ERROR` (`7010`). It is retryable subject to
+operation safety and is never mapped to a cron or parse error.
+
 ## Local broker
 
 ```console

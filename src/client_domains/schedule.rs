@@ -407,6 +407,25 @@ mod tests {
     }
 
     #[test]
+    fn should_preserve_schedule_backend_code_given_coded_error_response() {
+        let mut encoder = PayloadEncoder::new();
+        encoder
+            .put_u8(1)
+            .put_u32(crate::error::error_code::SCHEDULE_BACKEND_ERROR)
+            .put_string("backend busy");
+        let payload = encoder.finish();
+
+        let Err(error) = success(&payload, "LIST") else {
+            panic!("coded Schedule backend error unexpectedly decoded as success");
+        };
+
+        assert!(matches!(
+            error,
+            FitzError::Domain { code: 7010, ref message } if message == "backend busy"
+        ));
+    }
+
+    #[test]
     fn should_reject_schedule_list_page_given_trailing_bytes() {
         // Arrange
         let mut encoder = PayloadEncoder::new();
