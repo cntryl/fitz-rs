@@ -16,6 +16,7 @@ pub mod error_code {
     pub const RPC_SUBSCRIPTION_LIMIT: u32 = 6013;
     pub const SCHEDULE_INVALID_SUBSCRIPTION_PATTERN: u32 = 7006;
     pub const SCHEDULE_SUBSCRIPTION_LIMIT: u32 = 7007;
+    pub const SCHEDULE_BACKEND_ERROR: u32 = 7010;
 }
 
 /// Stable error categories exposed by the SDK.
@@ -102,7 +103,7 @@ impl FitzError {
             | Self::Transport(_)
             | Self::Backpressure(_)
             | Self::ConnectionClosed => true,
-            Self::Domain { code, .. } => matches!(code, 1004 | 4005 | 5001 | 6001..=6004),
+            Self::Domain { code, .. } => matches!(code, 1004 | 4005 | 5001 | 6001..=6004 | 7010),
             _ => false,
         }
     }
@@ -162,6 +163,17 @@ mod tests {
 
         // Assert
         assert!(retryable);
+    }
+
+    #[test]
+    fn should_classify_schedule_backend_error_as_retryable() {
+        let error = FitzError::Domain {
+            code: error_code::SCHEDULE_BACKEND_ERROR,
+            message: "backend busy".to_string(),
+        };
+
+        assert_eq!(error_code::SCHEDULE_BACKEND_ERROR, 7010);
+        assert!(error.is_retryable());
     }
 
     #[test]
