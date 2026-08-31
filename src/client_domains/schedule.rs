@@ -408,6 +408,7 @@ mod tests {
 
     #[test]
     fn should_preserve_schedule_backend_code_given_coded_error_response() {
+        // Arrange
         let mut encoder = PayloadEncoder::new();
         encoder
             .put_u8(1)
@@ -415,10 +416,12 @@ mod tests {
             .put_string("backend busy");
         let payload = encoder.finish();
 
+        // Act
         let Err(error) = success(&payload, "LIST") else {
             panic!("coded Schedule backend error unexpectedly decoded as success");
         };
 
+        // Assert
         assert!(matches!(
             error,
             FitzError::Domain { code: 7010, ref message } if message == "backend busy"

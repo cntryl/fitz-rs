@@ -212,6 +212,7 @@ fn scan(route: &str, scheme: &str) -> Result<Shape> {
         wildcard_suffix: true,
     };
     let mut segment_start = start;
+    let mut prev_double_wildcard = false;
     for index in start..=bytes.len() {
         if index != bytes.len() && bytes[index] != b'/' {
             continue;
@@ -226,6 +227,9 @@ fn scan(route: &str, scheme: &str) -> Result<Shape> {
             shape.first_wildcard.get_or_insert(shape.segments);
             shape.double_wildcard |= double_wildcard;
             if double_wildcard {
+                if prev_double_wildcard {
+                    return invalid("adjacent ** segments are not allowed");
+                }
                 shape.double_wildcard_count += 1;
             }
         } else {
@@ -236,6 +240,7 @@ fn scan(route: &str, scheme: &str) -> Result<Shape> {
                 shape.wildcard_suffix = false;
             }
         }
+        prev_double_wildcard = double_wildcard;
         shape.segments += 1;
         segment_start = index + 1;
     }
@@ -297,7 +302,9 @@ mod tests {
             "queue://realm/**",
             "queue://*/area/resource",
             "queue://**/resource",
-            "queue://realm/**/**",
+            "queue://**/renderers/**",
+            "queue://realm/**",
+            "queue://**",
         ];
 
         // Act
@@ -305,6 +312,25 @@ mod tests {
 
         // Assert
         assert!(results.iter().all(Result::is_ok));
+    }
+
+    #[test]
+    fn should_reject_adjacent_double_wildcard_segments_given_registration_pattern_when_validation_runs()
+     {
+        // Arrange: the broker's compiler rejects two literally consecutive `**`
+        // segments (`windows(2).any(|pair| pair == ["**", "**"]`), but must keep
+        // accepting `**` separated by a literal segment (e.g. `**/renderers/**`).
+        let patterns = [
+            "queue://acme/**/**",
+            "queue://**/**",
+            "queue://**/**/resource",
+        ];
+
+        // Act
+        let results = patterns.map(|pattern| validate_registration_pattern(pattern, "queue", 3));
+
+        // Assert
+        assert!(results.iter().all(Result::is_err));
     }
 
     #[test]

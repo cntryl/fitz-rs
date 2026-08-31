@@ -81,6 +81,7 @@ pub(crate) struct AsyncConnection {
     generation: Arc<AtomicU64>,
     close_requested: Arc<AtomicBool>,
     notifications: Arc<parking_lot::Mutex<HashMap<u16, broadcast::Sender<Vec<u8>>>>>,
+    notification_epoch: Arc<parking_lot::Mutex<u64>>,
     registrations: Arc<parking_lot::Mutex<HashMap<u64, Registration>>>,
     next_registration_id: Arc<AtomicU64>,
     timeout: Duration,
@@ -115,6 +116,7 @@ impl AsyncConnection {
         let (commands, command_rx) = mpsc::channel(max_queued.max(1));
         let (cancellations, cancellation_rx) = mpsc::unbounded_channel();
         let notifications = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let notification_epoch = Arc::new(parking_lot::Mutex::new(0));
         let generation = Arc::new(AtomicU64::new(0));
         let close_requested = Arc::new(AtomicBool::new(false));
         let registrations = Arc::new(parking_lot::Mutex::new(HashMap::new()));
@@ -129,6 +131,7 @@ impl AsyncConnection {
             commands: command_rx,
             cancellations: cancellation_rx,
             notifications: Arc::clone(&notifications),
+            notification_epoch: Arc::clone(&notification_epoch),
             generation: Arc::clone(&generation),
             close_requested: Arc::clone(&close_requested),
             registrations: Arc::clone(&registrations),
@@ -140,6 +143,7 @@ impl AsyncConnection {
             generation,
             close_requested,
             notifications,
+            notification_epoch,
             registrations,
             next_registration_id: Arc::new(AtomicU64::new(1)),
             timeout,
@@ -294,6 +298,23 @@ impl AsyncConnection {
             .subscribe()
     }
 
+    pub(crate) fn notification_epoch(&self) -> u64 {
+        *self.notification_epoch.lock()
+    }
+
+    pub(crate) fn install_if_notification_epoch(
+        &self,
+        expected: u64,
+        install: impl FnOnce(),
+    ) -> bool {
+        let epoch = self.notification_epoch.lock();
+        if *epoch != expected {
+            return false;
+        }
+        install();
+        true
+    }
+
     pub(crate) async fn close(&self) {
         self.close_requested.store(true, Ordering::Release);
         let (tx, rx) = oneshot::channel();
@@ -361,6 +382,7 @@ struct Supervisor {
     commands: mpsc::Receiver<Command>,
     cancellations: mpsc::UnboundedReceiver<u64>,
     notifications: Arc<parking_lot::Mutex<HashMap<u16, broadcast::Sender<Vec<u8>>>>>,
+    notification_epoch: Arc<parking_lot::Mutex<u64>>,
     generation: Arc<AtomicU64>,
     close_requested: Arc<AtomicBool>,
     registrations: Arc<parking_lot::Mutex<HashMap<u64, Registration>>>,
@@ -792,9 +814,7 @@ async fn round_trip_session(
         if message_type == expected_message_type {
             return Ok(payload);
         }
-        if let Some(sender) = supervisor.notifications.lock().get(&message_type) {
-            let _ = sender.send(payload);
-        }
+        publish_notification(supervisor, message_type, payload);
     }
 }
 
@@ -848,9 +868,16 @@ fn dispatch(
         }
         return;
     }
-    if let Some(sender) = supervisor.notifications.lock().get(&message_type) {
-        let _ = sender.send(payload);
-    }
+    publish_notification(supervisor, message_type, payload);
+}
+
+fn publish_notification(supervisor: &Supervisor, message_type: u16, payload: Vec<u8>) {
+    let Some(sender) = supervisor.notifications.lock().get(&message_type).cloned() else {
+        return;
+    };
+    let mut epoch = supervisor.notification_epoch.lock();
+    *epoch = epoch.wrapping_add(1);
+    let _ = sender.send(payload);
 }
 
 fn cancel_pending(pending: &mut HashMap<u16, VecDeque<PendingRequest>>, id: u64) -> bool {
@@ -985,6 +1012,7 @@ mod tests {
             commands,
             cancellations,
             notifications: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            notification_epoch: Arc::new(parking_lot::Mutex::new(0)),
             generation,
             close_requested: Arc::new(AtomicBool::new(false)),
             registrations: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -1070,6 +1098,7 @@ mod tests {
             commands,
             cancellations,
             notifications: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            notification_epoch: Arc::new(parking_lot::Mutex::new(0)),
             generation: Arc::new(AtomicU64::new(0)),
             close_requested: Arc::new(AtomicBool::new(false)),
             registrations,
