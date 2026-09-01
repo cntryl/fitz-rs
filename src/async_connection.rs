@@ -79,9 +79,10 @@ pub(crate) struct AsyncConnection {
     cancellations: mpsc::UnboundedSender<u64>,
     next_request_id: Arc<AtomicU64>,
     generation: Arc<AtomicU64>,
+    generation_watch: watch::Sender<u64>,
     close_requested: Arc<AtomicBool>,
     notifications: Arc<parking_lot::Mutex<HashMap<u16, broadcast::Sender<Vec<u8>>>>>,
-    notification_epoch: Arc<parking_lot::Mutex<u64>>,
+    notification_epoch: Arc<parking_lot::Mutex<HashMap<u16, Arc<parking_lot::Mutex<u64>>>>>,
     registrations: Arc<parking_lot::Mutex<HashMap<u64, Registration>>>,
     next_registration_id: Arc<AtomicU64>,
     timeout: Duration,
@@ -116,8 +117,9 @@ impl AsyncConnection {
         let (commands, command_rx) = mpsc::channel(max_queued.max(1));
         let (cancellations, cancellation_rx) = mpsc::unbounded_channel();
         let notifications = Arc::new(parking_lot::Mutex::new(HashMap::new()));
-        let notification_epoch = Arc::new(parking_lot::Mutex::new(0));
+        let notification_epoch = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let generation = Arc::new(AtomicU64::new(0));
+        let (generation_watch, _) = watch::channel(0_u64);
         let close_requested = Arc::new(AtomicBool::new(false));
         let registrations = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         tokio::spawn(supervise(Supervisor {
@@ -133,6 +135,7 @@ impl AsyncConnection {
             notifications: Arc::clone(&notifications),
             notification_epoch: Arc::clone(&notification_epoch),
             generation: Arc::clone(&generation),
+            generation_watch: generation_watch.clone(),
             close_requested: Arc::clone(&close_requested),
             registrations: Arc::clone(&registrations),
         }));
@@ -141,6 +144,7 @@ impl AsyncConnection {
             cancellations,
             next_request_id: Arc::new(AtomicU64::new(1)),
             generation,
+            generation_watch,
             close_requested,
             notifications,
             notification_epoch,
@@ -152,7 +156,9 @@ impl AsyncConnection {
     }
 
     pub(crate) async fn connect(&self) -> Result<()> {
-        self.close_requested.store(false, Ordering::Release);
+        if self.is_closed() {
+            return Err(FitzError::Closed);
+        }
         let (tx, rx) = oneshot::channel();
         tokio::time::timeout(self.timeout, self.commands.send(Command::Connect(tx)))
             .await
@@ -298,16 +304,30 @@ impl AsyncConnection {
             .subscribe()
     }
 
-    pub(crate) fn notification_epoch(&self) -> u64 {
-        *self.notification_epoch.lock()
+    /// Returns the current notification epoch scoped to `message_type`.
+    ///
+    /// Each message type tracks its own independent, monotonically
+    /// increasing counter so notification traffic from another domain on a
+    /// shared connection never perturbs a caller watching this type for a
+    /// race-safe install. Notifications for another registration of the
+    /// same message type conservatively advance the shared type epoch.
+    pub(crate) fn notification_epoch(&self, message_type: u16) -> u64 {
+        *epoch_slot(&self.notification_epoch, message_type).lock()
     }
 
+    /// Runs `install` and returns `true` only if `message_type`'s epoch is
+    /// still `expected`, i.e. no notification of that type has been
+    /// dispatched since the caller last read the epoch. The per-type lock is
+    /// held only for the duration of `install`, so it never blocks dispatch
+    /// of any other message type.
     pub(crate) fn install_if_notification_epoch(
         &self,
+        message_type: u16,
         expected: u64,
         install: impl FnOnce(),
     ) -> bool {
-        let epoch = self.notification_epoch.lock();
+        let slot = epoch_slot(&self.notification_epoch, message_type);
+        let epoch = slot.lock();
         if *epoch != expected {
             return false;
         }
@@ -316,7 +336,11 @@ impl AsyncConnection {
     }
 
     pub(crate) async fn close(&self) {
-        self.close_requested.store(true, Ordering::Release);
+        if self.close_requested.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let closed_generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.generation_watch.send_replace(closed_generation);
         let (tx, rx) = oneshot::channel();
         if tokio::time::timeout(self.timeout, self.commands.send(Command::Close(tx)))
             .await
@@ -328,6 +352,17 @@ impl AsyncConnection {
 
     pub(crate) fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.close_requested.load(Ordering::Acquire)
+    }
+
+    /// Returns a reactive receiver over the connection's generation,
+    /// so a caller can `await` a reconnect (any change) instead of polling
+    /// [`Self::generation`] on a timer.
+    pub(crate) fn generation_changes(&self) -> watch::Receiver<u64> {
+        self.generation_watch.subscribe()
     }
 
     pub(crate) fn register_restorable(
@@ -382,10 +417,24 @@ struct Supervisor {
     commands: mpsc::Receiver<Command>,
     cancellations: mpsc::UnboundedReceiver<u64>,
     notifications: Arc<parking_lot::Mutex<HashMap<u16, broadcast::Sender<Vec<u8>>>>>,
-    notification_epoch: Arc<parking_lot::Mutex<u64>>,
+    notification_epoch: Arc<parking_lot::Mutex<HashMap<u16, Arc<parking_lot::Mutex<u64>>>>>,
     generation: Arc<AtomicU64>,
+    generation_watch: watch::Sender<u64>,
     close_requested: Arc<AtomicBool>,
     registrations: Arc<parking_lot::Mutex<HashMap<u64, Registration>>>,
+}
+
+/// Returns (creating if absent) the per-message-type epoch counter's lock.
+fn epoch_slot(
+    epochs: &parking_lot::Mutex<HashMap<u16, Arc<parking_lot::Mutex<u64>>>>,
+    message_type: u16,
+) -> Arc<parking_lot::Mutex<u64>> {
+    Arc::clone(
+        epochs
+            .lock()
+            .entry(message_type)
+            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(0))),
+    )
 }
 
 async fn supervise(mut supervisor: Supervisor) {
@@ -450,7 +499,8 @@ async fn connect_and_run(
                     if matches!(result, SessionResult::Closed) {
                         return Ok(());
                     }
-                    supervisor.generation.fetch_add(1, Ordering::AcqRel);
+                    let new_generation = supervisor.generation.fetch_add(1, Ordering::AcqRel) + 1;
+                    supervisor.generation_watch.send_replace(new_generation);
                     emit_lifecycle(supervisor, "connection_lost");
                     tracing::warn!(
                         generation = supervisor.generation.load(Ordering::Acquire),
@@ -875,8 +925,11 @@ fn publish_notification(supervisor: &Supervisor, message_type: u16, payload: Vec
     let Some(sender) = supervisor.notifications.lock().get(&message_type).cloned() else {
         return;
     };
-    let mut epoch = supervisor.notification_epoch.lock();
-    *epoch = epoch.wrapping_add(1);
+    {
+        let slot = epoch_slot(&supervisor.notification_epoch, message_type);
+        let mut epoch = slot.lock();
+        *epoch = epoch.wrapping_add(1);
+    }
     let _ = sender.send(payload);
 }
 
@@ -1012,8 +1065,9 @@ mod tests {
             commands,
             cancellations,
             notifications: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            notification_epoch: Arc::new(parking_lot::Mutex::new(0)),
+            notification_epoch: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             generation,
+            generation_watch: watch::channel(0_u64).0,
             close_requested: Arc::new(AtomicBool::new(false)),
             registrations: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         };
@@ -1098,8 +1152,9 @@ mod tests {
             commands,
             cancellations,
             notifications: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            notification_epoch: Arc::new(parking_lot::Mutex::new(0)),
+            notification_epoch: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             generation: Arc::new(AtomicU64::new(0)),
+            generation_watch: watch::channel(0_u64).0,
             close_requested: Arc::new(AtomicBool::new(false)),
             registrations,
         };
