@@ -554,7 +554,7 @@ async fn observe_loop(
     shutdown: CancellationToken,
 ) {
     'outer: loop {
-        if shutdown.is_cancelled() {
+        if shutdown.is_cancelled() || client.connection.is_closed() {
             break;
         }
 
@@ -577,6 +577,7 @@ async fn observe_loop(
                 result = bootstrap(&client, &pattern, options.list_page_size, &mut subscription, &view, &ready) => {
                     match result {
                         Ok(()) => break,
+                        Err(FitzError::Closed) => break 'outer,
                         Err(error) if subscription_must_be_replaced(&error) => {
                             ready.store(false, Ordering::Release);
                             if !replace_observer_subscription(
@@ -659,9 +660,13 @@ async fn replace_observer_subscription(
         tokio::select! {
             () = shutdown.cancelled() => return false,
             replacement = client.subscribe(pattern) => {
-                if let Ok(replacement) = replacement {
-                    *subscription = replacement;
-                    return true;
+                match replacement {
+                    Ok(replacement) => {
+                        *subscription = replacement;
+                        return true;
+                    }
+                    Err(FitzError::Closed) => return false,
+                    Err(_) => {}
                 }
             }
         }
@@ -798,12 +803,14 @@ async fn steady_state(
                         .await
                         {
                             Ok(()) => {}
+                            Err(FitzError::Closed) => return SteadyStateExit::Shutdown,
                             Err(error) if subscription_must_be_replaced(&error) => {
                                 return SteadyStateExit::SubscriptionFailed;
                             }
                             Err(_) => return SteadyStateExit::Reconnected,
                         }
                     }
+                    Some(Err(FitzError::Closed)) => return SteadyStateExit::Shutdown,
                     Some(Err(_)) | None => return SteadyStateExit::SubscriptionFailed,
                 }
             }
@@ -815,6 +822,7 @@ async fn steady_state(
                     subscription,
                     view,
                 ).await {
+                    Err(FitzError::Closed) => return SteadyStateExit::Shutdown,
                     Err(error) if subscription_must_be_replaced(&error) => {
                         return SteadyStateExit::SubscriptionFailed;
                     }
@@ -2431,6 +2439,54 @@ mod tests {
             .expect("server script timed out")
             .unwrap();
         connection.close().await;
+    }
+
+    #[tokio::test]
+    async fn should_stop_observer_recovery_when_client_connection_is_closed() {
+        // Arrange
+        let (client, connection, server) = connected_lease_client(|mut stream| async move {
+            assert_eq!(
+                read_frame(&mut stream).await.0,
+                message_type::LEASE_SUBSCRIBE
+            );
+            write_frame(
+                &mut stream,
+                message_type::LEASE_SUBSCRIBE,
+                &token_response(1),
+            )
+            .await;
+            assert_eq!(read_frame(&mut stream).await.0, message_type::LEASE_LIST);
+            write_frame(
+                &mut stream,
+                message_type::LEASE_LIST,
+                &list_response(&[], None),
+            )
+            .await;
+
+            let mut byte = [0_u8; 1];
+            assert_eq!(stream.read(&mut byte).await.unwrap(), 0);
+        })
+        .await;
+        let observer = client
+            .observe("lease://acme/**", ObserveOptions::default())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), wait_until(|| observer.is_ready()))
+            .await
+            .expect("observer never became ready");
+
+        // Act
+        connection.close().await;
+
+        // Assert
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            wait_until(|| observer.task.as_ref().is_some_and(JoinHandle::is_finished)),
+        )
+        .await
+        .expect("observer kept retrying after permanent client close");
+        observer.close().await;
+        server.await.unwrap();
     }
 
     #[tokio::test]

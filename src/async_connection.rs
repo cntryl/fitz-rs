@@ -156,7 +156,9 @@ impl AsyncConnection {
     }
 
     pub(crate) async fn connect(&self) -> Result<()> {
-        self.close_requested.store(false, Ordering::Release);
+        if self.is_closed() {
+            return Err(FitzError::Closed);
+        }
         let (tx, rx) = oneshot::channel();
         tokio::time::timeout(self.timeout, self.commands.send(Command::Connect(tx)))
             .await
@@ -334,7 +336,11 @@ impl AsyncConnection {
     }
 
     pub(crate) async fn close(&self) {
-        self.close_requested.store(true, Ordering::Release);
+        if self.close_requested.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let closed_generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.generation_watch.send_replace(closed_generation);
         let (tx, rx) = oneshot::channel();
         if tokio::time::timeout(self.timeout, self.commands.send(Command::Close(tx)))
             .await
@@ -346,6 +352,10 @@ impl AsyncConnection {
 
     pub(crate) fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.close_requested.load(Ordering::Acquire)
     }
 
     /// Returns a reactive receiver over the connection's generation,
