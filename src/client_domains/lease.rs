@@ -472,7 +472,11 @@ pub struct LeaseListPage {
 pub struct ObserveOptions {
     /// Base interval between full-relist backstop reconciliations. The
     /// interval actually used for each tick is jittered by up to ±20% so a
-    /// fleet of observers does not all reconcile in lockstep.
+    /// fleet of observers does not all reconcile in lockstep. For a known
+    /// workload, use `clamp(shortest expected lease TTL / 2, 5s, 60s)`:
+    /// this targets two backstop passes during the shortest
+    /// lease lifetime without polling faster than one bounded full LIST
+    /// every five seconds per observer.
     pub reconciliation_interval: Duration,
     /// Page size used while paging LIST to completion during bootstrap and
     /// reconciliation.
