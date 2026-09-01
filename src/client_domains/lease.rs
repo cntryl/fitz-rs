@@ -227,17 +227,22 @@ impl LeaseClient {
             })
         }
     }
-    /// Performs the operation asynchronously.
+    /// Subscribes to Lease change notifications for every route matching
+    /// `pattern`. Like every other domain's `subscribe`, this accepts the
+    /// full registration-pattern grammar (`*`/`**` wildcards), not just
+    /// concrete routes: it is the direct-caller counterpart to the internal
+    /// bootstrap subscription [`LeaseClient::observe`] uses, and shares its
+    /// validation deliberately for consistency across the client surface.
     ///
     /// # Errors
     /// Returns an error when validation, transport, or broker processing fails.
-    pub async fn subscribe(&self, route: &str) -> Result<LeaseSubscription> {
-        validate_registration_pattern(route, "lease", 3)?;
+    pub async fn subscribe(&self, pattern: &str) -> Result<LeaseSubscription> {
+        validate_registration_pattern(pattern, "lease", 3)?;
         let receiver = self
             .connection
             .notifications(message_type::LEASE_NOTIFY, 64);
         let mut e = PayloadEncoder::new();
-        e.put_string(route);
+        e.put_string(pattern);
         let payload = e.finish();
         let response = self
             .connection
@@ -252,7 +257,7 @@ impl LeaseClient {
         );
         Ok(LeaseSubscription {
             connection: self.connection.clone(),
-            route: route.into(),
+            route: pattern.into(),
             registration,
             receiver: BroadcastStream::new(receiver),
             closed: false,
@@ -483,11 +488,6 @@ impl Default for ObserveOptions {
     }
 }
 
-/// Interval between checks for a connection generation bump (i.e. a
-/// reconnect). Deliberately short and not user-configurable: it only decides
-/// how quickly a reconnect is *noticed*, not how expensive noticing it is.
-const RECONNECT_POLL_INTERVAL: Duration = Duration::from_millis(50);
-
 /// Race-safe, self-healing view over every Lease route matching one
 /// selector.
 ///
@@ -537,6 +537,7 @@ impl Drop for LeaseObserver {
 enum SteadyStateExit {
     Shutdown,
     Reconnected,
+    SubscriptionFailed,
 }
 
 async fn observe_loop(
@@ -570,8 +571,20 @@ async fn observe_loop(
             tokio::select! {
                 () = shutdown.cancelled() => break 'outer,
                 result = bootstrap(&client, &pattern, options.list_page_size, &mut subscription, &view, &ready) => {
-                    if result.is_ok() {
-                        break;
+                    match result {
+                        Ok(()) => break,
+                        Err(error) if subscription_must_be_replaced(&error) => {
+                            ready.store(false, Ordering::Release);
+                            if !replace_observer_subscription(
+                                &client,
+                                &pattern,
+                                &mut subscription,
+                                &shutdown,
+                            ).await {
+                                break 'outer;
+                            }
+                        }
+                        Err(_) => {}
                     }
                 }
             }
@@ -606,9 +619,50 @@ async fn observe_loop(
             SteadyStateExit::Reconnected => {
                 ready.store(false, Ordering::Release);
             }
+            SteadyStateExit::SubscriptionFailed => {
+                ready.store(false, Ordering::Release);
+                if !replace_observer_subscription(&client, &pattern, &mut subscription, &shutdown)
+                    .await
+                {
+                    break;
+                }
+            }
         }
     }
     let _ = subscription.unsubscribe().await;
+}
+
+fn subscription_must_be_replaced(error: &FitzError) -> bool {
+    matches!(
+        error,
+        FitzError::Backpressure(_) | FitzError::ConnectionClosed
+    )
+}
+
+async fn replace_observer_subscription(
+    client: &LeaseClient,
+    pattern: &str,
+    subscription: &mut LeaseSubscription,
+    shutdown: &CancellationToken,
+) -> bool {
+    tokio::select! {
+        () = shutdown.cancelled() => return false,
+        _ = subscription.unsubscribe_in_place() => {}
+    }
+
+    let mut attempts = 0_u32;
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => return false,
+            replacement = client.subscribe(pattern) => {
+                if let Ok(replacement) = replacement {
+                    *subscription = replacement;
+                    return true;
+                }
+            }
+        }
+        backoff_epoch_race(&mut attempts).await;
+    }
 }
 
 /// Steps 3-5: list the selector to completion and install only after a pass
@@ -621,22 +675,44 @@ async fn bootstrap(
     view: &Arc<RwLock<HashMap<String, LeaseListItem>>>,
     ready: &Arc<AtomicBool>,
 ) -> Result<()> {
+    let mut epoch_race_attempts = 0_u32;
     loop {
-        let notification_epoch = client.connection.notification_epoch();
+        let notification_epoch = client
+            .connection
+            .notification_epoch(message_type::LEASE_NOTIFY);
         let fresh = full_list(client, pattern, page_size).await?;
         if drain_invalidation_buffer(subscription)? {
+            epoch_race_attempts = 0;
             continue;
         }
-        if client
-            .connection
-            .install_if_notification_epoch(notification_epoch, || {
+        if client.connection.install_if_notification_epoch(
+            message_type::LEASE_NOTIFY,
+            notification_epoch,
+            || {
                 *view.write() = fresh;
                 ready.store(true, Ordering::Release);
-            })
-        {
+            },
+        ) {
             return Ok(());
         }
+        // Defense in depth: notification_epoch is now scoped to
+        // message_type::LEASE_NOTIFY, so this branch should only ever be hit
+        // by a genuine Lease-notification race, not unrelated traffic on a
+        // shared connection. Back off anyway rather than re-listing at full
+        // speed, in case that assumption is ever violated.
+        backoff_epoch_race(&mut epoch_race_attempts).await;
     }
+}
+
+/// Bounded, capped backoff used between epoch-race retries in the bootstrap
+/// and reconciliation loops, so a persistent epoch race degrades to a slow
+/// steady retry instead of a zero-delay spin against the broker.
+async fn backoff_epoch_race(attempts: &mut u32) {
+    const BASE: Duration = Duration::from_millis(5);
+    const MAX: Duration = Duration::from_millis(200);
+    *attempts = attempts.saturating_add(1);
+    let delay = BASE.saturating_mul(1_u32 << (*attempts).min(6)).min(MAX);
+    tokio::time::sleep(delay).await;
 }
 
 /// Drains every notification already buffered for the observer. Returns true
@@ -684,21 +760,31 @@ async fn steady_state(
 ) -> SteadyStateExit {
     let reconciliation = tokio::time::sleep(jittered(options.reconciliation_interval));
     tokio::pin!(reconciliation);
-    let mut reconnect_poll = tokio::time::interval(RECONNECT_POLL_INTERVAL);
-    reconnect_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Event-driven reconnect detection: `generation_changes()` resolves as
+    // soon as the connection's generation is bumped, instead of polling
+    // `generation()` on a timer. A change is still double-checked against
+    // the baseline `generation` below in case of a stale/duplicate wakeup.
+    let mut generation_changes = client.connection.generation_changes();
+    // Close the small race between observe_loop's pre-steady-state
+    // generation check and subscribing to the watch channel: if a reconnect
+    // landed in that window, this receiver starts at the new value and would
+    // otherwise wait forever for a second change.
+    if client.connection.generation() != generation {
+        return SteadyStateExit::Reconnected;
+    }
     loop {
         tokio::select! {
             biased;
             () = shutdown.cancelled() => return SteadyStateExit::Shutdown,
-            _ = reconnect_poll.tick() => {
-                if client.connection.generation() != generation {
+            changed = generation_changes.changed() => {
+                if changed.is_err() || client.connection.generation() != generation {
                     return SteadyStateExit::Reconnected;
                 }
             }
             notification = subscription.next() => {
                 match notification {
                     Some(Ok(_)) => {
-                        if reconcile_after_invalidation(
+                        match reconcile_after_invalidation(
                             client,
                             pattern,
                             options.list_page_size,
@@ -706,22 +792,30 @@ async fn steady_state(
                             view,
                         )
                         .await
-                        .is_err()
                         {
-                            return SteadyStateExit::Reconnected;
+                            Ok(()) => {}
+                            Err(error) if subscription_must_be_replaced(&error) => {
+                                return SteadyStateExit::SubscriptionFailed;
+                            }
+                            Err(_) => return SteadyStateExit::Reconnected,
                         }
                     }
-                    Some(Err(_)) | None => return SteadyStateExit::Reconnected,
+                    Some(Err(_)) | None => return SteadyStateExit::SubscriptionFailed,
                 }
             }
             () = &mut reconciliation => {
-                let _ = reconcile_after_invalidation(
+                match reconcile_after_invalidation(
                     client,
                     pattern,
                     options.list_page_size,
                     subscription,
                     view,
-                ).await;
+                ).await {
+                    Err(error) if subscription_must_be_replaced(&error) => {
+                        return SteadyStateExit::SubscriptionFailed;
+                    }
+                    _ => {}
+                }
                 reconciliation
                     .as_mut()
                     .reset(tokio::time::Instant::now() + jittered(options.reconciliation_interval));
@@ -741,20 +835,26 @@ async fn reconcile_after_invalidation(
     subscription: &mut LeaseSubscription,
     view: &Arc<RwLock<HashMap<String, LeaseListItem>>>,
 ) -> Result<()> {
+    let mut epoch_race_attempts = 0_u32;
     loop {
-        let notification_epoch = client.connection.notification_epoch();
+        let notification_epoch = client
+            .connection
+            .notification_epoch(message_type::LEASE_NOTIFY);
         let fresh = full_list(client, pattern, page_size).await?;
         if drain_invalidation_buffer(subscription)? {
+            epoch_race_attempts = 0;
             continue;
         }
-        if client
-            .connection
-            .install_if_notification_epoch(notification_epoch, || {
+        if client.connection.install_if_notification_epoch(
+            message_type::LEASE_NOTIFY,
+            notification_epoch,
+            || {
                 *view.write() = fresh;
-            })
-        {
+            },
+        ) {
             return Ok(());
         }
+        backoff_epoch_race(&mut epoch_race_attempts).await;
     }
 }
 
@@ -869,6 +969,13 @@ impl LeaseSubscription {
     /// # Errors
     /// Returns an error when validation, transport, or broker processing fails.
     pub async fn unsubscribe(mut self) -> Result<()> {
+        self.unsubscribe_in_place().await
+    }
+
+    async fn unsubscribe_in_place(&mut self) -> Result<()> {
+        if self.closed {
+            return Ok(());
+        }
         self.closed = true;
         self.registration.deactivate();
         let mut e = PayloadEncoder::new();
@@ -928,8 +1035,11 @@ fn decode_subscription_id(response: &[u8]) -> Result<u64> {
     Ok(subscription_id)
 }
 fn decode_list_page(mut d: PayloadDecoder<'_>) -> Result<LeaseListPage> {
+    const MIN_ITEM_WIRE_BYTES: usize = 4 + 4 + 8 + 4 + 8 + 4;
     let item_count = d.get_u32()?;
-    let mut items = Vec::with_capacity(item_count as usize);
+    let declared_count = usize::try_from(item_count).unwrap_or(usize::MAX);
+    let plausible_count = d.remaining() / MIN_ITEM_WIRE_BYTES;
+    let mut items = Vec::with_capacity(declared_count.min(plausible_count));
     for _ in 0..item_count {
         items.push(LeaseListItem {
             route: d.get_string()?,
@@ -1011,6 +1121,24 @@ mod tests {
             .unwrap();
         stream.write_all(&frame).await.unwrap();
         stream.flush().await.unwrap();
+    }
+
+    async fn read_split(reader: &mut tokio::net::tcp::OwnedReadHalf) -> (u16, Vec<u8>) {
+        let len = reader.read_u32().await.unwrap() as usize;
+        let mut frame = vec![0; len];
+        reader.read_exact(&mut frame).await.unwrap();
+        let (kind, start) = crate::codec::decode_message_frame(&frame).unwrap();
+        (kind, frame[start..].to_vec())
+    }
+
+    async fn write_split(writer: &mut tokio::net::tcp::OwnedWriteHalf, kind: u16, payload: &[u8]) {
+        let frame = crate::codec::try_encode_message_frame(kind, payload).unwrap();
+        writer
+            .write_u32(u32::try_from(frame.len()).unwrap())
+            .await
+            .unwrap();
+        writer.write_all(&frame).await.unwrap();
+        writer.flush().await.unwrap();
     }
 
     async fn connected_lease_client<F, Fut>(
@@ -1148,6 +1276,19 @@ mod tests {
         assert_eq!(result.unwrap(), 42);
         server.await.unwrap();
         connection.close().await;
+    }
+
+    #[test]
+    fn should_reject_huge_list_count_without_unbounded_preallocation() {
+        // Arrange
+        let mut payload = PayloadEncoder::new();
+        payload.put_u32(u32::MAX);
+
+        // Act
+        let result = decode_list_page(PayloadDecoder::new(&payload.finish()));
+
+        // Assert
+        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -1682,6 +1823,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn should_converge_bootstrap_despite_continuous_unrelated_notification_traffic() {
+        // Arrange: register an unrelated (Queue) notification receiver on the
+        // same connection, then flood it with traffic for the whole test.
+        // notification_epoch tracking must be scoped to Lease so this
+        // unrelated traffic never prevents the observer's bootstrap install
+        // from succeeding; a connection-wide epoch would keep invalidating
+        // the install check and livelock the observer.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (mut reader, writer) = stream.into_split();
+            let writer = Arc::new(tokio::sync::Mutex::new(writer));
+
+            assert_eq!(read_split(&mut reader).await.0, message_type::CONNECT);
+
+            let (kind, payload) = read_split(&mut reader).await;
+            assert_eq!(kind, message_type::LEASE_SUBSCRIBE);
+            let mut d = PayloadDecoder::new(&payload);
+            assert_eq!(d.get_string().unwrap(), "lease://acme/**");
+            {
+                let mut w = writer.lock().await;
+                write_split(&mut w, message_type::LEASE_SUBSCRIBE, &token_response(1)).await;
+            }
+
+            // Flood unrelated Queue notifications for the rest of the
+            // connection's life, faster than a LEASE_LIST round trip can
+            // complete. Started only after authentication has settled so it
+            // cannot be mistaken for an authentication response.
+            let flood_writer = Arc::clone(&writer);
+            let flooding = tokio::spawn(async move {
+                loop {
+                    let mut w = flood_writer.lock().await;
+                    let frame =
+                        crate::codec::try_encode_message_frame(message_type::QUEUE_NOTIFY, &[])
+                            .unwrap();
+                    if w.write_u32(u32::try_from(frame.len()).unwrap())
+                        .await
+                        .is_err()
+                        || w.write_all(&frame).await.is_err()
+                        || w.flush().await.is_err()
+                    {
+                        return;
+                    }
+                    drop(w);
+                    tokio::time::sleep(Duration::from_micros(100)).await;
+                }
+            });
+
+            let (kind, _) = read_split(&mut reader).await;
+            assert_eq!(kind, message_type::LEASE_LIST);
+            {
+                let mut w = writer.lock().await;
+                write_split(&mut w, message_type::LEASE_LIST, &list_response(&[], None)).await;
+            }
+
+            let (kind, payload) = read_split(&mut reader).await;
+            assert_eq!(kind, message_type::LEASE_UNSUBSCRIBE);
+            let mut d = PayloadDecoder::new(&payload);
+            assert_eq!(d.get_string().unwrap(), "lease://acme/**");
+            {
+                let mut w = writer.lock().await;
+                write_split(&mut w, message_type::LEASE_UNSUBSCRIBE, &ok_response()).await;
+            }
+
+            flooding.abort();
+        });
+
+        let (state, _) = watch::channel(ConnectionState::Disconnected);
+        let connection = AsyncConnection::spawn(AsyncConnectionOptions {
+            endpoint: format!("tcp://{address}"),
+            token_provider: Arc::new(|| async { Ok(String::new()) }),
+            timeout: Duration::from_secs(2),
+            max_queued: 64,
+            reconnect: ReconnectPolicy {
+                enabled: false,
+                ..ReconnectPolicy::default()
+            },
+            retry: RetryPolicy::default(),
+            heartbeat: HeartbeatOptions::default(),
+            observability: FitzObservability::default(),
+            state,
+        });
+        connection.connect().await.unwrap();
+        // Register interest in the unrelated notification type so the
+        // supervisor actually tracks (and, pre-fix, bumps a shared epoch
+        // for) it instead of silently dropping it.
+        let _unrelated = connection.notifications(message_type::QUEUE_NOTIFY, 64);
+        let client = LeaseClient::new(connection.clone());
+
+        // Act
+        let observer = client
+            .observe("lease://acme/**", ObserveOptions::default())
+            .await
+            .unwrap();
+
+        // Assert: the observer becomes ready promptly despite the flood.
+        tokio::time::timeout(Duration::from_secs(3), wait_until(|| observer.is_ready()))
+            .await
+            .expect("observer livelocked under unrelated notification traffic");
+
+        observer.close().await;
+        server.await.unwrap();
+        connection.close().await;
+    }
+
+    #[tokio::test]
     async fn should_relist_once_when_notifications_arrive_during_bootstrap() {
         // Arrange: SUBSCRIBE acks, then a notification is delivered before the
         // observer's first LIST response even comes back. Per the bootstrap
@@ -1865,6 +2114,74 @@ mod tests {
         .expect("steady-state LIST removal never applied");
 
         observer.close().await;
+        server.await.unwrap();
+        connection.close().await;
+    }
+
+    #[tokio::test]
+    async fn should_retry_replacement_subscription_after_transient_failure() {
+        // Arrange
+        let (client, connection, server) = connected_lease_client(move |mut stream| async move {
+            assert_eq!(
+                read_frame(&mut stream).await.0,
+                message_type::LEASE_SUBSCRIBE
+            );
+            write_frame(
+                &mut stream,
+                message_type::LEASE_SUBSCRIBE,
+                &token_response(1),
+            )
+            .await;
+
+            assert_eq!(
+                read_frame(&mut stream).await.0,
+                message_type::LEASE_UNSUBSCRIBE
+            );
+            write_frame(&mut stream, message_type::LEASE_UNSUBSCRIBE, &ok_response()).await;
+
+            assert_eq!(
+                read_frame(&mut stream).await.0,
+                message_type::LEASE_SUBSCRIBE
+            );
+            write_frame(
+                &mut stream,
+                message_type::LEASE_SUBSCRIBE,
+                &error_response(5010, "transient subscribe failure"),
+            )
+            .await;
+
+            assert_eq!(
+                read_frame(&mut stream).await.0,
+                message_type::LEASE_SUBSCRIBE
+            );
+            write_frame(
+                &mut stream,
+                message_type::LEASE_SUBSCRIBE,
+                &token_response(2),
+            )
+            .await;
+
+            assert_eq!(
+                read_frame(&mut stream).await.0,
+                message_type::LEASE_UNSUBSCRIBE
+            );
+            write_frame(&mut stream, message_type::LEASE_UNSUBSCRIBE, &ok_response()).await;
+        })
+        .await;
+        let mut subscription = client.subscribe("lease://acme/**").await.unwrap();
+        let shutdown = CancellationToken::new();
+
+        // Act
+        let replaced = tokio::time::timeout(
+            Duration::from_secs(2),
+            replace_observer_subscription(&client, "lease://acme/**", &mut subscription, &shutdown),
+        )
+        .await
+        .unwrap();
+
+        // Assert
+        assert!(replaced);
+        subscription.unsubscribe().await.unwrap();
         server.await.unwrap();
         connection.close().await;
     }
