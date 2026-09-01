@@ -12,6 +12,8 @@ pub mod error_code {
     pub const QUEUE_SUBSCRIPTION_LIMIT: u32 = 4011;
     pub const LEASE_BAD_REQUEST: u32 = 5008;
     pub const LEASE_INVALID_SUBSCRIPTION_ROUTE: u32 = 5010;
+    pub const LEASE_INVALID_LIST_CURSOR: u32 = 5011;
+    pub const LEASE_INVALID_LIST_PATTERN: u32 = 5012;
     pub const RPC_INVALID_SUBSCRIPTION_PATTERN: u32 = 6012;
     pub const RPC_SUBSCRIPTION_LIMIT: u32 = 6013;
     pub const SCHEDULE_INVALID_SUBSCRIPTION_PATTERN: u32 = 7006;
@@ -167,13 +169,18 @@ mod tests {
 
     #[test]
     fn should_classify_schedule_backend_error_as_retryable() {
+        // Arrange
         let error = FitzError::Domain {
             code: error_code::SCHEDULE_BACKEND_ERROR,
             message: "backend busy".to_string(),
         };
 
+        // Act
+        let retryable = error.is_retryable();
+
+        // Assert
         assert_eq!(error_code::SCHEDULE_BACKEND_ERROR, 7010);
-        assert!(error.is_retryable());
+        assert!(retryable);
     }
 
     #[test]

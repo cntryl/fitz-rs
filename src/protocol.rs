@@ -41,6 +41,7 @@ pub mod message_type {
     pub const LEASE_SUBSCRIBE: u16 = 407;
     pub const LEASE_UNSUBSCRIBE: u16 = 408;
     pub const LEASE_NOTIFY: u16 = 409;
+    pub const LEASE_LIST: u16 = 410;
 
     // Notice domain (500-599)
     pub const NOTICE_PUBLISH: u16 = 500;
