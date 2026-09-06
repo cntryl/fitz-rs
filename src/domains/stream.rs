@@ -233,12 +233,17 @@ pub(crate) fn decode_stream_response(operation: &str, buf: &[u8]) -> Result<Stre
 
             Ok(StreamResponsePayload { session_id, data })
         }
-        1 => {
-            let (code, message) = if operation == "READ" {
+        1 | 2 => {
+            let (code, message) = if status == 2 || operation == "READ" {
                 (dec.get_u32()?, dec.get_string()?)
             } else {
                 (0, dec.get_string()?)
             };
+            if dec.remaining() != 0 {
+                return Err(FitzError::Protocol(format!(
+                    "{operation} error response has trailing data"
+                )));
+            }
             Err(FitzError::Domain {
                 code,
                 message: format!("{operation} failed: {message}"),
@@ -490,3 +495,7 @@ struct DecodedStreamNotifyPayload {
 #[cfg(test)]
 #[path = "stream_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "stream_error_tests.rs"]
+mod error_tests;
