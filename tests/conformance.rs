@@ -378,6 +378,57 @@ async fn should_complete_default_async_conformance_suite() {
     assert!(aggregate.scenarios.iter().all(|row| row.verdict == "pass"));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires fitz-auth and fitz-anon from compose.yml"]
+async fn should_correlate_same_type_requests_out_of_order() {
+    let connected = client(Transport::from_env(), AuthMode::from_env());
+    connected.connect().await.expect("broker connection");
+    assert!(connected.correlation_enabled());
+    assert_eq!(connected.server_capabilities(), (1, 1));
+    let parked_route = unique_route("queue");
+    let ready_route = unique_route("queue");
+    connected
+        .queue()
+        .expect("queue client")
+        .enqueue(&ready_route, b"second", None)
+        .await
+        .expect("seed ready queue");
+
+    let parked_queue = connected.queue().expect("queue client");
+    let parked_request_route = parked_route.clone();
+    let parked = tokio::spawn(async move {
+        parked_queue
+            .reserve(&parked_request_route, 30, 1, Some(5))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut second = tokio::time::timeout(
+        Duration::from_secs(2),
+        connected
+            .queue()
+            .expect("queue client")
+            .reserve(&ready_route, 30, 1, Some(0)),
+    )
+    .await
+    .expect("second reserve was serialized")
+    .expect("second reserve failed");
+    assert_eq!(second.pop().expect("second item").body, b"second");
+
+    connected
+        .queue()
+        .expect("queue client")
+        .enqueue(&parked_route, b"first", None)
+        .await
+        .expect("seed parked queue");
+    let mut first = tokio::time::timeout(Duration::from_secs(5), parked)
+        .await
+        .expect("parked reserve timed out")
+        .expect("parked task panicked")
+        .expect("parked reserve failed");
+    assert_eq!(first.pop().expect("first item").body, b"first");
+    connected.close().await.expect("close client");
+}
+
 async fn exercise_queue_workflow(connected: &Client) {
     let queue_route = unique_route("queue");
     connected
