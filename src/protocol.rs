@@ -3,6 +3,7 @@
 pub mod message_type {
     // Control channel messages (0-99)
     pub const CONNECT: u16 = 1;
+    pub const SERVER_HELLO: u16 = 4;
 
     // KV domain (100-199)
     pub const KV_BEGIN: u16 = 100;

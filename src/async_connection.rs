@@ -642,15 +642,22 @@ async fn settle_authentication(session: &mut Session) -> Result<()> {
     const SETTLE_DELAY: Duration = Duration::from_millis(100);
     match session {
         Session::Tcp(stream) => {
-            let mut byte = [0_u8; 1];
-            match tokio::time::timeout(SETTLE_DELAY, stream.peek(&mut byte)).await {
+            match tokio::time::timeout(SETTLE_DELAY, read_tcp(stream)).await {
                 Err(_) => Ok(()),
-                Ok(Ok(0)) => Err(FitzError::Authentication {
-                    message: "broker closed the connection during authentication".into(),
-                }),
+                Ok(Ok((message_type, _payload)))
+                    if message_type == crate::protocol::message_type::SERVER_HELLO =>
+                {
+                    // SERVER_HELLO is an unsolicited capability advertisement. It may
+                    // arrive during the authentication settle window and is not an
+                    // authentication response.
+                    Ok(())
+                }
                 Ok(Ok(_)) => Err(FitzError::Protocol(
                     "broker sent an unexpected authentication response".into(),
                 )),
+                Ok(Err(FitzError::ConnectionClosed)) => Err(FitzError::Authentication {
+                    message: "broker closed the connection during authentication".into(),
+                }),
                 Ok(Err(error)) => Err(FitzError::Authentication {
                     message: error.to_string(),
                 }),
@@ -670,6 +677,14 @@ async fn settle_authentication(session: &mut Session) -> Result<()> {
                         .await
                         .map_err(|error| FitzError::Transport(error.to_string()))?,
                     Ok(Some(Ok(Message::Pong(_)))) => {}
+                    Ok(Some(Ok(Message::Binary(frame)))) => {
+                        let (message_type, _payload_start) = decode_message_frame(&frame)?;
+                        if message_type != crate::protocol::message_type::SERVER_HELLO {
+                            return Err(FitzError::Protocol(
+                                "broker sent an unexpected authentication response".into(),
+                            ));
+                        }
+                    }
                     Ok(Some(Ok(_)) | None) => {
                         return Err(FitzError::Authentication {
                             message: "broker closed the connection during authentication".into(),
