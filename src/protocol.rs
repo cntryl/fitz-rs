@@ -3,7 +3,11 @@
 pub mod message_type {
     // Control channel messages (0-99)
     pub const CONNECT: u16 = 1;
+    pub const CORRELATE: u16 = 2;
+    pub const CORRELATED: u16 = 3;
     pub const SERVER_HELLO: u16 = 4;
+
+    pub const CAP_CORRELATION: u32 = 1 << 0;
 
     // KV domain (100-199)
     pub const KV_BEGIN: u16 = 100;

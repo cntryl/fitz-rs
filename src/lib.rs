@@ -331,6 +331,26 @@ impl Client {
     pub fn state(&self) -> ConnectionState {
         *self.inner.state_tx.borrow()
     }
+    /// Whether the current broker session advertised frame-level correlation.
+    #[must_use]
+    pub fn correlation_enabled(&self) -> bool {
+        self.inner
+            .connection
+            .lock()
+            .as_ref()
+            .is_some_and(AsyncConnection::correlation_enabled)
+    }
+    /// The current server protocol version and capability bits.
+    #[must_use]
+    pub fn server_capabilities(&self) -> (u16, u32) {
+        self.inner
+            .connection
+            .lock()
+            .as_ref()
+            .map_or((0, 0), |connection| {
+                (connection.protocol_version(), connection.capability_bits())
+            })
+    }
     #[must_use]
     pub fn subscribe_state(&self) -> watch::Receiver<ConnectionState> {
         self.inner.state_tx.subscribe()

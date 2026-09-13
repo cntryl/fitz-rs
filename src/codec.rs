@@ -216,6 +216,51 @@ pub fn decode_message_frame(buf: &[u8]) -> Result<(u16, usize)> {
     Ok((msg_type, payload_start))
 }
 
+/// Decode every TLV record in one message-bounded transport frame.
+pub fn decode_message_frames(mut buf: &[u8]) -> Result<Vec<(u16, Vec<u8>)>> {
+    let mut frames = Vec::with_capacity(2);
+    while !buf.is_empty() {
+        let (msg_type, header_len) = if buf[0] == 0xFF {
+            if buf.len() < 3 {
+                return Err(FitzError::Codec(
+                    "Incomplete multi-byte message type".into(),
+                ));
+            }
+            (u16::from_be_bytes([buf[1], buf[2]]), 3)
+        } else {
+            (u16::from(buf[0]), 1)
+        };
+        if buf.len() < header_len + 2 {
+            return Err(FitzError::Codec("Incomplete length field".into()));
+        }
+        let len = u16::from_be_bytes([buf[header_len], buf[header_len + 1]]) as usize;
+        let start = header_len + 2;
+        let end = start + len;
+        if buf.len() < end {
+            return Err(FitzError::Codec("Incomplete payload bytes".into()));
+        }
+        frames.push((msg_type, buf[start..end].to_vec()));
+        buf = &buf[end..];
+    }
+    Ok(frames)
+}
+
+pub fn try_encode_correlated_frame(
+    correlation_id: u64,
+    msg_type: u16,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    if correlation_id == 0 {
+        return Err(FitzError::Codec("zero correlation identifier".into()));
+    }
+    let mut frame = try_encode_message_frame(
+        crate::protocol::message_type::CORRELATE,
+        &correlation_id.to_be_bytes(),
+    )?;
+    frame.extend_from_slice(&try_encode_message_frame(msg_type, payload)?);
+    Ok(frame)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
