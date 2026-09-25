@@ -52,6 +52,7 @@ pub mod message_type {
     pub const NOTICE_PUBLISH: u16 = 500;
     pub const NOTICE_SUBSCRIBE: u16 = 501;
     pub const NOTICE_UNSUBSCRIBE: u16 = 502;
+    pub const NOTICE_UNSUBSCRIBE_ALL: u16 = 503;
     pub const NOTICE_NOTIFY: u16 = 504;
 
     // Stream domain (600-699)
@@ -73,6 +74,8 @@ pub mod message_type {
     pub const SCHEDULE_SUBSCRIBE: u16 = 703;
     pub const SCHEDULE_UNSUBSCRIBE: u16 = 704;
     pub const SCHEDULE_NOTIFY: u16 = 705; // Server -> Client only
+    pub const SCHEDULE_CREATE_BATCH: u16 = 706;
+    pub const SCHEDULE_LIST_V2: u16 = 707;
 }
 
 /// Transaction mode for KV operations.

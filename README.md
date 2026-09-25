@@ -67,6 +67,11 @@ Schedule listing uses `list(offset, limit)` on message 702 and returns
 `total_count`. Global stream continuations reuse the returned fingerprint and
 captured-watermark pair.
 
+`NoticeClient::unsubscribe_all()` sends message 503 and completes existing
+Notice handles after broker acknowledgment. Schedule `create_batch()` (706) and
+`list_v2()` (707) expose broker extensions; `list()` (702) remains the portable
+pagination API. Terminal RPC error responses surface as `FitzError::Domain`.
+
 Schedule backend unavailability and broker saturation use the distinct coded
 error `error_code::SCHEDULE_BACKEND_ERROR` (`7010`). It is retryable subject to
 operation safety and is never mapped to a cron or parse error.

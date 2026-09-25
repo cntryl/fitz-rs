@@ -32,6 +32,13 @@ pub struct ScheduleListPage {
     pub total_count: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleCursorPage {
+    pub entries: Vec<ScheduleEntry>,
+    pub has_more: bool,
+    pub continuation: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct ScheduleClient {
     connection: AsyncConnection,
@@ -76,6 +83,61 @@ impl ScheduleClient {
             ));
         }
         Ok(route.into())
+    }
+    /// Creates several schedules with broker extension 706.
+    ///
+    /// # Errors
+    /// Returns a validation, transport, or broker error.
+    pub async fn create_batch(&self, entries: &[ScheduleEntry]) -> Result<()> {
+        let mut encoder = PayloadEncoder::new();
+        encoder.put_u32(
+            u32::try_from(entries.len()).map_err(|_| FitzError::FrameTooLarge(entries.len()))?,
+        );
+        for entry in entries {
+            validate_fixed_route(&entry.route, "schedule", 4)?;
+            encoder
+                .put_string(&entry.route)
+                .put_string(&entry.cron)
+                .put_u8(entry.delivery_mode as u8)
+                .put_bytes(&entry.payload);
+        }
+        let response = self
+            .connection
+            .request(message_type::SCHEDULE_CREATE_BATCH, encoder.finish())
+            .await?;
+        if !plain_success(&response, "CREATE_BATCH")?.is_empty() {
+            return Err(FitzError::Protocol(
+                "schedule CREATE_BATCH response has trailing bytes".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reads a cursor page with broker extension 707.
+    ///
+    /// # Errors
+    /// Returns a transport, broker, or malformed-response error.
+    pub async fn list_v2(
+        &self,
+        continuation: Option<&str>,
+        limit: Option<u64>,
+    ) -> Result<ScheduleCursorPage> {
+        let mut encoder = PayloadEncoder::new();
+        if let Some(cursor) = continuation {
+            encoder.put_u8(1).put_string(cursor);
+        } else {
+            encoder.put_u8(0);
+        }
+        if let Some(value) = limit {
+            encoder.put_u8(1).put_u64(value);
+        } else {
+            encoder.put_u8(0);
+        }
+        let response = self
+            .connection
+            .request_replayable(message_type::SCHEDULE_LIST_V2, encoder.finish())
+            .await?;
+        decode_cursor_page(plain_success(&response, "LIST_V2")?)
     }
     /// Performs the operation asynchronously.
     ///
@@ -237,6 +299,72 @@ fn decode_list(mut d: PayloadDecoder<'_>) -> Result<ScheduleListPage> {
     })
 }
 
+fn decode_cursor_page(mut decoder: PayloadDecoder<'_>) -> Result<ScheduleCursorPage> {
+    if decoder.get_u8()? != 1 {
+        return Err(FitzError::Protocol(
+            "schedule LIST_V2 has unknown response version".into(),
+        ));
+    }
+    let has_more = match decoder.get_u8()? {
+        0 => false,
+        1 => true,
+        _ => {
+            return Err(FitzError::Protocol(
+                "schedule LIST_V2 has invalid has_more flag".into(),
+            ));
+        }
+    };
+    let continuation = match decoder.get_u8()? {
+        0 => None,
+        1 => Some(decoder.get_string()?),
+        _ => {
+            return Err(FitzError::Protocol(
+                "schedule LIST_V2 has invalid cursor flag".into(),
+            ));
+        }
+    };
+    let mut entries = Vec::new();
+    loop {
+        match decoder.get_u8()? {
+            0 => break,
+            1 => {}
+            _ => {
+                return Err(FitzError::Protocol(
+                    "schedule LIST_V2 has invalid entry flag".into(),
+                ));
+            }
+        }
+        let route = decoder.get_string()?;
+        let cron = decoder.get_string()?;
+        let delivery_mode = match decoder.get_u8()? {
+            0 => ScheduleDeliveryMode::Broadcast,
+            1 => ScheduleDeliveryMode::Single,
+            _ => {
+                return Err(FitzError::Protocol(
+                    "schedule LIST_V2 has invalid delivery mode".into(),
+                ));
+            }
+        };
+        let payload = decoder.get_bytes()?;
+        entries.push(ScheduleEntry {
+            route,
+            cron,
+            delivery_mode,
+            payload,
+        });
+    }
+    if !decoder.is_empty() {
+        return Err(FitzError::Protocol(
+            "schedule LIST_V2 response has trailing bytes".into(),
+        ));
+    }
+    Ok(ScheduleCursorPage {
+        entries,
+        has_more,
+        continuation,
+    })
+}
+
 fn success<'a>(response: &'a [u8], operation: &str) -> Result<PayloadDecoder<'a>> {
     let mut d = PayloadDecoder::new(response);
     match d.get_u8()? {
@@ -357,13 +485,22 @@ fn plain_success<'a>(response: &'a [u8], operation: &str) -> Result<PayloadDecod
     match d.get_u8()? {
         0 => Ok(d),
         1 => {
-            let message = d.get_string()?;
+            let first = d.get_u32()?;
+            let (code, message) = if usize::try_from(first).ok() == Some(d.remaining()) {
+                (
+                    0,
+                    String::from_utf8(d.get_raw(first as usize)?)
+                        .map_err(|_| FitzError::Codec("Invalid UTF-8".into()))?,
+                )
+            } else {
+                (first, d.get_string()?)
+            };
             if !d.is_empty() {
                 return Err(FitzError::Protocol(format!(
                     "Schedule {operation} error response has trailing bytes"
                 )));
             }
-            Err(FitzError::Domain { code: 0, message })
+            Err(FitzError::Domain { code, message })
         }
         v => Err(FitzError::Protocol(format!(
             "Schedule {operation} returned status {v}"
@@ -407,6 +544,32 @@ mod tests {
     }
 
     #[test]
+    fn should_decode_versioned_schedule_cursor_page() {
+        // Arrange
+        let mut encoder = PayloadEncoder::new();
+        encoder
+            .put_u8(1)
+            .put_u8(1)
+            .put_u8(1)
+            .put_string("next")
+            .put_u8(1)
+            .put_string("schedule://realm/area/job/run")
+            .put_string("*/5 * * * *")
+            .put_u8(1)
+            .put_bytes(b"payload")
+            .put_u8(0);
+        let payload = encoder.finish();
+
+        // Act
+        let page = decode_cursor_page(PayloadDecoder::new(&payload)).unwrap();
+
+        // Assert
+        assert!(page.has_more);
+        assert_eq!(page.continuation.as_deref(), Some("next"));
+        assert_eq!(page.entries.len(), 1);
+    }
+
+    #[test]
     fn should_preserve_schedule_backend_code_given_coded_error_response() {
         // Arrange
         let mut encoder = PayloadEncoder::new();
@@ -426,6 +589,20 @@ mod tests {
             error,
             FitzError::Domain { code: 7010, ref message } if message == "backend busy"
         ));
+    }
+
+    #[test]
+    fn should_preserve_coded_ingress_error_for_schedule_extension() {
+        // Arrange
+        let mut encoder = PayloadEncoder::new();
+        encoder.put_u8(1).put_u32(7010).put_string("broker busy");
+        let payload = encoder.finish();
+
+        // Act
+        let result = plain_success(&payload, "LIST_V2");
+
+        // Assert
+        assert!(matches!(result, Err(FitzError::Domain { code: 7010, .. })));
     }
 
     #[test]

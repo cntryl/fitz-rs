@@ -4,13 +4,17 @@ use std::io::ErrorKind;
 pub mod error_code {
     pub const KV_INVALID_SUBSCRIPTION_PATTERN: u32 = 1012;
     pub const KV_SUBSCRIPTION_LIMIT: u32 = 1013;
+    pub const KV_BUSY: u32 = 1014;
     pub const STREAM_INVALID_SUBSCRIPTION_PATTERN: u32 = 2010;
     pub const STREAM_SUBSCRIPTION_LIMIT: u32 = 2011;
+    pub const STREAM_BUSY: u32 = 2014;
     pub const NOTICE_INVALID_PATTERN: u32 = 3002;
     pub const NOTICE_SUBSCRIPTION_LIMIT: u32 = 3003;
+    pub const NOTICE_BUSY: u32 = 3006;
     pub const QUEUE_INVALID_SUBSCRIPTION_PATTERN: u32 = 4010;
     pub const QUEUE_SUBSCRIPTION_LIMIT: u32 = 4011;
     pub const LEASE_BAD_REQUEST: u32 = 5008;
+    pub const LEASE_QUEUE_FULL: u32 = 5007;
     pub const LEASE_INVALID_SUBSCRIPTION_ROUTE: u32 = 5010;
     pub const LEASE_INVALID_LIST_CURSOR: u32 = 5011;
     pub const LEASE_INVALID_LIST_PATTERN: u32 = 5012;
@@ -105,7 +109,10 @@ impl FitzError {
             | Self::Transport(_)
             | Self::Backpressure(_)
             | Self::ConnectionClosed => true,
-            Self::Domain { code, .. } => matches!(code, 1004 | 4005 | 5001 | 6001..=6004 | 7010),
+            Self::Domain { code, .. } => matches!(
+                code,
+                1004 | 1014 | 2014 | 3006 | 4005 | 5001 | 5007 | 6001..=6004 | 7010
+            ),
             _ => false,
         }
     }
@@ -208,5 +215,27 @@ mod tests {
 
         // Assert
         assert!(!retryable);
+    }
+
+    #[test]
+    fn should_match_broker_retry_table_for_domain_codes() {
+        // Arrange
+        let retryable = [
+            1004, 1014, 2014, 3006, 4005, 5001, 5007, 6001, 6002, 6003, 6004, 7010,
+        ];
+        let terminal = [1009, 2009, 3005, 4006, 5009, 6009, 7009];
+
+        // Act
+        let classify = |code| {
+            FitzError::Domain {
+                code,
+                message: String::new(),
+            }
+            .is_retryable()
+        };
+
+        // Assert
+        assert!(retryable.into_iter().all(classify));
+        assert!(terminal.into_iter().all(|code| !classify(code)));
     }
 }
