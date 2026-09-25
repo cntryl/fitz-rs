@@ -2,7 +2,7 @@ mod jwt;
 
 use cntryl_fitz::client_domains::kv::KvGetResult;
 use cntryl_fitz::client_domains::lease::LeaseAcquireOptions;
-use cntryl_fitz::client_domains::schedule::ScheduleDeliveryMode;
+use cntryl_fitz::client_domains::schedule::{ScheduleDeliveryMode, ScheduleEntry};
 use cntryl_fitz::client_domains::stream::StreamCommitMode;
 use cntryl_fitz::{Client, FitzError, KvDurability, TransactionMode};
 use futures_util::StreamExt;
@@ -230,19 +230,21 @@ async fn should_run_scenario(
     match id {
         1 | 3 => kv_round_trip(connected, KvDurability::Buffered).await?,
         2 => reject_invalid_jwt(transport).await?,
-        4 | 5 => {
+        4 => {
+            let route = unique_route("rpc");
+            let mut response = connected.rpc()?.call(&route, b"unknown route").await?;
+            assert!(matches!(
+                response.next().await,
+                Some(Err(FitzError::Domain { code: 6004, .. }))
+            ));
+        }
+        5 => {
+            let route = format!("{}/run", unique_route("schedule"));
             let result = connected
-                .kv()?
-                .begin(
-                    "stream://wrong/domain",
-                    TransactionMode::ReadWrite,
-                    KvDurability::Buffered,
-                )
+                .schedule()?
+                .create(&route, "invalid cron", ScheduleDeliveryMode::Single, b"")
                 .await;
-            let Err(error) = result else {
-                panic!("invalid route must fail");
-            };
-            assert!(matches!(error, FitzError::Protocol(_)));
+            assert!(matches!(result, Err(FitzError::Domain { .. })));
         }
         6 => reject_held_lease(connected, transport, auth_mode).await?,
         7 => {
@@ -496,10 +498,13 @@ async fn exercise_notice_workflow(connected: &Client) {
         .expect("notice decode");
     assert_eq!(notice.route, notice_route);
     assert_eq!(notice.body, b"notice");
-    notice_subscription
-        .unsubscribe()
+    connected
+        .notice()
+        .expect("notice client")
+        .unsubscribe_all()
         .await
-        .expect("unsubscribe notice");
+        .expect("unsubscribe all notices");
+    assert!(notice_subscription.next().await.is_none());
 }
 
 async fn exercise_rpc_workflow(connected: &Client) {
@@ -534,6 +539,7 @@ async fn exercise_rpc_workflow(connected: &Client) {
 
 async fn exercise_schedule_workflow(connected: &Client) {
     let schedule_route = format!("{}/run", unique_route("schedule"));
+    let batch_route = format!("{}/run", unique_route("schedule"));
     connected
         .schedule()
         .expect("schedule client")
@@ -545,6 +551,17 @@ async fn exercise_schedule_workflow(connected: &Client) {
         )
         .await
         .expect("create schedule");
+    connected
+        .schedule()
+        .expect("schedule client")
+        .create_batch(&[ScheduleEntry {
+            route: batch_route.clone(),
+            cron: "*/5 * * * *".into(),
+            delivery_mode: ScheduleDeliveryMode::Single,
+            payload: b"batch".to_vec(),
+        }])
+        .await
+        .expect("create schedule batch");
     let page = connected
         .schedule()
         .expect("schedule client")
@@ -556,12 +573,30 @@ async fn exercise_schedule_workflow(connected: &Client) {
             .iter()
             .any(|entry| entry.route == schedule_route)
     );
+    let cursor_page = connected
+        .schedule()
+        .expect("schedule client")
+        .list_v2(None, Some(1000))
+        .await
+        .expect("list cursor page");
+    assert!(
+        cursor_page
+            .entries
+            .iter()
+            .any(|entry| entry.route == batch_route)
+    );
     connected
         .schedule()
         .expect("schedule client")
         .cancel(&schedule_route)
         .await
         .expect("cancel schedule");
+    connected
+        .schedule()
+        .expect("schedule client")
+        .cancel(&batch_route)
+        .await
+        .expect("cancel batch schedule");
 }
 
 async fn exercise_stream_workflow(connected: &Client) {

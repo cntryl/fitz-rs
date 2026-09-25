@@ -8,6 +8,7 @@ use futures_core::Stream;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use tokio_stream::wrappers::BroadcastStream;
 
@@ -19,6 +20,7 @@ pub struct NoticeClient {
 
 struct SharedNoticeSubscription {
     registration: Arc<RestorableRegistration>,
+    active: Arc<AtomicBool>,
     references: usize,
 }
 
@@ -56,9 +58,9 @@ impl NoticeClient {
             .connection
             .notifications(message_type::NOTICE_NOTIFY, 64);
         let mut subscriptions = self.subscriptions.lock().await;
-        let registration = if let Some(shared) = subscriptions.get_mut(pattern) {
+        let (registration, active) = if let Some(shared) = subscriptions.get_mut(pattern) {
             shared.references += 1;
-            Arc::clone(&shared.registration)
+            (Arc::clone(&shared.registration), Arc::clone(&shared.active))
         } else {
             let mut encoder = PayloadEncoder::new();
             encoder.put_string(pattern);
@@ -74,14 +76,16 @@ impl NoticeClient {
                 subscription_id,
                 decode_subscription_id,
             ));
+            let active = Arc::new(AtomicBool::new(true));
             subscriptions.insert(
                 pattern.into(),
                 SharedNoticeSubscription {
                     registration: Arc::clone(&registration),
+                    active: Arc::clone(&active),
                     references: 1,
                 },
             );
-            registration
+            (registration, active)
         };
         drop(subscriptions);
         Ok(NoticeSubscription {
@@ -89,9 +93,30 @@ impl NoticeClient {
             subscriptions: Arc::clone(&self.subscriptions),
             pattern: pattern.into(),
             registration,
+            active,
             receiver: BroadcastStream::new(receiver),
             closed: false,
         })
+    }
+
+    /// Cancels all Notice subscriptions owned by this connection.
+    ///
+    /// # Errors
+    /// Returns a broker or transport error; local handles remain active when the request fails.
+    pub async fn unsubscribe_all(&self) -> Result<()> {
+        let mut subscriptions = self.subscriptions.lock().await;
+        decode_ok(
+            &self
+                .connection
+                .request(message_type::NOTICE_UNSUBSCRIBE_ALL, Vec::new())
+                .await?,
+        )?;
+        for shared in subscriptions.values() {
+            shared.registration.deactivate();
+            shared.active.store(false, Ordering::Release);
+        }
+        subscriptions.clear();
+        Ok(())
     }
 }
 
@@ -130,6 +155,7 @@ pub struct NoticeSubscription {
     subscriptions: Arc<tokio::sync::Mutex<HashMap<String, SharedNoticeSubscription>>>,
     pattern: String,
     registration: Arc<RestorableRegistration>,
+    active: Arc<AtomicBool>,
     receiver: BroadcastStream<Vec<u8>>,
     closed: bool,
 }
@@ -141,6 +167,9 @@ impl NoticeSubscription {
     /// Returns an error when validation, transport, or broker processing fails.
     pub async fn unsubscribe(mut self) -> Result<()> {
         self.closed = true;
+        if !self.active.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let mut subscriptions = self.subscriptions.lock().await;
         let Some(shared) = subscriptions.get_mut(&self.pattern) else {
             return Ok(());
@@ -159,6 +188,7 @@ impl NoticeSubscription {
                 .await?,
         )?;
         self.registration.deactivate();
+        self.active.store(false, Ordering::Release);
         subscriptions.remove(&self.pattern);
         Ok(())
     }
@@ -168,7 +198,7 @@ impl Stream for NoticeSubscription {
     type Item = Result<NoticeMessage>;
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if self.closed {
+        if self.closed || !self.active.load(Ordering::Acquire) {
             return Poll::Ready(None);
         }
         loop {
@@ -276,6 +306,63 @@ mod tests {
         let second = client.subscribe("notice://realm/area/*").await.unwrap();
         first.unsubscribe().await.unwrap();
         second.unsubscribe().await.unwrap();
+        server.await.unwrap();
+        connection.close().await;
+    }
+
+    #[tokio::test]
+    async fn should_end_existing_notice_handles_after_bulk_unsubscribe() {
+        // Arrange
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert_eq!(read_frame(&mut stream).await.0, message_type::CONNECT);
+            assert_eq!(
+                read_frame(&mut stream).await.0,
+                message_type::NOTICE_SUBSCRIBE
+            );
+            let mut response = PayloadEncoder::new();
+            response.put_u8(0).put_u64(42);
+            write_frame(
+                &mut stream,
+                message_type::NOTICE_SUBSCRIBE,
+                &response.finish(),
+            )
+            .await;
+            let (kind, payload) = read_frame(&mut stream).await;
+            assert_eq!(kind, message_type::NOTICE_UNSUBSCRIBE_ALL);
+            assert!(payload.is_empty());
+            write_frame(&mut stream, kind, &[0]).await;
+        });
+        let (state, _) = watch::channel(ConnectionState::Disconnected);
+        let connection = AsyncConnection::spawn(AsyncConnectionOptions {
+            endpoint: format!("tcp://{address}"),
+            token_provider: Arc::new(|| async { Ok(String::new()) }),
+            timeout: Duration::from_secs(1),
+            max_queued: 8,
+            reconnect: ReconnectPolicy {
+                enabled: false,
+                ..ReconnectPolicy::default()
+            },
+            retry: RetryPolicy::default(),
+            heartbeat: HeartbeatOptions::default(),
+            observability: FitzObservability::default(),
+            state,
+        });
+        connection.connect().await.unwrap();
+        let client = NoticeClient::new(connection.clone());
+        let mut subscription = client.subscribe("notice://realm/area/*").await.unwrap();
+
+        // Act
+        client.unsubscribe_all().await.unwrap();
+
+        // Assert
+        assert!(
+            futures_util::StreamExt::next(&mut subscription)
+                .await
+                .is_none()
+        );
         server.await.unwrap();
         connection.close().await;
     }
