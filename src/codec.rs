@@ -116,6 +116,13 @@ impl<'a> PayloadDecoder<'a> {
         Ok(bytes)
     }
 
+    pub fn get_raw(&mut self, len: usize) -> Result<Vec<u8>> {
+        self.check_len(len)?;
+        let bytes = self.buf[self.pos..self.pos + len].to_vec();
+        self.pos += len;
+        Ok(bytes)
+    }
+
     pub fn get_fixed<const N: usize>(&mut self) -> Result<[u8; N]> {
         self.check_len(N)?;
         let mut value = [0_u8; N];

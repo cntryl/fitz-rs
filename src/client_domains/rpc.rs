@@ -115,6 +115,9 @@ impl Stream for RpcResponseStream {
                     };
                     if end {
                         self.finished = true;
+                        if let Some(error) = decode_terminal_error(&body) {
+                            return Poll::Ready(Some(Err(error)));
+                        }
                     }
                     return Poll::Ready(Some(Ok(RpcResponseFrame { body, sequence })));
                 }
@@ -129,6 +132,21 @@ impl Stream for RpcResponseStream {
             }
         }
     }
+}
+
+fn decode_terminal_error(body: &[u8]) -> Option<FitzError> {
+    let mut decoder = PayloadDecoder::new(body);
+    if decoder.get_u8().ok()? != 1 {
+        return None;
+    }
+    let code = decoder.get_u32().ok()?;
+    if !(6001..=6013).contains(&code) {
+        return None;
+    }
+    let message = decoder.get_string().ok()?;
+    decoder
+        .is_empty()
+        .then_some(FitzError::Domain { code, message })
 }
 
 fn decode_rpc_response_frame(decoder: &mut PayloadDecoder<'_>) -> Result<(u64, bool, Vec<u8>)> {
@@ -264,6 +282,38 @@ impl RpcRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
+    use tokio::sync::broadcast;
+
+    #[tokio::test]
+    async fn should_surface_terminal_rpc_error_as_domain_error() {
+        // Arrange
+        let (sender, receiver) = broadcast::channel(2);
+        let id = [9_u8; 16];
+        let mut body = PayloadEncoder::new();
+        body.put_u8(1)
+            .put_u32(6004)
+            .put_string("No workers registered");
+        let mut frame = PayloadEncoder::new();
+        frame
+            .put_raw(&id)
+            .put_u64(0)
+            .put_u8(1)
+            .put_bytes(&body.finish());
+        let mut stream = RpcResponseStream {
+            correlation_id: id,
+            receiver: BroadcastStream::new(receiver),
+            finished: false,
+        };
+
+        // Act
+        sender.send(frame.finish()).unwrap();
+        let result = stream.next().await.unwrap();
+
+        // Assert
+        assert!(matches!(result, Err(FitzError::Domain { code: 6004, .. })));
+        assert!(stream.next().await.is_none());
+    }
 
     #[test]
     fn should_preserve_empty_terminal_rpc_response_frame() {

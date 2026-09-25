@@ -273,6 +273,7 @@ impl ClientBuilder {
                 observability: self.observability,
                 state_tx,
                 connection: Mutex::new(None),
+                notice: Mutex::new(None),
             }),
         })
     }
@@ -289,6 +290,7 @@ struct ClientInner {
     observability: FitzObservability,
     state_tx: watch::Sender<ConnectionState>,
     connection: Mutex<Option<AsyncConnection>>,
+    notice: Mutex<Option<client_domains::notice::NoticeClient>>,
 }
 
 /// Async Fitz client entry point.
@@ -367,9 +369,11 @@ impl Client {
     /// # Errors
     /// Returns [`FitzError::ConnectionClosed`] until [`Self::connect`] succeeds.
     pub fn notice(&self) -> Result<client_domains::notice::NoticeClient> {
-        Ok(client_domains::notice::NoticeClient::new(
-            self.connection()?,
-        ))
+        let connection = self.connection()?;
+        let mut notice = self.inner.notice.lock();
+        Ok(notice
+            .get_or_insert_with(|| client_domains::notice::NoticeClient::new(connection))
+            .clone())
     }
     /// Returns a Queue domain handle.
     ///
