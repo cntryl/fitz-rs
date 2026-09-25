@@ -33,7 +33,7 @@ socket2 = "0.6"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
-jsonwebtoken = "9"
+jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 serde_yaml = "0.9"
 criterion = { version = "0.7", features = ["async_tokio"] }
 

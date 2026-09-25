@@ -74,3 +74,9 @@ fn make_signed_jwt(
     )
     .expect("JWT encode failed")
 }
+
+#[test]
+fn test_jwt_signing_provider_is_available() {
+    let token = make_test_jwt("test-realm", "test-secret");
+    assert_eq!(token.split('.').count(), 3);
+}
