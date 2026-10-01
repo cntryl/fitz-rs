@@ -11,6 +11,11 @@ fn should_validate_service_name_using_utf8_byte_limit() {
         .build();
     assert!(valid.is_ok());
 
+    let padded = Client::builder("tcp://127.0.0.1:1", || async { Ok(String::new()) })
+        .service_name(format!(" {} ", "é".repeat(64)))
+        .build();
+    assert!(padded.is_ok());
+
     let oversized = Client::builder("tcp://127.0.0.1:1", || async { Ok(String::new()) })
         .service_name("é".repeat(65))
         .build();
@@ -123,8 +128,9 @@ async fn should_send_service_name_given_late_metadata_capability() -> Result<()>
         stream.read_exact(&mut metadata).await.unwrap();
         metadata
     });
+    let service_name = "é".repeat(64);
     let client = Client::builder(format!("tcp://{address}"), || async { Ok(String::new()) })
-        .service_name("orders-worker")
+        .service_name(format!(" {service_name} "))
         .build()?;
 
     // Act
@@ -135,14 +141,10 @@ async fn should_send_service_name_given_late_metadata_capability() -> Result<()>
         .await
         .expect("broker should receive metadata")
         .expect("server task panicked");
-    assert_eq!(&metadata[..3], &[5, 0, 17]);
-    assert_eq!(
-        &metadata[3..],
-        &[
-            0, 0, 0, 13, b'o', b'r', b'd', b'e', b'r', b's', b'-', b'w', b'o', b'r', b'k', b'e',
-            b'r'
-        ]
-    );
+    assert_eq!(&metadata[..3], &[5, 0, 132]);
+    let mut expected = 128_u32.to_be_bytes().to_vec();
+    expected.extend_from_slice(service_name.as_bytes());
+    assert_eq!(&metadata[3..], expected);
     assert_eq!(client.server_capabilities(), (1, 1 << 1));
     client.close().await?;
     Ok(())
