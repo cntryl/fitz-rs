@@ -636,6 +636,7 @@ mod tests {
             retry: RetryPolicy::default(),
             heartbeat: HeartbeatOptions::default(),
             observability: FitzObservability::default(),
+            service_name: None,
             state,
         });
         let pattern = "schedule://realm/area/job/*".to_string();

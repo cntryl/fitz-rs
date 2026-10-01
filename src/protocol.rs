@@ -6,9 +6,11 @@ pub mod message_type {
     pub const CORRELATE: u16 = 2;
     pub const CORRELATED: u16 = 3;
     pub const SERVER_HELLO: u16 = 4;
+    pub const SESSION_METADATA: u16 = 5;
 
     pub const CAP_CORRELATION: u32 = 1 << 0;
-    pub const CAP_KV_SCAN_EXCLUSIVE: u32 = 1 << 1;
+    pub const CAP_SESSION_METADATA: u32 = 1 << 1;
+    pub const CAP_KV_SCAN_EXCLUSIVE: u32 = 1 << 2;
 
     // KV domain (100-199)
     pub const KV_BEGIN: u16 = 100;

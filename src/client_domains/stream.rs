@@ -414,6 +414,7 @@ mod tests {
             retry: RetryPolicy::default(),
             heartbeat: HeartbeatOptions::default(),
             observability: FitzObservability::default(),
+            service_name: None,
             state,
         });
         let pattern = "stream://realm/area/*".to_string();

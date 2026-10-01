@@ -121,6 +121,7 @@ pub(crate) struct AsyncConnectionOptions {
     pub retry: RetryPolicy,
     pub heartbeat: HeartbeatOptions,
     pub observability: FitzObservability,
+    pub service_name: Option<String>,
     pub state: watch::Sender<ConnectionState>,
 }
 
@@ -135,6 +136,7 @@ impl AsyncConnection {
             retry,
             heartbeat,
             observability,
+            service_name,
             state,
         } = options;
         let (commands, command_rx) = mpsc::channel(max_queued.max(1));
@@ -146,6 +148,7 @@ impl AsyncConnection {
         let close_requested = Arc::new(AtomicBool::new(false));
         let registrations = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let capabilities = Arc::new(AtomicU64::new(0));
+        let service_metadata_sent = AtomicBool::new(false);
         tokio::spawn(supervise(Supervisor {
             endpoint,
             token_provider,
@@ -153,6 +156,8 @@ impl AsyncConnection {
             reconnect,
             heartbeat,
             observability,
+            service_name,
+            service_metadata_sent,
             state,
             commands: command_rx,
             cancellations: cancellation_rx,
@@ -458,6 +463,8 @@ struct Supervisor {
     reconnect: ReconnectPolicy,
     heartbeat: HeartbeatOptions,
     observability: FitzObservability,
+    service_name: Option<String>,
+    service_metadata_sent: AtomicBool,
     state: watch::Sender<ConnectionState>,
     commands: mpsc::Receiver<Command>,
     cancellations: mpsc::UnboundedReceiver<u64>,
@@ -618,6 +625,9 @@ enum Session {
 
 async fn open_session(supervisor: &Supervisor) -> Result<Session> {
     supervisor.capabilities.store(0, Ordering::Release);
+    supervisor
+        .service_metadata_sent
+        .store(false, Ordering::Release);
     let token = supervisor.token_provider.token().await?;
     supervisor.state.send_replace(ConnectionState::Connecting);
     let mut session = if let Some(address) = supervisor.endpoint.strip_prefix("tcp://") {
@@ -661,7 +671,33 @@ async fn open_session(supervisor: &Supervisor) -> Result<Session> {
     )
     .await?;
     settle_authentication(supervisor, &mut session).await?;
+    if let Some(payload) = take_session_metadata(supervisor) {
+        write_session(
+            &mut session,
+            crate::protocol::message_type::SESSION_METADATA,
+            payload,
+        )
+        .await?;
+    }
     Ok(session)
+}
+
+fn take_session_metadata(supervisor: &Supervisor) -> Option<Vec<u8>> {
+    if supervisor.capabilities.load(Ordering::Acquire)
+        & u64::from(crate::protocol::message_type::CAP_SESSION_METADATA)
+        == 0
+        || supervisor
+            .service_metadata_sent
+            .swap(true, Ordering::AcqRel)
+    {
+        return None;
+    }
+    let service_name = supervisor.service_name.as_ref()?;
+    let name = service_name.as_bytes();
+    let mut payload = Vec::with_capacity(4 + name.len());
+    payload.extend_from_slice(&u32::try_from(name.len()).ok()?.to_be_bytes());
+    payload.extend_from_slice(name);
+    Some(payload)
 }
 
 fn emit_lifecycle(supervisor: &Supervisor, name: &'static str) {
@@ -815,6 +851,7 @@ where
             Some(id) = supervisor.cancellations.recv() => if !cancel_all_pending(&mut pending, &mut correlated, &mut queued, id) { canceled.insert(id); },
             frame = read_tcp_frame(&mut reader) => if let Ok(frame) = frame {
                 let Ok(records) = decode_incoming(supervisor, &frame) else { fail_all(&mut pending, &mut correlated, &mut queued); return SessionResult::Disconnected; };
+                if let Some(payload) = take_session_metadata(supervisor) && write_tcp(&mut writer, crate::protocol::message_type::SESSION_METADATA, payload).await.is_err() { fail_all(&mut pending, &mut correlated, &mut queued); return SessionResult::Disconnected; }
                 for (message_type, payload, correlation_id) in records {
                     if correlation_id != 0 {
                         dispatch_correlated(supervisor, &mut correlated, correlation_id, message_type, payload);
@@ -881,6 +918,7 @@ async fn run_websocket(
             Some(id) = supervisor.cancellations.recv() => if !cancel_all_pending(&mut pending, &mut correlated, &mut queued, id) { canceled.insert(id); },
             message = reader.next() => match message {
                 Some(Ok(Message::Binary(frame))) => if let Ok(records) = decode_incoming(supervisor, &frame) {
+                    if let Some(payload) = take_session_metadata(supervisor) { let frame=try_encode_message_frame(crate::protocol::message_type::SESSION_METADATA, &payload); if frame.is_err() || writer.send(Message::Binary(frame.unwrap_or_default().into())).await.is_err() { fail_all(&mut pending, &mut correlated, &mut queued); return SessionResult::Disconnected; } }
                     awaiting_pong = false;
                     heartbeat.as_mut().reset(tokio::time::Instant::now() + heartbeat_idle);
                     for (message_type, payload, correlation_id) in records {
@@ -1208,6 +1246,7 @@ mod tests {
             retry: RetryPolicy::default(),
             heartbeat: HeartbeatOptions::default(),
             observability: FitzObservability::default(),
+            service_name: None,
             state,
         });
         connection.connect().await.unwrap();
@@ -1256,6 +1295,7 @@ mod tests {
             retry: RetryPolicy::default(),
             heartbeat: HeartbeatOptions::default(),
             observability: FitzObservability::default(),
+            service_name: None,
             state,
         });
 
@@ -1282,6 +1322,8 @@ mod tests {
             reconnect: ReconnectPolicy::default(),
             heartbeat: HeartbeatOptions::default(),
             observability: FitzObservability::default(),
+            service_name: None,
+            service_metadata_sent: AtomicBool::new(false),
             state,
             commands,
             cancellations,
@@ -1370,6 +1412,8 @@ mod tests {
             reconnect: ReconnectPolicy::default(),
             heartbeat: HeartbeatOptions::default(),
             observability: FitzObservability::default(),
+            service_name: None,
+            service_metadata_sent: AtomicBool::new(false),
             state,
             commands,
             cancellations,
