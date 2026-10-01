@@ -19,6 +19,7 @@ async fn main() -> Result<()> {
         // Fetch a fresh token here. The provider is called again on reconnect.
         Ok(std::env::var("FITZ_TOKEN").unwrap_or_default())
     })
+    .service_name("orders-worker")
     .build()?;
 
     client.connect().await?;
@@ -27,6 +28,9 @@ async fn main() -> Result<()> {
     Ok(())
 }
 ```
+
+`service_name` is optional. New brokers record it on the active session after
+advertising the `SESSION_METADATA` capability; older brokers receive no metadata frame.
 
 For a broker that permits anonymous sessions, use
 `Client::anonymous("ws://127.0.0.1:4190/ws")`.

@@ -223,9 +223,15 @@ pub struct ClientBuilder {
     retry: RetryPolicy,
     heartbeat: HeartbeatOptions,
     observability: FitzObservability,
+    service_name: Option<String>,
 }
 
 impl ClientBuilder {
+    #[must_use]
+    pub fn service_name(mut self, name: impl Into<String>) -> Self {
+        self.service_name = Some(name.into());
+        self
+    }
     #[must_use]
     pub fn request_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
@@ -260,6 +266,15 @@ impl ClientBuilder {
     /// # Errors
     /// Returns an error when validation, encoding, transport, or broker processing fails.
     pub fn build(self) -> Result<Client> {
+        if let Some(service_name) = &self.service_name
+            && (service_name.trim().is_empty()
+                || service_name.len() > 128
+                || service_name.chars().any(char::is_control))
+        {
+            return Err(FitzError::Connection(
+                "service name must be non-empty, at most 128 UTF-8 bytes, and contain no control characters".into(),
+            ));
+        }
         let (state_tx, _) = watch::channel(ConnectionState::Disconnected);
         Ok(Client {
             inner: Arc::new(ClientInner {
@@ -271,6 +286,7 @@ impl ClientBuilder {
                 retry: self.retry,
                 heartbeat: self.heartbeat,
                 observability: self.observability,
+                service_name: self.service_name,
                 state_tx,
                 connection: Mutex::new(None),
                 notice: Mutex::new(None),
@@ -288,6 +304,7 @@ struct ClientInner {
     retry: RetryPolicy,
     heartbeat: HeartbeatOptions,
     observability: FitzObservability,
+    service_name: Option<String>,
     state_tx: watch::Sender<ConnectionState>,
     connection: Mutex<Option<AsyncConnection>>,
     notice: Mutex<Option<client_domains::notice::NoticeClient>>,
@@ -314,6 +331,7 @@ impl Client {
             retry: RetryPolicy::default(),
             heartbeat: HeartbeatOptions::default(),
             observability: FitzObservability::default(),
+            service_name: None,
         }
     }
     #[must_use]
@@ -327,6 +345,7 @@ impl Client {
             retry: RetryPolicy::default(),
             heartbeat: HeartbeatOptions::default(),
             observability: FitzObservability::default(),
+            service_name: None,
         }
     }
     #[must_use]
@@ -436,6 +455,7 @@ impl Client {
                     retry: self.inner.retry.clone(),
                     heartbeat: self.inner.heartbeat.clone(),
                     observability: self.inner.observability.clone(),
+                    service_name: self.inner.service_name.clone(),
                     state: self.inner.state_tx.clone(),
                 })
             })

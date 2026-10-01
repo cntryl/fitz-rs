@@ -1180,6 +1180,7 @@ mod tests {
             retry: RetryPolicy::default(),
             heartbeat: HeartbeatOptions::default(),
             observability: FitzObservability::default(),
+            service_name: None,
             state,
         });
         connection.connect().await.unwrap();
@@ -1917,6 +1918,7 @@ mod tests {
             retry: RetryPolicy::default(),
             heartbeat: HeartbeatOptions::default(),
             observability: FitzObservability::default(),
+            service_name: None,
             state,
         });
         connection.connect().await.unwrap();
@@ -2359,6 +2361,7 @@ mod tests {
             retry: RetryPolicy::default(),
             heartbeat: HeartbeatOptions::default(),
             observability: FitzObservability::default(),
+            service_name: None,
             state,
         });
         connection.connect().await.unwrap();
@@ -2524,6 +2527,7 @@ mod tests {
             retry: RetryPolicy::default(),
             heartbeat: HeartbeatOptions::default(),
             observability: FitzObservability::default(),
+            service_name: None,
             state,
         });
         connection.connect().await.unwrap();
