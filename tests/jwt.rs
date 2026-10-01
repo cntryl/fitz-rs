@@ -76,7 +76,7 @@ fn make_signed_jwt(
 }
 
 #[test]
-fn test_jwt_signing_provider_is_available() {
+fn should_provide_signed_token_given_test_claims() {
     let token = make_test_jwt("test-realm", "test-secret");
     assert_eq!(token.split('.').count(), 3);
 }

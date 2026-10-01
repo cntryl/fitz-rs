@@ -103,10 +103,17 @@ pub struct KvPair {
 
 #[derive(Debug, Clone, Default)]
 pub struct KvScanOptions {
+    /// Inclusive directional bound: lower for forward scans, upper for reverse scans.
     pub start_key: Option<Vec<u8>>,
+    /// Exclusive directional bound: upper for forward scans, lower for reverse scans.
     pub end_key: Option<Vec<u8>>,
+    /// Maximum items in this page; `None` or `Some(0)` uses the server default/frame budget.
     pub limit: Option<u32>,
+    /// Selects descending key order and reverse directional bounds.
     pub reverse: bool,
+    /// Resume strictly after `start_key` in the selected direction.
+    /// Requires the broker to advertise `CAP_KV_SCAN_EXCLUSIVE`.
+    pub start_exclusive: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,12 +256,24 @@ impl KvTransaction {
     /// Returns an error when validation, transport, or broker processing fails.
     pub async fn scan(&self, options: &KvScanOptions) -> Result<KvScanPage> {
         self.ensure_open()?;
-        if let (Some(start), Some(end)) = (&options.start_key, &options.end_key)
-            && ((!options.reverse && start > end) || (options.reverse && start < end))
+        if options.start_exclusive
+            && self.connection.capability_bits()
+                & crate::protocol::message_type::CAP_KV_SCAN_EXCLUSIVE
+                == 0
         {
-            return Err(FitzError::Protocol(
-                "scan bounds do not match the requested direction".into(),
+            return Err(FitzError::DomainError(
+                "broker did not advertise exclusive KV SCAN resume support".into(),
             ));
+        }
+        if scan_range_is_empty(
+            options.start_key.as_deref(),
+            options.end_key.as_deref(),
+            options.reverse,
+        ) {
+            return Ok(KvScanPage {
+                pairs: Vec::new(),
+                has_more: false,
+            });
         }
         let mut encoder = PayloadEncoder::new();
         encoder.put_u64(self.transaction_id).put_string(&self.route);
@@ -266,6 +285,9 @@ impl KvTransaction {
             encoder.put_u8(0);
         }
         encoder.put_u8(u8::from(options.reverse));
+        if options.start_exclusive {
+            encoder.put_u8(1);
+        }
         let response = self
             .connection
             .request_replayable_in_generation(
@@ -274,20 +296,7 @@ impl KvTransaction {
                 Some(self.generation),
             )
             .await?;
-        let mut decoder = PayloadDecoder::new(&response);
-        if decoder.get_u8()? != 0 {
-            return Err(FitzError::DomainError("KV SCAN failed".into()));
-        }
-        let count = decoder.get_u32()?;
-        let mut pairs = Vec::with_capacity(count as usize);
-        for _ in 0..count {
-            pairs.push(KvPair {
-                key: decoder.get_bytes()?,
-                value: decoder.get_bytes()?,
-            });
-        }
-        let has_more = !decoder.is_empty() && decoder.get_u8()? == 1;
-        Ok(KvScanPage { pairs, has_more })
+        decode_scan_response(&response)
     }
 
     /// Performs the operation asynchronously.
@@ -329,6 +338,135 @@ impl KvTransaction {
         let mut encoder = PayloadEncoder::new();
         encoder.put_u64(self.transaction_id).put_string(&self.route);
         encoder.finish()
+    }
+}
+
+fn scan_range_is_empty(start: Option<&[u8]>, end: Option<&[u8]>, reverse: bool) -> bool {
+    let (Some(start), Some(end)) = (start, end) else {
+        return false;
+    };
+    match start.cmp(end) {
+        std::cmp::Ordering::Equal => true,
+        std::cmp::Ordering::Greater => !reverse,
+        std::cmp::Ordering::Less => reverse,
+    }
+}
+
+fn decode_scan_response(payload: &[u8]) -> Result<KvScanPage> {
+    let mut decoder = PayloadDecoder::new(payload);
+    if decoder.get_u8()? != 0 {
+        return Err(FitzError::DomainError("KV SCAN failed".into()));
+    }
+    let count = decoder.get_u32()?;
+    let available = decoder.remaining();
+    let maximum_count = available.saturating_sub(1) / 8;
+    let capacity = usize::try_from(count).map_err(|_| {
+        FitzError::Protocol(format!(
+            "KV SCAN item count {count} does not fit this target"
+        ))
+    })?;
+    if capacity > maximum_count {
+        return Err(FitzError::Protocol(format!(
+            "KV SCAN item count {count} exceeds the remaining response payload"
+        )));
+    }
+    let mut pairs = Vec::with_capacity(capacity);
+    for _ in 0..count {
+        pairs.push(KvPair {
+            key: decoder.get_bytes()?,
+            value: decoder.get_bytes()?,
+        });
+    }
+    let has_more = match decoder.get_u8()? {
+        0 => false,
+        1 => true,
+        flag => {
+            return Err(FitzError::Protocol(format!(
+                "KV SCAN returned invalid has_more flag {flag}"
+            )));
+        }
+    };
+    if !decoder.is_empty() {
+        return Err(FitzError::Protocol(
+            "KV SCAN response contains trailing bytes".into(),
+        ));
+    }
+    Ok(KvScanPage { pairs, has_more })
+}
+
+#[cfg(test)]
+mod scan_response_tests {
+    use super::{decode_scan_response, scan_range_is_empty};
+    use crate::FitzError;
+    use crate::codec::PayloadEncoder;
+
+    #[test]
+    fn should_reject_scan_response_without_has_more() {
+        // Arrange
+        let mut encoder = PayloadEncoder::new();
+        encoder.put_u8(0).put_u32(0);
+
+        // Act
+        let result = decode_scan_response(&encoder.finish());
+
+        // Assert
+        assert!(matches!(result, Err(FitzError::Codec(_))));
+    }
+
+    #[test]
+    fn should_reject_scan_response_with_invalid_has_more() {
+        // Arrange
+        let mut encoder = PayloadEncoder::new();
+        encoder.put_u8(0).put_u32(0).put_u8(2);
+
+        // Act
+        let result = decode_scan_response(&encoder.finish());
+
+        // Assert
+        assert!(matches!(result, Err(FitzError::Protocol(_))));
+    }
+
+    #[test]
+    fn should_reject_scan_response_with_trailing_bytes() {
+        // Arrange
+        let mut encoder = PayloadEncoder::new();
+        encoder.put_u8(0).put_u32(0).put_u8(0).put_u8(0xff);
+
+        // Act
+        let result = decode_scan_response(&encoder.finish());
+
+        // Assert
+        assert!(matches!(result, Err(FitzError::Protocol(_))));
+    }
+
+    #[test]
+    fn should_reject_impossible_scan_count_before_allocating() {
+        // Arrange
+        let mut encoder = PayloadEncoder::new();
+        encoder.put_u8(0).put_u32(u32::MAX);
+
+        // Act
+        let result = decode_scan_response(&encoder.finish());
+
+        // Assert
+        assert!(matches!(result, Err(FitzError::Protocol(_))));
+    }
+
+    #[test]
+    fn should_treat_inverted_scan_bounds_as_empty_for_direction() {
+        // Arrange
+        let lower = b"a";
+        let upper = b"z";
+
+        // Act
+        let forward_is_empty = scan_range_is_empty(Some(upper), Some(lower), false);
+        let reverse_is_empty = scan_range_is_empty(Some(lower), Some(upper), true);
+        let valid_reverse_is_empty = scan_range_is_empty(Some(upper), Some(lower), true);
+
+        // Assert
+        assert!(forward_is_empty);
+        assert!(reverse_is_empty);
+        assert!(!valid_reverse_is_empty);
     }
 }
 
