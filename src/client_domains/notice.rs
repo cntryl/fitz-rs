@@ -333,7 +333,7 @@ mod tests {
             .await;
             let (kind, payload) = read_frame(&mut stream).await;
             assert_eq!(kind, message_type::NOTICE_UNSUBSCRIBE_ALL);
-            assert!(payload.is_empty());
+            assert_eq!(payload, Vec::<u8>::new());
             write_frame(&mut stream, kind, &[0]).await;
         });
         let (state, _) = watch::channel(ConnectionState::Disconnected);
