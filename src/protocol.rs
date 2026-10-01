@@ -8,6 +8,7 @@ pub mod message_type {
     pub const SERVER_HELLO: u16 = 4;
 
     pub const CAP_CORRELATION: u32 = 1 << 0;
+    pub const CAP_KV_SCAN_EXCLUSIVE: u32 = 1 << 1;
 
     // KV domain (100-199)
     pub const KV_BEGIN: u16 = 100;

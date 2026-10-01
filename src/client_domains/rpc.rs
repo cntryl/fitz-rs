@@ -151,7 +151,15 @@ fn decode_terminal_error(body: &[u8]) -> Option<FitzError> {
 
 fn decode_rpc_response_frame(decoder: &mut PayloadDecoder<'_>) -> Result<(u64, bool, Vec<u8>)> {
     let sequence = decoder.get_u64()?;
-    let end = decoder.get_u8()? != 0;
+    let end = match decoder.get_u8()? {
+        0 => false,
+        1 => true,
+        flags => {
+            return Err(FitzError::Protocol(format!(
+                "RPC response contains unsupported flags {flags}"
+            )));
+        }
+    };
     let body = decoder.get_bytes()?;
     if !decoder.is_empty() {
         return Err(FitzError::Protocol(
@@ -330,6 +338,21 @@ mod tests {
         assert_eq!(sequence, 7);
         assert!(end);
         assert!(body.is_empty());
+    }
+
+    #[test]
+    fn should_reject_rpc_response_with_unsupported_flags() {
+        // Arrange
+        let mut encoder = PayloadEncoder::new();
+        encoder.put_u64(0).put_u8(2).put_bytes(&[]);
+        let payload = encoder.finish();
+        let mut decoder = PayloadDecoder::new(&payload);
+
+        // Act
+        let result = decode_rpc_response_frame(&mut decoder);
+
+        // Assert
+        assert!(matches!(result, Err(FitzError::Protocol(_))));
     }
 
     #[test]
