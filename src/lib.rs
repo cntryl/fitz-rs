@@ -188,6 +188,7 @@ impl Default for HeartbeatOptions {
 }
 
 /// Supplies an opaque token for every initial connection and reconnect.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait TokenProvider: Send + Sync + 'static {
     async fn token(&self) -> Result<String>;
