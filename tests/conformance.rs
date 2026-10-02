@@ -1,4 +1,6 @@
 mod jwt;
+#[path = "conformance/server_020.rs"]
+mod server_020;
 
 use cntryl_fitz::client_domains::kv::KvGetResult;
 use cntryl_fitz::client_domains::lease::LeaseAcquireOptions;
@@ -386,7 +388,9 @@ async fn should_correlate_same_type_requests_out_of_order() {
     let connected = client(Transport::from_env(), AuthMode::from_env());
     connected.connect().await.expect("broker connection");
     assert!(connected.correlation_enabled());
-    assert_eq!(connected.server_capabilities(), (1, 1));
+    let (version, capabilities) = connected.server_capabilities();
+    assert_eq!(version, 1);
+    assert_eq!(capabilities & 1, 1);
     let parked_route = unique_route("queue");
     let ready_route = unique_route("queue");
     connected

@@ -5,20 +5,23 @@ use tokio::net::TcpListener;
 
 #[test]
 fn should_validate_service_name_using_utf8_byte_limit() {
-    // Arrange / Act / Assert
-    let valid = Client::builder("tcp://127.0.0.1:1", || async { Ok(String::new()) })
+    // Arrange
+    let address = "tcp://127.0.0.1:1";
+
+    // Act
+    let valid = Client::builder(address, || async { Ok(String::new()) })
         .service_name("é".repeat(64))
         .build();
-    assert!(valid.is_ok());
-
-    let padded = Client::builder("tcp://127.0.0.1:1", || async { Ok(String::new()) })
+    let padded = Client::builder(address, || async { Ok(String::new()) })
         .service_name(format!(" {} ", "é".repeat(64)))
         .build();
-    assert!(padded.is_ok());
-
-    let oversized = Client::builder("tcp://127.0.0.1:1", || async { Ok(String::new()) })
+    let oversized = Client::builder(address, || async { Ok(String::new()) })
         .service_name("é".repeat(65))
         .build();
+
+    // Assert
+    assert!(valid.is_ok());
+    assert!(padded.is_ok());
     assert!(oversized.is_err());
 }
 
