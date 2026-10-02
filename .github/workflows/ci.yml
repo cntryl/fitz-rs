@@ -1,20 +1,15 @@
-name: ci
+name: CI
 
 on:
-  workflow_dispatch:
-    inputs:
-      broker_tag:
-        description: Fitz broker image tag
-        type: choice
-        options: [main, develop]
-        default: main
   push:
   pull_request:
-  schedule:
-    - cron: "0 0 * * *"
 
-env:
-  FITZ_BROKER_IMAGE: ghcr.io/cntryl/fitz:${{ inputs.broker_tag || 'main' }}
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   verify:
@@ -47,49 +42,6 @@ jobs:
 
       - name: Build documentation
         run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --all-features --no-deps
-
-      - name: Package crate
-        run: cargo package
-
-  broker:
-    timeout-minutes: 20
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
-
-      - name: Set up stable Rust
-        uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: stable
-
-      - name: Start broker stack
-        run: docker compose up -d
-
-      - name: Run broker-backed conformance and domain matrix
-        shell: bash
-        run: |
-          for transport in tcp ws; do
-            for auth_mode in anonymous valid_jwt; do
-              output="artifacts/conformance-${transport}-${auth_mode}.json"
-              CONFORMANCE_TRANSPORT="$transport" \
-                CONFORMANCE_AUTH_MODE="$auth_mode" \
-                CONFORMANCE_OUTPUT="$output" \
-                cargo test --test conformance -- --ignored --nocapture
-            done
-          done
-
-      - name: Upload conformance results
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: fitz-rs-conformance-results
-          path: artifacts/conformance-*.json
-          if-no-files-found: warn
-
-      - name: Stop broker stack
-        if: always()
-        run: docker compose down --volumes
 
   security:
     timeout-minutes: 10

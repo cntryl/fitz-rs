@@ -16,7 +16,7 @@ fn should_decode_begin_response_with_session_id() {
     let decoded = decode_stream_response("BEGIN", &buf).unwrap();
     // Assert
     assert_eq!(decoded.session_id, Some(9));
-    assert!(decoded.data.is_empty());
+    assert_eq!(decoded.data, Vec::<u8>::new());
 }
 
 #[test]

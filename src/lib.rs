@@ -188,6 +188,7 @@ impl Default for HeartbeatOptions {
 }
 
 /// Supplies an opaque token for every initial connection and reconnect.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait TokenProvider: Send + Sync + 'static {
     async fn token(&self) -> Result<String>;
@@ -227,9 +228,10 @@ pub struct ClientBuilder {
 }
 
 impl ClientBuilder {
+    /// Report a trimmed friendly service name to brokers that advertise session metadata.
     #[must_use]
     pub fn service_name(mut self, name: impl Into<String>) -> Self {
-        self.service_name = Some(name.into());
+        self.service_name = Some(name.into().trim().to_owned());
         self
     }
     #[must_use]

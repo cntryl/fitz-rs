@@ -337,7 +337,7 @@ mod tests {
         // Assert
         assert_eq!(sequence, 7);
         assert!(end);
-        assert!(body.is_empty());
+        assert_eq!(body, Vec::<u8>::new());
     }
 
     #[test]
