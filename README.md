@@ -76,6 +76,55 @@ Notice handles after broker acknowledgment. Schedule `create_batch()` (706) and
 `list_v2()` (707) expose broker extensions; `list()` (702) remains the portable
 pagination API. Terminal RPC error responses surface as `FitzError::Domain`.
 
+Workers can link a downstream call to an inbound request with
+`rpc.call_from_request(&request, route, body).await?`. This carries the current
+remaining budget and ends the downstream stream when the parent request is
+cancelled. Dropping a response stream also sends best-effort cancellation when
+the broker advertises `CAP_RPC_CANCELLATION`.
+
+RPC timeouts are remaining end-to-end budgets (up to one day). Worker budgets
+start at transport receipt, include local buffering time, and cancel
+`request.cancellation` locally when they expire. Disconnect also cancels active
+worker contexts. A downstream link belongs to that invocation; finishing or
+dropping its response stream disposes the link without cancelling the parent or
+other calls. Older brokers receive unchanged request and registration bytes;
+local cancellation reports `Unsupported` when remote cancellation is unavailable.
+
+For an A → B → C chain, B passes its inbound context explicitly:
+
+```rust,no_run
+use futures_util::StreamExt;
+# async fn forward(rpc: cntryl_fitz::client_domains::rpc::RpcClient,
+# mut inbound: cntryl_fitz::client_domains::rpc::RpcRequest) -> cntryl_fitz::Result<()> {
+let mut child = rpc.call_from_request(&inbound, "rpc://prod/app/c", &inbound.body).await?;
+while let Some(frame) = child.next().await {
+    inbound.respond(&frame?.body, false).await?;
+}
+drop(child);
+// Release invocation-owned resources before finishing or dropping the context.
+inbound.finish().await?;
+# Ok(())
+# }
+```
+
+Sending a terminal response alone does not acknowledge worker cleanup. Finish
+or release the request context only after cleanup has completed; a negotiated
+cleanup acknowledgment then lets the broker reclaim cancelled execution credit.
+Cancellation is cooperative and best-effort. `Forwarded` confirms routing of
+the signal, not stopped work or undone side effects. No cancellation outcome
+establishes rollback or makes retry safe after dispatch.
+
+The real SDK chain scenarios run against the candidate broker on either transport:
+
+```console
+FITZ_RPC_CHAIN_ADDR=tcp://127.0.0.1:4191 cargo test --test rpc_chain -- --ignored
+FITZ_RPC_CHAIN_ADDR=ws://127.0.0.1:4190/ws cargo test --test rpc_chain -- --ignored
+```
+
+Set `FITZ_BROKER_JWT_HMAC_SECRET` (and optionally `FITZ_BROKER_JWT_AUDIENCE` and
+`FITZ_BROKER_JWT_TENANT`) for the same authenticated scenarios. Stable package
+publication and release tags remain separate from these source acceptance checks.
+
 Schedule backend unavailability and broker saturation use the distinct coded
 error `error_code::SCHEDULE_BACKEND_ERROR` (`7010`). It is retryable subject to
 operation safety and is never mapped to a cron or parse error.

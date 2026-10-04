@@ -11,6 +11,7 @@ pub mod message_type {
     pub const CAP_CORRELATION: u32 = 1 << 0;
     pub const CAP_SESSION_METADATA: u32 = 1 << 1;
     pub const CAP_KV_SCAN_EXCLUSIVE: u32 = 1 << 2;
+    pub const CAP_RPC_CANCELLATION: u32 = 1 << 3;
 
     // KV domain (100-199)
     pub const KV_BEGIN: u16 = 100;
@@ -40,6 +41,8 @@ pub mod message_type {
     pub const RPC_UNSUBSCRIBE: u16 = 301;
     pub const RPC_REQUEST: u16 = 302;
     pub const RPC_RESPONSE: u16 = 303;
+    pub const RPC_CANCEL: u16 = 304;
+    pub const RPC_LIFECYCLE: u16 = 305;
 
     // Lease domain (400-499)
     pub const LEASE_ACQUIRE: u16 = 400;

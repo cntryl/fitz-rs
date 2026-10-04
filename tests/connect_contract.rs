@@ -4,22 +4,45 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 #[test]
-fn should_validate_service_name_using_utf8_byte_limit() {
-    // Arrange / Act / Assert
-    let valid = Client::builder("tcp://127.0.0.1:1", || async { Ok(String::new()) })
-        .service_name("é".repeat(64))
-        .build();
-    assert!(valid.is_ok());
+fn should_accept_service_name_at_utf8_byte_limit() {
+    // Arrange
+    let name = "é".repeat(64);
 
-    let padded = Client::builder("tcp://127.0.0.1:1", || async { Ok(String::new()) })
-        .service_name(format!(" {} ", "é".repeat(64)))
+    // Act
+    let result = Client::builder("tcp://127.0.0.1:1", || async { Ok(String::new()) })
+        .service_name(name)
         .build();
-    assert!(padded.is_ok());
 
-    let oversized = Client::builder("tcp://127.0.0.1:1", || async { Ok(String::new()) })
-        .service_name("é".repeat(65))
+    // Assert
+    assert!(result.is_ok());
+}
+
+#[test]
+fn should_trim_service_name_before_utf8_byte_limit_validation() {
+    // Arrange
+    let name = format!(" {} ", "é".repeat(64));
+
+    // Act
+    let result = Client::builder("tcp://127.0.0.1:1", || async { Ok(String::new()) })
+        .service_name(name)
         .build();
-    assert!(oversized.is_err());
+
+    // Assert
+    assert!(result.is_ok());
+}
+
+#[test]
+fn should_reject_service_name_exceeding_utf8_byte_limit() {
+    // Arrange
+    let name = "é".repeat(65);
+
+    // Act
+    let result = Client::builder("tcp://127.0.0.1:1", || async { Ok(String::new()) })
+        .service_name(name)
+        .build();
+
+    // Assert
+    assert!(result.is_err());
 }
 
 #[tokio::test]

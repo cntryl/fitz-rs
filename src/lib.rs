@@ -31,6 +31,7 @@ pub mod client_domains;
 mod codec;
 mod domains;
 mod error;
+mod notifications;
 mod observability;
 mod protocol;
 

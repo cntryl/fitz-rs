@@ -2,6 +2,7 @@ use crate::codec::{
     decode_message_frame, decode_message_frames, try_encode_correlated_frame,
     try_encode_message_frame,
 };
+use crate::notifications::{Notifications, ReceivedNotification};
 use crate::{
     ConnectionState, FitzAttributes, FitzError, FitzLifecycleEvent, FitzObservability,
     HeartbeatOptions, ReconnectPolicy, Result, RetryPolicy, TokenProvider,
@@ -104,7 +105,7 @@ pub(crate) struct AsyncConnection {
     generation: Arc<AtomicU64>,
     generation_watch: watch::Sender<u64>,
     close_requested: Arc<AtomicBool>,
-    notifications: Arc<parking_lot::Mutex<HashMap<u16, broadcast::Sender<Vec<u8>>>>>,
+    notifications: Arc<Notifications>,
     notification_epoch: Arc<parking_lot::Mutex<HashMap<u16, Arc<parking_lot::Mutex<u64>>>>>,
     registrations: Arc<parking_lot::Mutex<HashMap<u64, Registration>>>,
     next_registration_id: Arc<AtomicU64>,
@@ -141,7 +142,7 @@ impl AsyncConnection {
         } = options;
         let (commands, command_rx) = mpsc::channel(max_queued.max(1));
         let (cancellations, cancellation_rx) = mpsc::unbounded_channel();
-        let notifications = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let notifications = Arc::new(Notifications::default());
         let notification_epoch = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let generation = Arc::new(AtomicU64::new(0));
         let (generation_watch, _) = watch::channel(0_u64);
@@ -347,11 +348,15 @@ impl AsyncConnection {
         message_type: u16,
         capacity: usize,
     ) -> broadcast::Receiver<Vec<u8>> {
-        let mut notifications = self.notifications.lock();
-        notifications
-            .entry(message_type)
-            .or_insert_with(|| broadcast::channel(capacity.max(1)).0)
-            .subscribe()
+        self.notifications.subscribe(message_type, capacity)
+    }
+
+    pub(crate) fn timed_notifications(
+        &self,
+        message_type: u16,
+        capacity: usize,
+    ) -> broadcast::Receiver<ReceivedNotification> {
+        self.notifications.subscribe_timed(message_type, capacity)
     }
 
     /// Returns the current notification epoch scoped to `message_type`.
@@ -468,7 +473,7 @@ struct Supervisor {
     state: watch::Sender<ConnectionState>,
     commands: mpsc::Receiver<Command>,
     cancellations: mpsc::UnboundedReceiver<u64>,
-    notifications: Arc<parking_lot::Mutex<HashMap<u16, broadcast::Sender<Vec<u8>>>>>,
+    notifications: Arc<Notifications>,
     notification_epoch: Arc<parking_lot::Mutex<HashMap<u16, Arc<parking_lot::Mutex<u64>>>>>,
     generation: Arc<AtomicU64>,
     generation_watch: watch::Sender<u64>,
@@ -1140,15 +1145,16 @@ fn dispatch_correlated(
 }
 
 fn publish_notification(supervisor: &Supervisor, message_type: u16, payload: Vec<u8>) {
-    let Some(sender) = supervisor.notifications.lock().get(&message_type).cloned() else {
-        return;
-    };
     {
         let slot = epoch_slot(&supervisor.notification_epoch, message_type);
         let mut epoch = slot.lock();
         *epoch = epoch.wrapping_add(1);
     }
-    let _ = sender.send(payload);
+    supervisor.notifications.publish(
+        message_type,
+        payload,
+        supervisor.generation.load(Ordering::Acquire),
+    );
 }
 
 fn cancel_pending(pending: &mut HashMap<u16, VecDeque<PendingRequest>>, id: u64) -> bool {
@@ -1327,7 +1333,7 @@ mod tests {
             state,
             commands,
             cancellations,
-            notifications: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            notifications: Arc::new(Notifications::default()),
             notification_epoch: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             generation,
             generation_watch: watch::channel(0_u64).0,
@@ -1417,7 +1423,7 @@ mod tests {
             state,
             commands,
             cancellations,
-            notifications: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            notifications: Arc::new(Notifications::default()),
             notification_epoch: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             generation: Arc::new(AtomicU64::new(0)),
             generation_watch: watch::channel(0_u64).0,
