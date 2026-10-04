@@ -11,6 +11,53 @@ mod jwt;
 
 #[tokio::test]
 #[ignore = "requires a broker advertising CAP_RPC_CANCELLATION at FITZ_RPC_CHAIN_ADDR"]
+async fn should_receive_worker_responses_given_opaque_dispatch_identity() -> Result<()> {
+    // Arrange
+    let endpoint =
+        std::env::var("FITZ_RPC_CHAIN_ADDR").unwrap_or_else(|_| "tcp://127.0.0.1:4191".to_owned());
+    let caller = client(&endpoint)?;
+    let worker_client = client(&endpoint)?;
+    caller.connect().await?;
+    worker_client.connect().await?;
+    let route = format!("rpc://chain/app/unary-{}", uuid::Uuid::new_v4());
+    let mut worker = worker_client.rpc()?.register_worker(&route, 1).await?;
+    let serving = tokio::spawn(async move {
+        let mut request = worker.next().await.unwrap().unwrap();
+        request.respond(b"first", false).await.unwrap();
+        request.respond(b"last", true).await.unwrap();
+    });
+
+    // Act
+    let mut response = caller.rpc()?.call(&route, b"request").await?;
+    let first = response.next().await.unwrap()?;
+    let last = response.next().await.unwrap()?;
+    let ended = response.next().await.is_none();
+    serving.await.unwrap();
+
+    // Assert
+    assert_eq!((first.sequence, first.body), (0, b"first".to_vec()));
+    assert_eq!((last.sequence, last.body), (1, b"last".to_vec()));
+    assert!(ended);
+    caller.close().await?;
+    worker_client.close().await?;
+    Ok(())
+}
+
+fn client(endpoint: &str) -> Result<Client> {
+    if let Ok(secret) = std::env::var("FITZ_BROKER_JWT_HMAC_SECRET") {
+        let token = jwt::make_test_jwt("chain", &secret);
+        Client::builder(endpoint, move || {
+            let token = token.clone();
+            async move { Ok(token) }
+        })
+        .build()
+    } else {
+        Client::anonymous(endpoint).build()
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a broker advertising CAP_RPC_CANCELLATION at FITZ_RPC_CHAIN_ADDR"]
 async fn should_cancel_real_sdk_call_chain_given_caller_cancellation() -> Result<()> {
     // Arrange
     let chain = Chain::start(Duration::from_secs(3)).await?;
@@ -51,19 +98,7 @@ impl Chain {
     async fn start(budget: Duration) -> Result<Self> {
         let endpoint = std::env::var("FITZ_RPC_CHAIN_ADDR")
             .unwrap_or_else(|_| "tcp://127.0.0.1:4191".to_owned());
-        let make_client = || {
-            if let Ok(secret) = std::env::var("FITZ_BROKER_JWT_HMAC_SECRET") {
-                let token = jwt::make_test_jwt("chain", &secret);
-                Client::builder(&endpoint, move || {
-                    let token = token.clone();
-                    async move { Ok(token) }
-                })
-                .build()
-            } else {
-                Client::anonymous(&endpoint).build()
-            }
-        };
-        let clients = [make_client()?, make_client()?, make_client()?];
+        let clients = [client(&endpoint)?, client(&endpoint)?, client(&endpoint)?];
         for client in &clients {
             client.connect().await?;
             assert_ne!(client.server_capabilities().1 & (1 << 3), 0);
