@@ -32,6 +32,10 @@ async fn main() -> Result<()> {
 `service_name` is optional. New brokers record it on the active session after
 advertising the `SESSION_METADATA` capability; older brokers receive no metadata frame.
 
+`connect()` waits for `SERVER_HELLO` on both transports within the configured
+connection timeout, so negotiated capabilities are available before registration.
+An explicit legacy hello without cancellation support remains valid.
+
 For a broker that permits anonymous sessions, use
 `Client::anonymous("ws://127.0.0.1:4190/ws")`.
 
@@ -87,7 +91,10 @@ start at transport receipt, include local buffering time, and cancel
 `request.cancellation` locally when they expire. Disconnect also cancels active
 worker contexts. A downstream link belongs to that invocation; finishing or
 dropping its response stream disposes the link without cancelling the parent or
-other calls. Older brokers receive unchanged request and registration bytes;
+other calls. An already canceled parent rejects downstream work locally. Broker
+cancellation discards buffered requests before application delivery and acknowledges
+their cleanup immediately; active requests acknowledge when their context is released.
+Older brokers receive unchanged request and registration bytes;
 local cancellation reports `Unsupported` when remote cancellation is unavailable.
 
 For an A → B → C chain, B passes its inbound context explicitly:

@@ -739,13 +739,13 @@ fn apply_server_hello(supervisor: &Supervisor, payload: &[u8]) {
 }
 
 async fn settle_authentication(supervisor: &Supervisor, session: &mut Session) -> Result<()> {
-    const SETTLE_DELAY: Duration = Duration::from_millis(100);
     match session {
         Session::Tcp(stream) => {
-            match tokio::time::timeout(SETTLE_DELAY, read_tcp(stream)).await {
-                Err(_) => Ok(()),
+            match tokio::time::timeout(supervisor.timeout, read_tcp(stream)).await {
+                Err(_) => Err(FitzError::Timeout),
                 Ok(Ok((message_type, payload)))
-                    if message_type == crate::protocol::message_type::SERVER_HELLO =>
+                    if message_type == crate::protocol::message_type::SERVER_HELLO
+                        && payload.len() >= 6 =>
                 {
                     // SERVER_HELLO is an unsolicited capability advertisement. It may
                     // arrive during the authentication settle window and is not an
@@ -765,14 +765,14 @@ async fn settle_authentication(supervisor: &Supervisor, session: &mut Session) -
             }
         }
         Session::WebSocket(socket) => {
-            let deadline = tokio::time::Instant::now() + SETTLE_DELAY;
+            let deadline = tokio::time::Instant::now() + supervisor.timeout;
             loop {
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if remaining.is_zero() {
-                    return Ok(());
+                    return Err(FitzError::Timeout);
                 }
                 match tokio::time::timeout(remaining, socket.next()).await {
-                    Err(_) => return Ok(()),
+                    Err(_) => return Err(FitzError::Timeout),
                     Ok(Some(Ok(Message::Ping(payload)))) => socket
                         .send(Message::Pong(payload))
                         .await
@@ -780,12 +780,15 @@ async fn settle_authentication(supervisor: &Supervisor, session: &mut Session) -
                     Ok(Some(Ok(Message::Pong(_)))) => {}
                     Ok(Some(Ok(Message::Binary(frame)))) => {
                         let (message_type, payload_start) = decode_message_frame(&frame)?;
-                        if message_type != crate::protocol::message_type::SERVER_HELLO {
+                        if message_type != crate::protocol::message_type::SERVER_HELLO
+                            || frame.len() - payload_start < 6
+                        {
                             return Err(FitzError::Protocol(
                                 "broker sent an unexpected authentication response".into(),
                             ));
                         }
                         apply_server_hello(supervisor, &frame[payload_start..]);
+                        return Ok(());
                     }
                     Ok(Some(Ok(_)) | None) => {
                         return Err(FitzError::Authentication {
@@ -1232,6 +1235,13 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let (mut reader, mut writer) = stream.into_split();
             let _connect = read_tcp(&mut reader).await.unwrap();
+            write_tcp(
+                &mut writer,
+                crate::protocol::message_type::SERVER_HELLO,
+                vec![0, 1, 0, 0, 0, 0],
+            )
+            .await
+            .unwrap();
             let _first = read_tcp(&mut reader).await.unwrap();
             write_tcp(&mut writer, 100, b"late".to_vec()).await.unwrap();
             let _second = read_tcp(&mut reader).await.unwrap();
@@ -1281,6 +1291,13 @@ mod tests {
             drop(first);
             let (mut second, _) = listener.accept().await.unwrap();
             let _ = read_tcp(&mut second).await.unwrap();
+            write_tcp(
+                &mut second,
+                crate::protocol::message_type::SERVER_HELLO,
+                vec![0, 1, 0, 0, 0, 0],
+            )
+            .await
+            .unwrap();
             tokio::time::sleep(Duration::from_millis(250)).await;
         });
         let token_calls = Arc::new(AtomicUsize::new(0));

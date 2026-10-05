@@ -128,6 +128,9 @@ impl RpcClient {
         route: &str,
         body: &[u8],
     ) -> Result<RpcResponseStream> {
+        if request.cancellation.is_cancelled() {
+            return Err(FitzError::Canceled);
+        }
         let mut stream = self
             .call_with_timeout(route, body, request.remaining_time())
             .await?;
@@ -309,7 +312,23 @@ impl RpcResponseStream {
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            match tokio::time::timeout_at(deadline, self.lifecycle_receiver.recv()).await {
+            let result = tokio::select! {
+                result = tokio::time::timeout_at(deadline, self.lifecycle_receiver.recv()) => result,
+                () = async {
+                    if let Some(closed) = &mut self.connection_closed {
+                        closed.await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    self.finished = true;
+                    self.timeout = None;
+                    self.cancellation_shutdown.cancel();
+                    self.cancellation_outcome = Some(RpcCancellationOutcome::ConnectionClosed);
+                    return RpcCancellationOutcome::ConnectionClosed;
+                }
+            };
+            match result {
                 Ok(Ok(payload)) => {
                     if let Some(outcome) =
                         decode_cancellation_result(&payload, &self.correlation_id)

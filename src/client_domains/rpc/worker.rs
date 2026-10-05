@@ -5,6 +5,62 @@ use super::{
     route_matches_pattern,
 };
 use crate::notifications::ReceivedNotification;
+use futures_util::task::AtomicWaker;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+struct WorkerInbox {
+    requests: Mutex<VecDeque<Result<RpcRequest>>>,
+    waker: AtomicWaker,
+    closed: AtomicBool,
+    capacity: usize,
+}
+
+impl WorkerInbox {
+    fn push(&self, request: Result<RpcRequest>) -> Option<Result<RpcRequest>> {
+        let mut requests = self.requests.lock();
+        if self.closed.load(Ordering::Acquire) || requests.len() >= self.capacity {
+            return Some(request);
+        }
+        requests.push_back(request);
+        drop(requests);
+        self.waker.wake();
+        None
+    }
+
+    fn remove(&self, correlation_id: &[u8; 16]) -> Option<Result<RpcRequest>> {
+        let mut requests = self.requests.lock();
+        let index = requests.iter().position(|request| {
+            request
+                .as_ref()
+                .is_ok_and(|request| &request.correlation_id == correlation_id)
+        })?;
+        requests.remove(index)
+    }
+
+    fn clear(&self) {
+        let requests = std::mem::take(&mut *self.requests.lock());
+        drop(requests);
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.waker.wake();
+    }
+
+    fn poll_next(&self, cx: &mut Context<'_>) -> Poll<Option<Result<RpcRequest>>> {
+        let mut requests = self.requests.lock();
+        if let Some(request) = requests.pop_front() {
+            return Poll::Ready(Some(request));
+        }
+        self.waker.register(cx.waker());
+        if self.closed.load(Ordering::Acquire) {
+            Poll::Ready(None)
+        } else {
+            Poll::Pending
+        }
+    }
+}
 
 pub(super) fn start(
     connection: AsyncConnection,
@@ -17,11 +73,16 @@ pub(super) fn start(
 ) -> RpcWorker {
     let active_calls = Arc::new(Mutex::new(HashMap::<[u8; 16], ActiveWorkerCall>::new()));
     let shutdown = CancellationToken::new();
-    let (sender, inbox) = tokio::sync::mpsc::channel(capacity);
+    let inbox = Arc::new(WorkerInbox {
+        requests: Mutex::new(VecDeque::new()),
+        waker: AtomicWaker::new(),
+        closed: AtomicBool::new(false),
+        capacity,
+    });
     let worker = RpcWorker {
         connection: connection.clone(),
         pattern: pattern.clone(),
-        receiver: tokio_stream::wrappers::ReceiverStream::new(inbox),
+        inbox: Arc::clone(&inbox),
         registration,
         active_calls: Arc::clone(&active_calls),
         cancellation_shutdown: shutdown.clone(),
@@ -37,12 +98,13 @@ pub(super) fn start(
                     if changed.is_err() { break; }
                     for call in active_calls.lock().values() { call.cancellation.cancel(); }
                     active_calls.lock().clear();
+                    inbox.clear();
                 }
                 event = requests.recv() => match event {
                     Ok(received) if received.generation == connection.generation() => {
                         let request = decode_request(&connection, &pattern, &active_calls, supports_cancellation, &received);
                         if let Some(request) = request
-                            && let Err(tokio::sync::mpsc::error::TrySendError::Full(Ok(mut rejected))) = sender.try_send(request) {
+                            && let Some(Ok(mut rejected)) = inbox.push(request) {
                                 let mut body = PayloadEncoder::new();
                                 body.put_u8(1).put_u32(6003).put_string("Local RPC worker is overloaded");
                                 let _ = rejected.respond(&body.finish(), true).await;
@@ -50,17 +112,27 @@ pub(super) fn start(
                     }
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let _ = sender.try_send(Err(FitzError::Backpressure("RPC worker stream is full".into())));
+                        let _ = inbox.push(Err(FitzError::Backpressure("RPC worker stream is full".into())));
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 },
                 event = lifecycle.recv() => match event {
-                    Ok(payload) => cancel_worker_call(&active_calls, &payload),
+                    Ok(payload) => {
+                        if payload.len() == 18 && payload[0] == 2 && (1..=4).contains(&payload[17]) {
+                            let correlation_id: [u8; 16] = payload[1..17].try_into().expect("validated UUID length");
+                            if let Some(request) = inbox.remove(&correlation_id) {
+                                drop(request);
+                            } else {
+                                cancel_worker_call(&active_calls, &payload);
+                            }
+                        }
+                    }
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         }
+        inbox.close();
     });
     worker
 }
@@ -135,7 +207,7 @@ fn decode_request(
 pub struct RpcWorker {
     connection: AsyncConnection,
     pattern: String,
-    receiver: tokio_stream::wrappers::ReceiverStream<Result<RpcRequest>>,
+    inbox: Arc<WorkerInbox>,
     registration: RestorableRegistration,
     active_calls: Arc<Mutex<HashMap<[u8; 16], ActiveWorkerCall>>>,
     cancellation_shutdown: CancellationToken,
@@ -165,6 +237,8 @@ impl Drop for RpcWorker {
         for call in self.active_calls.lock().values() {
             call.cancellation.cancel();
         }
+        self.inbox.close();
+        self.inbox.clear();
     }
 }
 pub(super) fn decode_worker_registration(response: &[u8]) -> Result<u64> {
@@ -173,11 +247,11 @@ pub(super) fn decode_worker_registration(response: &[u8]) -> Result<u64> {
 }
 impl Stream for RpcWorker {
     type Item = Result<RpcRequest>;
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if self.closed {
             return Poll::Ready(None);
         }
-        Pin::new(&mut self.receiver).poll_next(cx)
+        self.inbox.poll_next(cx)
     }
 }
 pub struct RpcRequest {
@@ -242,6 +316,8 @@ impl RpcRequest {
         }
         self.cleanup_done = true;
         self.cleanup.cancel();
+        drop(std::mem::take(&mut self.body));
+        drop(std::mem::take(&mut self.route));
         self.active_calls.lock().remove(&self.correlation_id);
         if self.supports_cancellation && self.connection.generation() == self.generation {
             let connection = self.connection.clone();

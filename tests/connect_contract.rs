@@ -56,6 +56,10 @@ async fn should_omit_service_name_given_legacy_broker() -> Result<()> {
         stream.read_exact(&mut length).await.unwrap();
         let mut connect = vec![0; u32::from_be_bytes(length) as usize];
         stream.read_exact(&mut connect).await.unwrap();
+        stream
+            .write_all(&[0, 0, 0, 9, 4, 0, 6, 0, 1, 0, 0, 0, 0])
+            .await
+            .unwrap();
         tokio::time::timeout(Duration::from_millis(200), stream.read_exact(&mut length))
             .await
             .is_err()
@@ -108,6 +112,10 @@ async fn should_connect_given_delayed_broker_when_connect_when_ready_called() ->
         stream.read_exact(&mut length).await.unwrap();
         let mut frame = vec![0; u32::from_be_bytes(length) as usize];
         stream.read_exact(&mut frame).await.unwrap();
+        stream
+            .write_all(&[0, 0, 0, 9, 4, 0, 6, 0, 1, 0, 0, 0, 0])
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
     });
     let client = Client::anonymous(format!("tcp://{address}")).build()?;
