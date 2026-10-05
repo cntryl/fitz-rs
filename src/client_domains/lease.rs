@@ -1165,6 +1165,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             assert_eq!(read_frame(&mut stream).await.0, message_type::CONNECT);
+            write_frame(&mut stream, message_type::SERVER_HELLO, &[0, 1, 0, 0, 0, 0]).await;
             script(stream).await;
         });
         let (state, _) = watch::channel(ConnectionState::Disconnected);
@@ -1852,6 +1853,12 @@ mod tests {
             let writer = Arc::new(tokio::sync::Mutex::new(writer));
 
             assert_eq!(read_split(&mut reader).await.0, message_type::CONNECT);
+            write_split(
+                &mut *writer.lock().await,
+                message_type::SERVER_HELLO,
+                &[0, 1, 0, 0, 0, 0],
+            )
+            .await;
 
             let (kind, payload) = read_split(&mut reader).await;
             assert_eq!(kind, message_type::LEASE_SUBSCRIBE);
@@ -2291,6 +2298,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut first, _) = listener.accept().await.unwrap();
             assert_eq!(read_frame(&mut first).await.0, message_type::CONNECT);
+            write_frame(&mut first, message_type::SERVER_HELLO, &[0, 1, 0, 0, 0, 0]).await;
             let (kind, payload) = read_frame(&mut first).await;
             assert_eq!(kind, message_type::LEASE_SUBSCRIBE);
             let mut d = PayloadDecoder::new(&payload);
@@ -2313,6 +2321,7 @@ mod tests {
 
             let (mut second, _) = listener.accept().await.unwrap();
             assert_eq!(read_frame(&mut second).await.0, message_type::CONNECT);
+            write_frame(&mut second, message_type::SERVER_HELLO, &[0, 1, 0, 0, 0, 0]).await;
             // Restorable registration replay: the same SUBSCRIBE is re-sent
             // automatically by the connection layer, not by the observer.
             let (kind, payload) = read_frame(&mut second).await;
@@ -2499,6 +2508,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             assert_eq!(read_frame(&mut stream).await.0, message_type::CONNECT);
+            write_frame(&mut stream, message_type::SERVER_HELLO, &[0, 1, 0, 0, 0, 0]).await;
             let (kind, payload) = read_frame(&mut stream).await;
             assert_eq!(kind, message_type::LEASE_ACQUIRE);
             assert_eq!(

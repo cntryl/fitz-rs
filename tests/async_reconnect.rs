@@ -107,6 +107,7 @@ async fn run_reconnect_server(
 ) -> std::io::Result<()> {
     let (mut first, _) = listener.accept().await?;
     assert_eq!(read_frame(&mut first).await?.0, CONNECT);
+    write_frame(&mut first, 4, &[0, 1, 0, 0, 0, 0]).await?;
     assert_eq!(read_frame(&mut first).await?.0, NOTICE_SUBSCRIBE);
     write_frame(&mut first, NOTICE_SUBSCRIBE, &subscribe_response(11)).await?;
     let _ = drop_first_rx.await;
@@ -114,6 +115,7 @@ async fn run_reconnect_server(
 
     let (mut second, _) = listener.accept().await?;
     assert_eq!(read_frame(&mut second).await?.0, CONNECT);
+    write_frame(&mut second, 4, &[0, 1, 0, 0, 0, 0]).await?;
     assert_eq!(read_frame(&mut second).await?.0, NOTICE_SUBSCRIBE);
     write_frame(&mut second, NOTICE_SUBSCRIBE, &subscribe_response(29)).await?;
     let mut notification = Vec::new();
@@ -134,6 +136,7 @@ async fn run_websocket_reconnect_server(
         .await
         .map_err(std::io::Error::other)?;
     assert_eq!(read_websocket_frame(&mut first).await?.0, CONNECT);
+    write_websocket_frame(&mut first, 4, &[0, 1, 0, 0, 0, 0]).await?;
     assert_eq!(read_websocket_frame(&mut first).await?.0, NOTICE_SUBSCRIBE);
     write_websocket_frame(&mut first, NOTICE_SUBSCRIBE, &subscribe_response(11)).await?;
     let _ = drop_first_rx.await;
@@ -144,6 +147,7 @@ async fn run_websocket_reconnect_server(
         .await
         .map_err(std::io::Error::other)?;
     assert_eq!(read_websocket_frame(&mut second).await?.0, CONNECT);
+    write_websocket_frame(&mut second, 4, &[0, 1, 0, 0, 0, 0]).await?;
     assert_eq!(read_websocket_frame(&mut second).await?.0, NOTICE_SUBSCRIBE);
     write_websocket_frame(&mut second, NOTICE_SUBSCRIBE, &subscribe_response(29)).await?;
     let mut notification = Vec::new();

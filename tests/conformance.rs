@@ -386,7 +386,8 @@ async fn should_correlate_same_type_requests_out_of_order() {
     let connected = client(Transport::from_env(), AuthMode::from_env());
     connected.connect().await.expect("broker connection");
     assert!(connected.correlation_enabled());
-    assert_eq!(connected.server_capabilities(), (1, 1));
+    assert_eq!(connected.server_capabilities().0, 1);
+    assert_ne!(connected.server_capabilities().1 & 1, 0);
     let parked_route = unique_route("queue");
     let ready_route = unique_route("queue");
     connected

@@ -7,10 +7,21 @@ use crate::domains::routes::{
 use crate::protocol::message_type;
 use crate::{FitzError, Result};
 use futures_core::Stream;
+use parking_lot::Mutex;
+use std::collections::HashMap;
+mod worker;
+use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
+use std::time::Duration;
+use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use worker::decode_worker_registration;
+pub use worker::{RpcRequest, RpcWorker};
 #[derive(Clone)]
 pub struct RpcClient {
     connection: AsyncConnection,
@@ -24,21 +35,129 @@ impl RpcClient {
     /// # Errors
     /// Returns an error when validation, transport, or broker processing fails.
     pub async fn call(&self, route: &str, body: &[u8]) -> Result<RpcResponseStream> {
+        self.call_with_timeout(route, body, None).await
+    }
+
+    /// Invokes an RPC route with an optional end-to-end budget.
+    ///
+    /// The timeout is sent to a supporting broker as a remaining budget. Use
+    /// [`RpcResponseStream::cancel`] to request best-effort cancellation.
+    ///
+    /// # Errors
+    /// Returns an error when validation or transport processing fails.
+    pub async fn call_with_timeout(
+        &self,
+        route: &str,
+        body: &[u8],
+        timeout: Option<Duration>,
+    ) -> Result<RpcResponseStream> {
         validate_concrete_route(route, "rpc")?;
+        if timeout.is_some_and(|value| value > Duration::from_secs(86_400)) {
+            return Err(FitzError::Protocol(
+                "RPC timeout must not exceed one day".into(),
+            ));
+        }
+        let deadline = timeout.map(|value| tokio::time::Instant::now() + value);
         let correlation_id = *Uuid::new_v4().as_bytes();
         let receiver = self
             .connection
             .notifications(message_type::RPC_RESPONSE, 64);
+        let lifecycle_receiver = self
+            .connection
+            .notifications(message_type::RPC_LIFECYCLE, 64);
+        let supports_cancellation =
+            self.connection.capability_bits() & message_type::CAP_RPC_CANCELLATION != 0;
         let mut e = PayloadEncoder::new();
         e.put_raw(&correlation_id).put_string(route).put_bytes(body);
+        if supports_cancellation && let Some(deadline) = deadline {
+            let budget_ms = deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .as_millis()
+                .min(86_400_000) as u32;
+            e.put_u8(1).put_u8(1).put_u32(budget_ms);
+        }
+        let mut generations = self.connection.generation_changes();
         self.connection
             .send(message_type::RPC_REQUEST, e.finish())
             .await?;
+        let cancellation_sent = Arc::new(AtomicBool::new(false));
+        let cancellation_shutdown = CancellationToken::new();
+        if supports_cancellation && let Some(deadline) = deadline {
+            let connection = self.connection.clone();
+            let sent = Arc::clone(&cancellation_sent);
+            let shutdown = cancellation_shutdown.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    () = tokio::time::sleep_until(deadline) => {
+                        let _ = send_cancellation_once(&connection, correlation_id, &sent, 2).await;
+                    }
+                    () = shutdown.cancelled() => {}
+                }
+            });
+        }
+        let connection_closed = Box::pin(async move {
+            let _ = generations.changed().await;
+        });
         Ok(RpcResponseStream {
+            connection: Some(self.connection.clone()),
             correlation_id,
             receiver: BroadcastStream::new(receiver),
+            lifecycle_receiver,
+            supports_cancellation,
+            cancellation_sent,
+            cancellation_outcome: None,
+            timeout: deadline.map(|value| Box::pin(tokio::time::sleep_until(value))),
+            parent_cancellation: None,
+            cancellation_shutdown,
+            connection_closed: Some(connection_closed),
             finished: false,
         })
+    }
+
+    /// Invokes a downstream RPC using the remaining budget and cancellation of an inbound call.
+    ///
+    /// The returned stream ends when the inbound request is cancelled, and the client sends a
+    /// best-effort cancellation to the downstream broker when that request's cancellation token
+    /// is cancelled.
+    ///
+    /// # Errors
+    /// Returns an error when validation, transport, or broker processing fails.
+    pub async fn call_from_request(
+        &self,
+        request: &RpcRequest,
+        route: &str,
+        body: &[u8],
+    ) -> Result<RpcResponseStream> {
+        if request.cancellation.is_cancelled() {
+            return Err(FitzError::Canceled);
+        }
+        let mut stream = self
+            .call_with_timeout(route, body, request.remaining_time())
+            .await?;
+        let parent_cancellation = request.cancellation.clone();
+        stream.parent_cancellation = Some(Box::pin(parent_cancellation.clone().cancelled_owned()));
+        if stream.supports_cancellation {
+            let Some(connection) = stream.connection.clone() else {
+                return Ok(stream);
+            };
+            let correlation_id = stream.correlation_id;
+            let cancellation_sent = Arc::clone(&stream.cancellation_sent);
+            let cancellation_shutdown = stream.cancellation_shutdown.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    () = parent_cancellation.cancelled() => {
+                        let _ = send_cancellation_once(
+                            &connection,
+                            correlation_id,
+                            &cancellation_sent,
+                            1,
+                        ).await;
+                    }
+                    () = cancellation_shutdown.cancelled() => {}
+                }
+            });
+        }
+        Ok(stream)
     }
     /// Performs the operation asynchronously.
     ///
@@ -47,9 +166,19 @@ impl RpcClient {
     pub async fn register_worker(&self, pattern: &str, max_concurrency: u32) -> Result<RpcWorker> {
         validate_registration_pattern(pattern, "rpc", 0)?;
         validate_worker_concurrency(max_concurrency)?;
-        let receiver = self.connection.notifications(message_type::RPC_REQUEST, 64);
+        let receiver = self
+            .connection
+            .timed_notifications(message_type::RPC_REQUEST, 1024);
+        let lifecycle_receiver = self
+            .connection
+            .notifications(message_type::RPC_LIFECYCLE, 1024);
         let mut e = PayloadEncoder::new();
         e.put_string(pattern).put_u32(max_concurrency);
+        let supports_cancellation =
+            self.connection.capability_bits() & message_type::CAP_RPC_CANCELLATION != 0;
+        if supports_cancellation {
+            e.put_u8(1).put_u8(1);
+        }
         let payload = e.finish();
         decode_ok(
             &self
@@ -63,13 +192,15 @@ impl RpcClient {
             0,
             decode_worker_registration,
         );
-        Ok(RpcWorker {
-            connection: self.connection.clone(),
-            pattern: pattern.into(),
-            receiver: BroadcastStream::new(receiver),
+        Ok(worker::start(
+            self.connection.clone(),
+            pattern.to_owned(),
+            receiver,
+            lifecycle_receiver,
             registration,
-            closed: false,
-        })
+            supports_cancellation,
+            max_concurrency as usize,
+        ))
     }
 }
 
@@ -88,15 +219,188 @@ pub struct RpcResponseFrame {
     pub sequence: u64,
 }
 pub struct RpcResponseStream {
+    connection: Option<AsyncConnection>,
     correlation_id: [u8; 16],
     receiver: BroadcastStream<Vec<u8>>,
+    lifecycle_receiver: broadcast::Receiver<Vec<u8>>,
+    supports_cancellation: bool,
+    cancellation_sent: Arc<AtomicBool>,
+    cancellation_outcome: Option<RpcCancellationOutcome>,
+    timeout: Option<Pin<Box<tokio::time::Sleep>>>,
+    parent_cancellation: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+    cancellation_shutdown: CancellationToken,
+    connection_closed: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
     finished: bool,
+}
+
+/// Result of a best-effort RPC cancellation request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcCancellationOutcome {
+    NotRequested,
+    RequestNotSent,
+    Unsupported,
+    QueuedRemoved,
+    Forwarded,
+    WorkerUnsupported,
+    AlreadyTerminal,
+    UnknownOrUnauthorized,
+    ForwardingFailed,
+    Unconfirmed,
+    ConnectionClosed,
+}
+
+impl RpcResponseStream {
+    fn abandon(&mut self, reason: u8) {
+        self.finished = true;
+        self.timeout = None;
+        self.parent_cancellation = None;
+        self.cancellation_shutdown.cancel();
+        if self.supports_cancellation
+            && let Some(connection) = self.connection.clone()
+        {
+            spawn_cancellation_once(
+                connection,
+                self.correlation_id,
+                &self.cancellation_sent,
+                reason,
+            );
+        } else {
+            self.cancellation_outcome = Some(RpcCancellationOutcome::Unsupported);
+        }
+    }
+
+    /// Requests best-effort cancellation and waits for the broker's lifecycle result.
+    ///
+    /// A `Forwarded` outcome confirms that the broker routed a signal to the worker. It
+    /// does not confirm that worker code or side effects have stopped.
+    pub async fn cancel(&mut self) -> RpcCancellationOutcome {
+        if let Some(outcome) = self.cancellation_outcome {
+            return outcome;
+        }
+        if self.finished
+            && self.parent_cancellation.is_none()
+            && !self.cancellation_sent.load(Ordering::Acquire)
+        {
+            return RpcCancellationOutcome::AlreadyTerminal;
+        }
+        if !self.supports_cancellation {
+            self.finished = true;
+            self.timeout = None;
+            self.cancellation_shutdown.cancel();
+            self.cancellation_outcome = Some(RpcCancellationOutcome::Unsupported);
+            return RpcCancellationOutcome::Unsupported;
+        }
+
+        let Some(connection) = &self.connection else {
+            return RpcCancellationOutcome::RequestNotSent;
+        };
+        if let Err(error) =
+            send_cancellation_once(connection, self.correlation_id, &self.cancellation_sent, 1)
+                .await
+        {
+            let outcome = if matches!(error, FitzError::Closed | FitzError::ConnectionClosed) {
+                RpcCancellationOutcome::ConnectionClosed
+            } else {
+                RpcCancellationOutcome::RequestNotSent
+            };
+            self.finished = true;
+            self.timeout = None;
+            self.cancellation_shutdown.cancel();
+            self.cancellation_outcome = Some(outcome);
+            return outcome;
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let result = tokio::select! {
+                result = tokio::time::timeout_at(deadline, self.lifecycle_receiver.recv()) => result,
+                () = async {
+                    if let Some(closed) = &mut self.connection_closed {
+                        closed.await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    self.finished = true;
+                    self.timeout = None;
+                    self.cancellation_shutdown.cancel();
+                    self.cancellation_outcome = Some(RpcCancellationOutcome::ConnectionClosed);
+                    return RpcCancellationOutcome::ConnectionClosed;
+                }
+            };
+            match result {
+                Ok(Ok(payload)) => {
+                    if let Some(outcome) =
+                        decode_cancellation_result(&payload, &self.correlation_id)
+                    {
+                        self.finished = true;
+                        self.timeout = None;
+                        self.cancellation_shutdown.cancel();
+                        self.cancellation_outcome = Some(outcome);
+                        return outcome;
+                    }
+                }
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => {
+                    self.finished = true;
+                    self.timeout = None;
+                    self.cancellation_shutdown.cancel();
+                    self.cancellation_outcome = Some(RpcCancellationOutcome::Unconfirmed);
+                    return RpcCancellationOutcome::Unconfirmed;
+                }
+            }
+        }
+    }
+}
+
+fn decode_cancellation_result(
+    payload: &[u8],
+    correlation_id: &[u8; 16],
+) -> Option<RpcCancellationOutcome> {
+    if payload.len() != 18 || payload[0] != 4 || payload[1..17] != correlation_id[..] {
+        return None;
+    }
+    Some(match payload[17] {
+        1 => RpcCancellationOutcome::QueuedRemoved,
+        2 => RpcCancellationOutcome::Forwarded,
+        3 => RpcCancellationOutcome::WorkerUnsupported,
+        4 => RpcCancellationOutcome::AlreadyTerminal,
+        5 => RpcCancellationOutcome::UnknownOrUnauthorized,
+        6 => RpcCancellationOutcome::ForwardingFailed,
+        _ => return None,
+    })
 }
 impl Stream for RpcResponseStream {
     type Item = Result<RpcResponseFrame>;
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if self.finished {
             return Poll::Ready(None);
+        }
+        if self
+            .connection_closed
+            .as_mut()
+            .is_some_and(|closed| closed.as_mut().poll(cx).is_ready())
+        {
+            self.finished = true;
+            self.cancellation_shutdown.cancel();
+            self.cancellation_outcome = Some(RpcCancellationOutcome::ConnectionClosed);
+            return Poll::Ready(Some(Err(FitzError::ConnectionClosed)));
+        }
+        if self
+            .parent_cancellation
+            .as_mut()
+            .is_some_and(|parent| parent.as_mut().poll(cx).is_ready())
+        {
+            self.abandon(1);
+            return Poll::Ready(None);
+        }
+        if self
+            .timeout
+            .as_mut()
+            .is_some_and(|timeout| timeout.as_mut().poll(cx).is_ready())
+        {
+            self.abandon(2);
+            return Poll::Ready(Some(Err(FitzError::Timeout)));
         }
         loop {
             match Pin::new(&mut self.receiver).poll_next(cx) {
@@ -115,6 +419,9 @@ impl Stream for RpcResponseStream {
                     };
                     if end {
                         self.finished = true;
+                        self.timeout = None;
+                        self.parent_cancellation = None;
+                        self.cancellation_shutdown.cancel();
                         if let Some(error) = decode_terminal_error(&body) {
                             return Poll::Ready(Some(Err(error)));
                         }
@@ -122,16 +429,72 @@ impl Stream for RpcResponseStream {
                     return Poll::Ready(Some(Ok(RpcResponseFrame { body, sequence })));
                 }
                 Poll::Ready(Some(Err(_))) => {
-                    self.finished = true;
+                    self.abandon(1);
                     return Poll::Ready(Some(Err(FitzError::Backpressure(
                         "RPC response stream is full".into(),
                     ))));
                 }
                 Poll::Ready(None) => return Poll::Ready(None),
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    return Poll::Pending;
+                }
             }
         }
     }
+}
+
+impl Drop for RpcResponseStream {
+    fn drop(&mut self) {
+        self.cancellation_shutdown.cancel();
+        if self.finished || !self.supports_cancellation {
+            return;
+        }
+        let Some(connection) = self.connection.clone() else {
+            return;
+        };
+        spawn_cancellation_once(connection, self.correlation_id, &self.cancellation_sent, 1);
+    }
+}
+
+fn spawn_cancellation_once(
+    connection: AsyncConnection,
+    correlation_id: [u8; 16],
+    cancellation_sent: &AtomicBool,
+    reason: u8,
+) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    if cancellation_sent.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    runtime.spawn(async move {
+        let _ = send_cancellation_message(&connection, correlation_id, reason).await;
+    });
+}
+
+async fn send_cancellation_once(
+    connection: &AsyncConnection,
+    correlation_id: [u8; 16],
+    cancellation_sent: &AtomicBool,
+    reason: u8,
+) -> Result<()> {
+    if cancellation_sent.swap(true, Ordering::AcqRel) {
+        return Ok(());
+    }
+    send_cancellation_message(connection, correlation_id, reason).await
+}
+
+async fn send_cancellation_message(
+    connection: &AsyncConnection,
+    correlation_id: [u8; 16],
+    reason: u8,
+) -> Result<()> {
+    let mut encoder = PayloadEncoder::new();
+    encoder.put_u8(1).put_raw(&correlation_id).put_u8(reason);
+    connection
+        .send(message_type::RPC_CANCEL, encoder.finish())
+        .await
 }
 
 fn decode_terminal_error(body: &[u8]) -> Option<FitzError> {
@@ -169,216 +532,41 @@ fn decode_rpc_response_frame(decoder: &mut PayloadDecoder<'_>) -> Result<(u64, b
     Ok((sequence, end, body))
 }
 
-pub struct RpcWorker {
-    connection: AsyncConnection,
-    pattern: String,
-    receiver: BroadcastStream<Vec<u8>>,
-    registration: RestorableRegistration,
-    closed: bool,
+struct ActiveWorkerCall {
+    cancellation: CancellationToken,
+    cancellation_requested: bool,
 }
-impl RpcWorker {
-    /// Performs the operation asynchronously.
-    ///
-    /// # Errors
-    /// Returns an error when validation, transport, or broker processing fails.
-    pub async fn deregister(mut self) -> Result<()> {
-        self.closed = true;
-        self.registration.deactivate();
-        let mut e = PayloadEncoder::new();
-        e.put_string(&self.pattern);
-        decode_ok(
-            &self
-                .connection
-                .request(message_type::RPC_UNSUBSCRIBE, e.finish())
-                .await?,
-        )
+
+fn cancel_worker_call(active_calls: &Mutex<HashMap<[u8; 16], ActiveWorkerCall>>, payload: &[u8]) {
+    if payload.len() != 18 || payload[0] != 2 || !(1..=4).contains(&payload[17]) {
+        return;
     }
+    let correlation_id: [u8; 16] = payload[1..17].try_into().expect("fixed length checked");
+    let cancellation = {
+        let mut calls = active_calls.lock();
+        let Some(call) = calls.get_mut(&correlation_id) else {
+            return;
+        };
+        call.cancellation_requested = true;
+        call.cancellation.clone()
+    };
+    cancellation.cancel();
 }
-fn decode_worker_registration(response: &[u8]) -> Result<u64> {
-    decode_ok(response)?;
-    Ok(0)
-}
-impl Stream for RpcWorker {
-    type Item = Result<RpcRequest>;
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if self.closed {
-            return Poll::Ready(None);
-        }
-        loop {
-            match Pin::new(&mut self.receiver).poll_next(cx) {
-                Poll::Ready(Some(Ok(payload))) => {
-                    let mut d = PayloadDecoder::new(&payload);
-                    let correlation_id = match d.get_fixed::<16>() {
-                        Ok(v) => v,
-                        Err(e) => return Poll::Ready(Some(Err(e))),
-                    };
-                    let route = match d.get_string() {
-                        Ok(v) => v,
-                        Err(e) => return Poll::Ready(Some(Err(e))),
-                    };
-                    if !route_matches_pattern(&route, &self.pattern) {
-                        continue;
-                    }
-                    let body = match d.get_bytes() {
-                        Ok(v) => v,
-                        Err(e) => return Poll::Ready(Some(Err(e))),
-                    };
-                    return Poll::Ready(Some(Ok(RpcRequest {
-                        connection: self.connection.clone(),
-                        correlation_id,
-                        route,
-                        body,
-                        next_sequence: 0,
-                        finished: false,
-                        generation: self.connection.generation(),
-                    })));
-                }
-                Poll::Ready(Some(Err(_))) => {
-                    return Poll::Ready(Some(Err(FitzError::Backpressure(
-                        "RPC worker stream is full".into(),
-                    ))));
-                }
-                Poll::Ready(None) => return Poll::Ready(None),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
+
+fn decode_rpc_request_budget(decoder: &mut PayloadDecoder<'_>) -> Result<Option<Duration>> {
+    if decoder.is_empty() {
+        return Ok(None);
     }
-}
-pub struct RpcRequest {
-    connection: AsyncConnection,
-    correlation_id: [u8; 16],
-    pub route: String,
-    pub body: Vec<u8>,
-    next_sequence: u64,
-    finished: bool,
-    generation: u64,
-}
-impl RpcRequest {
-    /// Performs the operation asynchronously.
-    ///
-    /// # Errors
-    /// Returns an error when validation, transport, or broker processing fails.
-    pub async fn respond(&mut self, body: &[u8], is_end: bool) -> Result<()> {
-        if self.finished || self.connection.generation() != self.generation {
-            return Err(FitzError::StaleHandle);
-        }
-        let mut e = PayloadEncoder::new();
-        e.put_raw(&self.correlation_id)
-            .put_u64(self.next_sequence)
-            .put_u8(u8::from(is_end))
-            .put_bytes(body);
-        self.connection
-            .send(message_type::RPC_RESPONSE, e.finish())
-            .await?;
-        self.next_sequence += 1;
-        self.finished = is_end;
-        Ok(())
+    let version = decoder.get_u8()?;
+    let flags = decoder.get_u8()?;
+    let budget_ms = decoder.get_u32()?;
+    if !decoder.is_empty() || version != 1 || flags != 1 || budget_ms > 86_400_000 {
+        return Err(FitzError::Protocol(
+            "invalid RPC request budget extension".into(),
+        ));
     }
-    /// Performs the operation asynchronously.
-    ///
-    /// # Errors
-    /// Returns an error when validation, transport, or broker processing fails.
-    pub async fn finish(mut self) -> Result<()> {
-        if self.finished {
-            Ok(())
-        } else {
-            self.respond(&[], true).await
-        }
-    }
+    Ok(Some(Duration::from_millis(u64::from(budget_ms))))
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use futures_util::StreamExt;
-    use tokio::sync::broadcast;
-
-    #[tokio::test]
-    async fn should_surface_terminal_rpc_error_as_domain_error() {
-        // Arrange
-        let (sender, receiver) = broadcast::channel(2);
-        let id = [9_u8; 16];
-        let mut body = PayloadEncoder::new();
-        body.put_u8(1)
-            .put_u32(6004)
-            .put_string("No workers registered");
-        let mut frame = PayloadEncoder::new();
-        frame
-            .put_raw(&id)
-            .put_u64(0)
-            .put_u8(1)
-            .put_bytes(&body.finish());
-        let mut stream = RpcResponseStream {
-            correlation_id: id,
-            receiver: BroadcastStream::new(receiver),
-            finished: false,
-        };
-
-        // Act
-        sender.send(frame.finish()).unwrap();
-        let result = stream.next().await.unwrap();
-
-        // Assert
-        assert!(matches!(result, Err(FitzError::Domain { code: 6004, .. })));
-        assert!(stream.next().await.is_none());
-    }
-
-    #[test]
-    fn should_preserve_empty_terminal_rpc_response_frame() {
-        // Arrange
-        let mut encoder = PayloadEncoder::new();
-        encoder.put_u64(7).put_u8(1).put_bytes(&[]);
-        let payload = encoder.finish();
-        let mut decoder = PayloadDecoder::new(&payload);
-
-        // Act
-        let (sequence, end, body) = decode_rpc_response_frame(&mut decoder).unwrap();
-
-        // Assert
-        assert_eq!(sequence, 7);
-        assert!(end);
-        assert_eq!(body, Vec::<u8>::new());
-    }
-
-    #[test]
-    fn should_reject_rpc_response_with_unsupported_flags() {
-        // Arrange
-        let mut encoder = PayloadEncoder::new();
-        encoder.put_u64(0).put_u8(2).put_bytes(&[]);
-        let payload = encoder.finish();
-        let mut decoder = PayloadDecoder::new(&payload);
-
-        // Act
-        let result = decode_rpc_response_frame(&mut decoder);
-
-        // Assert
-        assert!(matches!(result, Err(FitzError::Protocol(_))));
-    }
-
-    #[test]
-    fn should_accept_worker_concurrency_at_wire_boundaries() {
-        // Arrange
-        let valid = [1, 1024];
-
-        // Act
-        let results = valid.map(validate_worker_concurrency);
-
-        // Assert
-        assert!(results.into_iter().all(|result| result.is_ok()));
-    }
-
-    #[test]
-    fn should_reject_worker_concurrency_outside_wire_range() {
-        // Arrange
-        let invalid = [0, 1025, u32::MAX];
-
-        // Act
-        let results = invalid.map(validate_worker_concurrency);
-
-        // Assert
-        assert!(results.into_iter().all(|result| matches!(
-            result,
-            Err(FitzError::Protocol(message)) if message == "max_concurrency must be between 1 and 1024"
-        )));
-    }
-}
+mod tests;
