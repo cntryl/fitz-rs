@@ -7,6 +7,7 @@ use crate::protocol::message_type;
 use crate::{FitzError, Result};
 use futures_core::Stream;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::task::{Context, Poll};
 use tokio_stream::wrappers::BroadcastStream;
 
@@ -109,6 +110,7 @@ impl QueueClient {
                 id: decoder.get_u64()?,
                 token: decoder.get_u64()?,
                 body: decoder.get_bytes()?,
+                state: AtomicU8::new(0),
             });
         }
         Ok(items)
@@ -152,6 +154,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn should_not_retry_malformed_enqueue_capacity_response() {
+        // Arrange
+        let response = [1, 0, 0, 15, 165];
+        // Act
+        let retryable = is_retryable_enqueue_rejection(&response);
+        // Assert
+        assert!(!retryable);
+    }
+
+    #[test]
+    fn should_preserve_long_plain_error_without_inferring_capacity() {
+        // Arrange
+        let message = "x".repeat(4005);
+        let mut encoder = PayloadEncoder::new();
+        encoder.put_u8(1).put_string(&message);
+        // Act
+        let error = decode_queue_plain_ok(&encoder.finish()).unwrap_err();
+        // Assert
+        assert!(
+            matches!(error, FitzError::Domain { code: 0, message: decoded } if decoded == message)
+        );
+    }
+
+    #[test]
+    fn should_classify_indeterminate_completion_as_terminal() {
+        // Arrange
+        let mut encoder = PayloadEncoder::new();
+        encoder
+            .put_u8(1)
+            .put_u32(4007)
+            .put_string("outcome unknown");
+        // Act
+        let error = decode_queue_plain_ok(&encoder.finish()).unwrap_err();
+        // Assert
+        assert!(matches!(error, FitzError::Domain { code: 4007, .. }));
+        assert!(!error.is_retryable());
+    }
+
+    #[test]
+    fn should_preserve_coded_capacity_rejection_for_completion() {
+        // Arrange
+        let mut encoder = PayloadEncoder::new();
+        encoder.put_u8(1).put_u32(4005).put_string("not accepted");
+        // Act
+        let error = decode_queue_plain_ok(&encoder.finish()).unwrap_err();
+        // Assert
+        assert!(matches!(error, FitzError::Domain { code: 4005, .. }));
+    }
+
+    #[test]
     fn should_encode_enqueue_delay_in_seconds_without_truncation() {
         // Arrange
         let route = "queue://realm/area/jobs";
@@ -188,9 +240,10 @@ mod tests {
 }
 
 fn is_retryable_enqueue_rejection(response: &[u8]) -> bool {
-    let mut decoder = PayloadDecoder::new(response);
-    decoder.get_u8().is_ok_and(|status| status == 1)
-        && decoder.get_u32().is_ok_and(|code| code == 4005)
+    matches!(
+        success_decoder(response, "ENQUEUE"),
+        Err(FitzError::Domain { code: 4005, .. })
+    )
 }
 
 pub struct QueueItem {
@@ -200,11 +253,14 @@ pub struct QueueItem {
     id: u64,
     token: u64,
     pub body: Vec<u8>,
+    state: AtomicU8,
 }
 
 impl QueueItem {
     fn ensure_current(&self) -> Result<()> {
-        if self.connection.generation() == self.generation {
+        if self.connection.generation() == self.generation
+            && self.state.load(Ordering::Acquire) == 0
+        {
             Ok(())
         } else {
             Err(FitzError::StaleHandle)
@@ -231,10 +287,18 @@ impl QueueItem {
     }
     /// Performs the operation asynchronously.
     ///
+    /// The handle stays usable after rejection. Retry only a confirmed capacity
+    /// rejection with bounded backoff while its lease is valid; a lost response
+    /// has an unknown outcome. Successful completion closes the handle.
+    ///
     /// # Errors
     /// Returns an error when validation, transport, or broker processing fails.
-    pub async fn complete(self) -> Result<()> {
+    pub async fn complete(&self) -> Result<()> {
         self.ensure_current()?;
+        self.state
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| FitzError::StaleHandle)?;
+        let completion = CompletionGuard(&self.state);
         let mut encoder = PayloadEncoder::new();
         encoder
             .put_string(&self.route)
@@ -245,7 +309,10 @@ impl QueueItem {
                 .connection
                 .request(message_type::QUEUE_COMPLETE, encoder.finish())
                 .await?,
-        )
+        )?;
+        self.state.store(2, Ordering::Release);
+        drop(completion);
+        Ok(())
     }
 }
 
@@ -339,14 +406,10 @@ fn success_decoder<'a>(response: &'a [u8], operation: &str) -> Result<PayloadDec
     let mut decoder = PayloadDecoder::new(response);
     match decoder.get_u8()? {
         0 => Ok(decoder),
-        1 if matches!(operation, "ENQUEUE" | "RESERVE") => Err(FitzError::Domain {
-            code: decoder.get_u32()?,
-            message: decoder.get_string()?,
-        }),
-        1 => Err(FitzError::Domain {
-            code: 0,
-            message: decoder.get_string()?,
-        }),
+        1 => Err(decode_queue_error(
+            response,
+            matches!(operation, "ENQUEUE" | "RESERVE"),
+        )?),
         status => Err(FitzError::Protocol(format!(
             "Queue {operation} returned status {status}"
         ))),
@@ -360,12 +423,36 @@ fn decode_queue_plain_ok(response: &[u8]) -> Result<()> {
         0 => Err(FitzError::Protocol(
             "Queue response has trailing bytes".into(),
         )),
-        1 => Err(FitzError::Domain {
-            code: 0,
-            message: decoder.get_string()?,
-        }),
+        1 => Err(decode_queue_error(response, false)?),
         status => Err(FitzError::Protocol(format!(
             "Queue operation returned status {status}"
         ))),
+    }
+}
+
+fn decode_queue_error(response: &[u8], coded_only: bool) -> Result<FitzError> {
+    let plain = response.len() >= 5
+        && u32::from_be_bytes(response[1..5].try_into().unwrap()) as usize == response.len() - 5;
+    let coded = response.len() >= 9
+        && u32::from_be_bytes(response[5..9].try_into().unwrap()) as usize == response.len() - 9;
+    if (coded_only && !coded) || (!coded_only && plain == coded) {
+        return Err(FitzError::Protocol(
+            "Malformed or ambiguous Queue error response".into(),
+        ));
+    }
+    let mut decoder = PayloadDecoder::new(&response[1..]);
+    let code = if coded { decoder.get_u32()? } else { 0 };
+    let message = decoder.get_string()?;
+    Ok(FitzError::Domain { code, message })
+}
+
+struct CompletionGuard<'a>(&'a AtomicU8);
+
+impl Drop for CompletionGuard<'_> {
+    fn drop(&mut self) {
+        // Reset failed or canceled attempts without reopening acknowledged items.
+        let _ = self
+            .0
+            .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire);
     }
 }

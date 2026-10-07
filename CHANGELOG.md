@@ -2,6 +2,9 @@
 
 ## 0.2.0 - Unreleased
 
+- Preserve coded Queue admission failures alongside legacy plain errors, including retryable capacity rejection and terminal unknown outcomes.
+- Breaking: Queue completion borrows its handle so a rejected ACK can be retried explicitly; successful completion invalidates the handle. Reject malformed enqueue responses before automatic retry.
+
 - Add authority-aware managed lease methods with a stable broker-issued admission fencing token.
 - Breaking: Schedule listing uses canonical message 702 with offset/limit and `total_count`.
 - Breaking: Queue delays are expressed in wire-shaped seconds, and Lease acquisition exposes `wait_seconds`.
