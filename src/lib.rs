@@ -13,9 +13,9 @@
 //! client.connect().await?;
 //!
 //! // Routes are opaque strings — the client never parses them.
-//! let tx = client.kv()?.begin("kv://my-realm/app/users", TransactionMode::ReadWrite, KvDurability::Buffered).await?;
+//! let tx = client.kv()?.begin("kv://my-realm/app/users", TransactionMode::ReadWrite).await?;
 //! tx.put(b"user:1", b"alice").await?;
-//! tx.commit().await?;
+//! tx.commit(KvDurability::Buffered).await?;
 //!
 //! // Leases
 //! let grant = client.lease()?.acquire(
@@ -43,7 +43,7 @@ pub use observability::{
 };
 pub use protocol::TransactionMode;
 
-/// Durability requested for a KV transaction.
+/// Persistence required at KV COMMIT.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum KvDurability {

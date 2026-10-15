@@ -23,18 +23,10 @@ impl KvClient {
     ///
     /// # Errors
     /// Returns an error when validation, transport, or broker processing fails.
-    pub async fn begin(
-        &self,
-        route: &str,
-        mode: TransactionMode,
-        durability: KvDurability,
-    ) -> Result<KvTransaction> {
+    pub async fn begin(&self, route: &str, mode: TransactionMode) -> Result<KvTransaction> {
         validate_fixed_route(route, "kv", 3)?;
         let mut encoder = PayloadEncoder::new();
-        encoder
-            .put_string(route)
-            .put_u8(mode as u8)
-            .put_u8(durability as u8);
+        encoder.put_string(route).put_u8(mode as u8);
         let response = self
             .connection
             .request(message_type::KV_BEGIN, encoder.finish())
@@ -303,12 +295,14 @@ impl KvTransaction {
     ///
     /// # Errors
     /// Returns an error when validation, transport, or broker processing fails.
-    pub async fn commit(mut self) -> Result<()> {
+    pub async fn commit(mut self, durability: KvDurability) -> Result<()> {
         self.ensure_open()?;
+        let mut payload = self.finish_payload();
+        payload.push(durability as u8);
         let result = decode_ok(
             &self
                 .connection
-                .request(message_type::KV_COMMIT, self.finish_payload())
+                .request(message_type::KV_COMMIT, payload)
                 .await?,
         );
         self.closed = true;

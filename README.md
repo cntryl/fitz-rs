@@ -225,3 +225,14 @@ A timeout, disconnect, cancellation after sending, or error `4007` can leave the
 outcome unknown. Do not blindly replay enqueue, reserve, or completion in those
 cases. Reconnection invalidates old reservation handles. A retryable error is a
 classification, not a guarantee of automatic retries or exactly-once processing.
+
+### Commit-time persistence
+
+KV BEGIN selects only scope and transaction mode. Choose Buffered or Sync explicitly at each KV and Stream COMMIT. Buffered maps to local Buffered or cloud CloudAsync; Sync maps to local Sync or cloud CloudStrict and is never silently downgraded. Queue remains best effort.
+
+```rust,ignore
+// Before: begin(route, TransactionMode::ReadWrite, KvDurability::Sync), then commit().
+let tx = client.kv()?.begin(route, TransactionMode::ReadWrite).await?;
+tx.commit(KvDurability::Sync).await?;
+// Stream retains session.commit(StreamCommitMode::Sync).await?.
+```
