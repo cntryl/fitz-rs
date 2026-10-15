@@ -266,6 +266,7 @@ mod tests {
 
     #[tokio::test]
     async fn should_reference_count_duplicate_notice_subscriptions() {
+        // Arrange
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -304,10 +305,12 @@ mod tests {
         });
         connection.connect().await.unwrap();
         let client = NoticeClient::new(connection.clone());
+        // Act
         let first = client.subscribe("notice://realm/area/*").await.unwrap();
         let second = client.subscribe("notice://realm/area/*").await.unwrap();
         first.unsubscribe().await.unwrap();
         second.unsubscribe().await.unwrap();
+        // Assert: the scripted broker verifies a single subscription and unsubscribe.
         server.await.unwrap();
         connection.close().await;
     }

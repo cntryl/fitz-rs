@@ -131,12 +131,12 @@ fn unique_route(scheme: &str) -> String {
 async fn kv_round_trip(client: &Client, durability: KvDurability) -> Result<(), FitzError> {
     let transaction = client
         .kv()?
-        .begin(&unique_route("kv"), TransactionMode::ReadWrite, durability)
+        .begin(&unique_route("kv"), TransactionMode::ReadWrite)
         .await?;
     transaction.put(b"key", b"value").await?;
     let value = transaction.get(b"key").await?;
     assert_eq!(value, KvGetResult::Found(b"value".to_vec()));
-    transaction.commit().await
+    transaction.commit(durability).await
 }
 
 async fn reject_invalid_jwt(transport: Transport) -> Result<(), FitzError> {

@@ -623,6 +623,7 @@ mod tests {
 
     #[tokio::test]
     async fn should_retain_schedule_wire_subscription_until_last_local_handle() {
+        // Arrange
         let (state, _) = watch::channel(ConnectionState::Disconnected);
         let connection = AsyncConnection::spawn(AsyncConnectionOptions {
             endpoint: "tcp://127.0.0.1:1".into(),
@@ -662,7 +663,9 @@ mod tests {
             receiver: BroadcastStream::new(receiver),
             closed: false,
         };
+        // Act
         handle.unsubscribe().await.unwrap();
+        // Assert
         assert_eq!(subscriptions.lock().await[&pattern].references, 1);
     }
 }

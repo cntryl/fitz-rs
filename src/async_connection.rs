@@ -1283,6 +1283,7 @@ mod tests {
 
     #[tokio::test]
     async fn should_allow_connect_retry_with_refreshed_token_after_auth_failure() {
+        // Arrange
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -1322,11 +1323,11 @@ mod tests {
             state,
         });
 
-        assert!(matches!(
-            connection.connect().await,
-            Err(FitzError::Authentication { .. })
-        ));
+        // Act
+        let first = connection.connect().await;
         connection.connect().await.unwrap();
+        // Assert
+        assert!(matches!(first, Err(FitzError::Authentication { .. })));
         assert_eq!(token_calls.load(Ordering::Acquire), 2);
         connection.close().await;
         server.await.unwrap();
@@ -1334,6 +1335,7 @@ mod tests {
 
     #[tokio::test]
     async fn should_fail_stale_queued_command_instead_of_replaying_on_new_generation() {
+        // Arrange
         let (commands_tx, commands) = mpsc::channel(4);
         let (_cancellations_tx, cancellations) = mpsc::unbounded_channel();
         let (state, _) = watch::channel(ConnectionState::Authenticated);
@@ -1362,6 +1364,7 @@ mod tests {
         let (reader, writer) = tokio::io::split(io);
         let task = tokio::spawn(async move { run_io(&mut supervisor, reader, writer).await });
         let (response_tx, response_rx) = oneshot::channel();
+        // Act
         commands_tx
             .send(Command::Request {
                 id: 1,
@@ -1372,6 +1375,7 @@ mod tests {
             })
             .await
             .unwrap();
+        // Assert
         assert!(matches!(
             response_rx.await.unwrap(),
             Err(FitzError::ConnectionClosed)
@@ -1384,6 +1388,7 @@ mod tests {
 
     #[tokio::test]
     async fn should_continue_restoring_registrations_after_one_restore_fails() {
+        // Arrange
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -1448,7 +1453,9 @@ mod tests {
             registrations,
             capabilities: Arc::new(AtomicU64::new(0)),
         };
+        // Act
         restore_registrations(&supervisor, &mut session).await;
+        // Assert
         assert_eq!(good_wire_id.load(Ordering::Acquire), 99);
         server.await.unwrap();
     }

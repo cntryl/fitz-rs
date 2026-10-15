@@ -2,6 +2,10 @@
 
 ## 0.2.0 - Unreleased
 
+- Requires the server commit-time persistence contract from cntryl/fitz#471; the old KV wire format is incompatible. Validated against `fitz:develop`.
+
+- Breaking: KV BEGIN no longer accepts persistence. KV COMMIT requires an explicit Buffered or Sync choice; Stream COMMIT also requires an explicit choice. No connection default or silent Sync downgrade is used.
+
 - Preserve coded Queue admission failures alongside legacy plain errors, including retryable capacity rejection and terminal unknown outcomes.
 - Breaking: Queue completion borrows its handle so a rejected ACK can be retried explicitly; successful completion invalidates the handle. Reject malformed enqueue responses before automatic retry.
 
