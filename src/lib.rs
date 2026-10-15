@@ -527,11 +527,13 @@ mod tests {
 
     #[tokio::test]
     async fn should_bound_individual_operation_given_operation_timeout() {
+        // Arrange
         let options = OperationOptions {
             timeout: Duration::from_millis(1),
             cancellation: CancellationToken::new(),
         };
 
+        // Act
         let result = options
             .run(async {
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -539,11 +541,13 @@ mod tests {
             })
             .await;
 
+        // Assert
         assert!(matches!(result, Err(FitzError::Timeout)));
     }
 
     #[tokio::test]
     async fn should_cancel_individual_operation_given_cancellation_token() {
+        // Arrange
         let cancellation = CancellationToken::new();
         cancellation.cancel();
         let options = OperationOptions {
@@ -551,8 +555,10 @@ mod tests {
             cancellation,
         };
 
+        // Act
         let result = options.run(std::future::pending::<Result<()>>()).await;
 
+        // Assert
         assert!(matches!(result, Err(FitzError::Canceled)));
     }
 }

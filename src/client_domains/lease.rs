@@ -2402,7 +2402,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_unsubscribe_and_stop_background_work_when_closed() {
+    async fn should_unsubscribe_observer_when_closed() {
         // Arrange
         let (client, connection, server) = connected_lease_client(|mut stream| async move {
             let (kind, payload) = read_frame(&mut stream).await;
@@ -2502,7 +2502,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_complete_deferred_acquire_and_release_when_handle_dropped() {
+    async fn should_release_deferred_grant_when_handle_dropped() {
+        // Arrange
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -2551,7 +2552,9 @@ mod tests {
             )
             .await
             .unwrap();
+        // Act
         drop(handle);
+        // Assert: the scripted broker verifies release of the deferred grant.
         server.await.unwrap();
         connection.close().await;
     }
