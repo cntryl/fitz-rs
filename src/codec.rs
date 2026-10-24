@@ -20,6 +20,11 @@ impl PayloadEncoder {
         self
     }
 
+    pub fn put_u16(&mut self, value: u16) -> &mut Self {
+        self.buf.extend_from_slice(&value.to_be_bytes());
+        self
+    }
+
     pub fn put_u32(&mut self, value: u32) -> &mut Self {
         self.buf.extend_from_slice(&value.to_be_bytes());
         self
