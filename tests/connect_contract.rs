@@ -46,7 +46,7 @@ fn should_reject_service_name_exceeding_utf8_byte_limit() {
 }
 
 #[tokio::test]
-async fn should_omit_service_name_given_legacy_broker() -> Result<()> {
+async fn should_reject_legacy_broker_hello() -> Result<()> {
     // Arrange
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
@@ -69,10 +69,11 @@ async fn should_omit_service_name_given_legacy_broker() -> Result<()> {
         .build()?;
 
     // Act
-    client.connect().await?;
+    let connected = client.connect().await;
 
     // Assert
-    assert!(server.await.expect("server task panicked"));
+    assert!(connected.is_err());
+    let _ = server.await.expect("server task panicked");
     client.close().await?;
     Ok(())
 }
@@ -112,10 +113,7 @@ async fn should_connect_given_delayed_broker_when_connect_when_ready_called() ->
         stream.read_exact(&mut length).await.unwrap();
         let mut frame = vec![0; u32::from_be_bytes(length) as usize];
         stream.read_exact(&mut frame).await.unwrap();
-        stream
-            .write_all(&[0, 0, 0, 9, 4, 0, 6, 0, 1, 0, 0, 0, 0])
-            .await
-            .unwrap();
+        stream.write_all(&hello_frame()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
     });
     let client = Client::anonymous(format!("tcp://{address}")).build()?;
@@ -138,7 +136,7 @@ async fn should_connect_given_delayed_broker_when_connect_when_ready_called() ->
 }
 
 #[tokio::test]
-async fn should_send_service_name_given_late_metadata_capability() -> Result<()> {
+async fn should_send_service_name_in_connect_before_delayed_hello() -> Result<()> {
     // Arrange
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
@@ -149,15 +147,8 @@ async fn should_send_service_name_given_late_metadata_capability() -> Result<()>
         let mut connect = vec![0; u32::from_be_bytes(length) as usize];
         stream.read_exact(&mut connect).await.unwrap();
         tokio::time::sleep(Duration::from_millis(150)).await;
-        // A delayed SERVER_HELLO (type 4) advertises CAP_SESSION_METADATA (bit 1).
-        stream
-            .write_all(&[0, 0, 0, 9, 4, 0, 6, 0, 1, 0, 0, 0, 2])
-            .await
-            .unwrap();
-        stream.read_exact(&mut length).await.unwrap();
-        let mut metadata = vec![0; u32::from_be_bytes(length) as usize];
-        stream.read_exact(&mut metadata).await.unwrap();
-        metadata
+        stream.write_all(&hello_frame()).await.unwrap();
+        connect
     });
     let service_name = "é".repeat(64);
     let client = Client::builder(format!("tcp://{address}"), || async { Ok(String::new()) })
@@ -168,15 +159,13 @@ async fn should_send_service_name_given_late_metadata_capability() -> Result<()>
     client.connect().await?;
 
     // Assert
-    let metadata = tokio::time::timeout(Duration::from_secs(1), server)
-        .await
-        .expect("broker should receive metadata")
-        .expect("server task panicked");
-    assert_eq!(&metadata[..3], &[5, 0, 132]);
-    let mut expected = 128_u32.to_be_bytes().to_vec();
-    expected.extend_from_slice(service_name.as_bytes());
-    assert_eq!(&metadata[3..], expected);
-    assert_eq!(client.server_capabilities(), (1, 1 << 1));
+    let connect = server.await.expect("server task panicked");
+    let payload = &connect[15..];
+    assert_eq!(&payload[..4], &[0, 2, 0, 2]);
+    assert_eq!(&payload[8..12], &[0, 0, 0, 0]);
+    assert_eq!(&payload[12..16], &128_u32.to_be_bytes());
+    assert_eq!(&payload[16..144], service_name.as_bytes());
+    assert_eq!(client.server_capabilities(), (2, 0));
     client.close().await?;
     Ok(())
 }
@@ -200,4 +189,19 @@ async fn should_stop_given_cancellation_when_connect_when_ready_called() -> Resu
     // Assert
     assert!(matches!(error, FitzError::Canceled));
     Ok(())
+}
+
+fn hello_frame() -> Vec<u8> {
+    let mut payload = 2_u16.to_be_bytes().to_vec();
+    payload.extend_from_slice(&0_u32.to_be_bytes());
+    payload.extend_from_slice(&1_048_576_u32.to_be_bytes());
+    payload.extend_from_slice(&64_u32.to_be_bytes());
+    payload.extend_from_slice(&1_u64.to_be_bytes());
+    let mut frame = vec![0, 2, 0];
+    frame.extend_from_slice(&0_u64.to_be_bytes());
+    frame.extend_from_slice(&22_u32.to_be_bytes());
+    frame.extend_from_slice(&payload);
+    let mut transport = u32::try_from(frame.len()).unwrap().to_be_bytes().to_vec();
+    transport.extend_from_slice(&frame);
+    transport
 }

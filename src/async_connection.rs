@@ -1322,27 +1322,28 @@ mod tests {
     use tokio::net::TcpListener;
 
     #[tokio::test]
-    async fn should_discard_canceled_fifo_slot_given_late_response() {
+    async fn should_isolate_canceled_request_given_late_correlated_response() {
         // Arrange
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let (received_tx, received_rx) = oneshot::channel();
+        let (cancelled_tx, cancelled_rx) = oneshot::channel();
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (mut reader, mut writer) = stream.into_split();
-            let _connect = read_tcp(&mut reader).await.unwrap();
-            write_tcp(
-                &mut writer,
-                crate::protocol::message_type::HELLO,
-                crate::codec::test_hello_payload(),
-            )
-            .await
-            .unwrap();
-            let _first = read_tcp(&mut reader).await.unwrap();
-            write_tcp(&mut writer, 100, b"late".to_vec()).await.unwrap();
-            let _second = read_tcp(&mut reader).await.unwrap();
-            write_tcp(&mut writer, 100, b"second".to_vec())
-                .await
-                .unwrap();
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut stream = crate::test_support::TestSession::new(socket);
+            stream.read_frame().await;
+            stream
+                .write_frame(
+                    crate::protocol::message_type::HELLO,
+                    &crate::codec::test_hello_payload(),
+                )
+                .await;
+            stream.read_frame().await;
+            received_tx.send(()).unwrap();
+            cancelled_rx.await.unwrap();
+            stream.write_frame(100, b"late").await;
+            stream.read_frame().await;
+            stream.write_frame(100, b"second").await;
         });
         let (state, _) = watch::channel(ConnectionState::Disconnected);
         let connection = AsyncConnection::spawn(AsyncConnectionOptions {
@@ -1367,8 +1368,10 @@ mod tests {
             let connection = connection.clone();
             async move { connection.request(100, b"first".to_vec()).await }
         });
-        tokio::task::yield_now().await;
+        received_rx.await.unwrap();
         first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        cancelled_tx.send(()).unwrap();
         let response = connection.request(100, b"second".to_vec()).await.unwrap();
 
         // Assert
@@ -1384,6 +1387,15 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut first, _) = listener.accept().await.unwrap();
             let _ = read_tcp(&mut first).await.unwrap();
+            let mut rejection = crate::codec::PayloadEncoder::new();
+            rejection.put_u16(1).put_string("invalid token");
+            write_tcp(
+                &mut first,
+                crate::protocol::message_type::CONNECT_REJECTED,
+                rejection.finish(),
+            )
+            .await
+            .unwrap();
             drop(first);
             let (mut second, _) = listener.accept().await.unwrap();
             let _ = read_tcp(&mut second).await.unwrap();

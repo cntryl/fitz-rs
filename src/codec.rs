@@ -331,10 +331,15 @@ mod tests {
     }
 
     #[test]
-    fn should_encode_message_type_zero_as_single_byte() {
-        let frame = encode_message_frame(0, b"ok");
-        assert_eq!(frame[0], 0);
-        assert_eq!(&frame[1..3], &[0, 2]);
+    fn should_encode_message_type_zero_in_fixed_header() {
+        // Arrange
+        let payload = b"ok";
+        // Act
+        let frame = encode_message_frame(0, payload);
+        let header = decode_frame_header(&frame).unwrap();
+        // Assert
+        assert_eq!(header.message_type, 0);
+        assert_eq!(&frame[FRAME_HEADER_LEN..], payload);
     }
 
     #[test]
@@ -355,7 +360,7 @@ mod tests {
     #[test]
     fn should_reject_oversized_payload_given_value_above_frame_limit_when_encoding_attempted() {
         // Arrange
-        let payload = vec![0u8; (u16::MAX as usize) + 1];
+        let payload = vec![0u8; MAX_MESSAGE_SIZE - FRAME_HEADER_LEN + 1];
 
         // Act
         let err = try_encode_message_frame(100, &payload).unwrap_err();
@@ -379,13 +384,14 @@ mod tests {
     #[test]
     fn should_reject_trailing_bytes_given_extra_frame_data_when_strict_decoding_used() {
         // Arrange
-        let frame = vec![100, 0, 2, b'h', b'i', b'!'];
+        let mut frame = encode_message_frame(100, b"hi");
+        frame.push(b'!');
 
         // Act
         let err = decode_message_frame(&frame).unwrap_err();
 
         // Assert
-        assert!(err.to_string().contains("Frame length does not match"));
+        assert_eq!(err.kind(), crate::error::FitzErrorKind::Protocol);
     }
 
     #[test]

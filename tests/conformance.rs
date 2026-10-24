@@ -200,7 +200,7 @@ async fn reject_held_lease(
     let Err(error) = result else {
         panic!("held lease must reject a competing acquisition");
     };
-    assert!(matches!(error, FitzError::Domain { code: 5001, .. }));
+    assert!(matches!(error, FitzError::DomainWire { code: 5050, .. }));
     contender.close().await?;
     owner.release().await
 }
@@ -235,7 +235,7 @@ async fn should_run_scenario(
             let mut response = connected.rpc()?.call(&route, b"unknown route").await?;
             assert!(matches!(
                 response.next().await,
-                Some(Err(FitzError::Domain { code: 6004, .. }))
+                Some(Err(FitzError::DomainWire { code: 6051, .. }))
             ));
         }
         5 => {
@@ -244,7 +244,7 @@ async fn should_run_scenario(
                 .schedule()?
                 .create(&route, "invalid cron", ScheduleDeliveryMode::Single, b"")
                 .await;
-            assert!(matches!(result, Err(FitzError::Domain { .. })));
+            assert!(matches!(result, Err(FitzError::DomainWire { .. })));
         }
         6 => reject_held_lease(connected, transport, auth_mode).await?,
         7 => {
@@ -383,11 +383,11 @@ async fn should_complete_default_async_conformance_suite() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires fitz-auth and fitz-anon from compose.yml"]
 async fn should_correlate_same_type_requests_out_of_order() {
+    // Arrange
     let connected = client(Transport::from_env(), AuthMode::from_env());
     connected.connect().await.expect("broker connection");
     assert!(connected.correlation_enabled());
-    assert_eq!(connected.server_capabilities().0, 1);
-    assert_ne!(connected.server_capabilities().1 & 1, 0);
+    assert_eq!(connected.server_capabilities(), (2, 0));
     let parked_route = unique_route("queue");
     let ready_route = unique_route("queue");
     connected
@@ -399,6 +399,7 @@ async fn should_correlate_same_type_requests_out_of_order() {
 
     let parked_queue = connected.queue().expect("queue client");
     let parked_request_route = parked_route.clone();
+    // Act
     let parked = tokio::spawn(async move {
         parked_queue
             .reserve(&parked_request_route, 30, 1, Some(5))
@@ -428,6 +429,7 @@ async fn should_correlate_same_type_requests_out_of_order() {
         .expect("parked reserve timed out")
         .expect("parked task panicked")
         .expect("parked reserve failed");
+    // Assert
     assert_eq!(first.pop().expect("first item").body, b"first");
     connected.close().await.expect("close client");
 }

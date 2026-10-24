@@ -10,7 +10,9 @@ async fn should_surface_terminal_rpc_error_as_domain_error() {
     let id = [9_u8; 16];
     let mut body = PayloadEncoder::new();
     body.put_u8(1)
-        .put_u32(6004)
+        .put_u16(6051)
+        .put_u8(0)
+        .put_u8(0)
         .put_string("No workers registered");
     let mut frame = PayloadEncoder::new();
     frame
@@ -38,7 +40,10 @@ async fn should_surface_terminal_rpc_error_as_domain_error() {
     let result = stream.next().await.unwrap();
 
     // Assert
-    assert!(matches!(result, Err(FitzError::Domain { code: 6004, .. })));
+    assert!(matches!(
+        result,
+        Err(FitzError::DomainWire { code: 6051, .. })
+    ));
     assert!(stream.next().await.is_none());
 }
 
@@ -134,7 +139,7 @@ fn should_reject_worker_concurrency_outside_wire_range() {
 #[test]
 fn should_decode_negotiated_rpc_request_budget() {
     // Arrange
-    let mut decoder = PayloadDecoder::new(&[1, 1, 0, 0, 1, 44]);
+    let mut decoder = PayloadDecoder::new(&[1, 0, 0, 1, 44]);
 
     // Act
     let budget = decode_rpc_request_budget(&mut decoder).unwrap();
@@ -146,7 +151,7 @@ fn should_decode_negotiated_rpc_request_budget() {
 #[test]
 fn should_reject_rpc_request_budget_with_trailing_bytes() {
     // Arrange
-    let mut decoder = PayloadDecoder::new(&[1, 1, 0, 0, 1, 44, 0]);
+    let mut decoder = PayloadDecoder::new(&[1, 0, 0, 1, 44, 0]);
 
     // Act
     let result = decode_rpc_request_budget(&mut decoder);

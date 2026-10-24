@@ -108,8 +108,10 @@ impl LeaseClient {
             }
             completion.get_u64()?
         } else {
-            return Err(FitzError::Domain {
-                code: 5001,
+            return Err(FitzError::DomainWire {
+                code: 5050,
+                class: 0,
+                effect: 0,
                 message: "lease acquisition queued".into(),
             });
         };
@@ -1099,6 +1101,8 @@ fn lease_success<'a>(response: &'a [u8], operation: &str) -> Result<PayloadDecod
 mod tests {
     use super::*;
     use crate::async_connection::AsyncConnectionOptions;
+    use crate::test_support::TestSession as TcpStream;
+    use crate::test_support::{TestReadHalf, TestWriteHalf};
     use crate::{
         ConnectionState, FitzObservability, HeartbeatOptions, ReconnectPolicy, RetryPolicy,
     };
@@ -1106,43 +1110,36 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::net::TcpListener;
     use tokio::sync::{oneshot, watch};
     use tokio::task::JoinHandle;
 
+    async fn accept_authenticated_session(listener: &TcpListener) -> TcpStream {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut session = TcpStream::new(socket);
+        assert_eq!(read_frame(&mut session).await.0, message_type::CONNECT);
+        write_frame(
+            &mut session,
+            message_type::HELLO,
+            &crate::codec::test_hello_payload(),
+        )
+        .await;
+        session
+    }
+
     async fn read_frame(stream: &mut TcpStream) -> (u16, Vec<u8>) {
-        let len = stream.read_u32().await.unwrap() as usize;
-        let mut frame = vec![0; len];
-        stream.read_exact(&mut frame).await.unwrap();
-        let (kind, start) = crate::codec::decode_message_frame(&frame).unwrap();
-        (kind, frame[start..].to_vec())
+        stream.read_frame().await
     }
     async fn write_frame(stream: &mut TcpStream, kind: u16, payload: &[u8]) {
-        let frame = crate::codec::try_encode_message_frame(kind, payload).unwrap();
-        stream
-            .write_u32(u32::try_from(frame.len()).unwrap())
-            .await
-            .unwrap();
-        stream.write_all(&frame).await.unwrap();
-        stream.flush().await.unwrap();
+        stream.write_frame(kind, payload).await;
     }
 
-    async fn read_split(reader: &mut tokio::net::tcp::OwnedReadHalf) -> (u16, Vec<u8>) {
-        let len = reader.read_u32().await.unwrap() as usize;
-        let mut frame = vec![0; len];
-        reader.read_exact(&mut frame).await.unwrap();
-        let (kind, start) = crate::codec::decode_message_frame(&frame).unwrap();
-        (kind, frame[start..].to_vec())
+    async fn read_split(reader: &mut TestReadHalf) -> (u16, Vec<u8>) {
+        reader.read_frame().await
     }
 
-    async fn write_split(writer: &mut tokio::net::tcp::OwnedWriteHalf, kind: u16, payload: &[u8]) {
-        let frame = crate::codec::try_encode_message_frame(kind, payload).unwrap();
-        writer
-            .write_u32(u32::try_from(frame.len()).unwrap())
-            .await
-            .unwrap();
-        writer.write_all(&frame).await.unwrap();
-        writer.flush().await.unwrap();
+    async fn write_split(writer: &mut TestWriteHalf, kind: u16, payload: &[u8]) {
+        writer.write_frame(kind, payload).await;
     }
 
     async fn connected_lease_client<F, Fut>(
@@ -1155,7 +1152,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut stream = TcpStream::new(socket);
             assert_eq!(read_frame(&mut stream).await.0, message_type::CONNECT);
             write_frame(
                 &mut stream,
@@ -1200,7 +1198,12 @@ mod tests {
 
     fn error_response(code: u32, message: &str) -> Vec<u8> {
         let mut response = PayloadEncoder::new();
-        response.put_u8(1).put_u32(code).put_string(message);
+        response
+            .put_u8(1)
+            .put_u16(u16::try_from(code).unwrap())
+            .put_u8(0)
+            .put_u8(0)
+            .put_string(message);
         response.finish()
     }
 
@@ -1243,7 +1246,9 @@ mod tests {
         let mut response = PayloadEncoder::new();
         response
             .put_u8(1)
-            .put_u32(5001)
+            .put_u16(5050)
+            .put_u8(0)
+            .put_u8(0)
             .put_string("HeldByOther: worker-1");
 
         // Act: decode the response through the shared Lease status parser.
@@ -1252,7 +1257,7 @@ mod tests {
         };
 
         // Assert: retain the numeric domain code used by retry and callers.
-        assert!(matches!(error, FitzError::Domain { code: 5001, .. }));
+        assert!(matches!(error, FitzError::DomainWire { code: 5050, .. }));
     }
 
     #[tokio::test]
@@ -1391,7 +1396,7 @@ mod tests {
             write_frame(
                 &mut stream,
                 message_type::LEASE_ACQUIRE,
-                &error_response(5006, "lease acquisition wait timed out"),
+                &error_response(5055, "lease acquisition wait timed out"),
             )
             .await;
         })
@@ -1414,8 +1419,8 @@ mod tests {
         // Assert: preserve the typed timeout and never admit application work.
         assert!(matches!(
             result,
-            Err(LeaseExecutionError::Acquisition(FitzError::Domain {
-                code: 5006,
+            Err(LeaseExecutionError::Acquisition(FitzError::DomainWire {
+                code: 5055,
                 ..
             }))
         ));
@@ -1477,7 +1482,7 @@ mod tests {
             write_frame(
                 &mut stream,
                 message_type::LEASE_ACQUIRE,
-                &error_response(5001, "held by another owner"),
+                &error_response(5050, "held by another owner"),
             )
             .await;
         })
@@ -1499,8 +1504,8 @@ mod tests {
         // Assert: return the acquisition error without admitting application work.
         assert!(matches!(
             result,
-            Err(LeaseExecutionError::Acquisition(FitzError::Domain {
-                code: 5001,
+            Err(LeaseExecutionError::Acquisition(FitzError::DomainWire {
+                code: 5050,
                 ..
             }))
         ));
@@ -1801,7 +1806,7 @@ mod tests {
         };
 
         // Assert
-        assert!(matches!(error, FitzError::Domain { code: 5011, .. }));
+        assert!(matches!(error, FitzError::DomainWire { code: 5057, .. }));
     }
 
     #[test]
@@ -1818,7 +1823,7 @@ mod tests {
         };
 
         // Assert
-        assert!(matches!(error, FitzError::Domain { code: 5012, .. }));
+        assert!(matches!(error, FitzError::DomainWire { code: 5003, .. }));
     }
 
     #[test]
@@ -1845,7 +1850,8 @@ mod tests {
         let address = listener.local_addr().unwrap();
 
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
+            let (socket, _) = listener.accept().await.unwrap();
+            let stream = TcpStream::new(socket);
             let (mut reader, writer) = stream.into_split();
             let writer = Arc::new(tokio::sync::Mutex::new(writer));
 
@@ -2293,14 +2299,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let (mut first, _) = listener.accept().await.unwrap();
-            assert_eq!(read_frame(&mut first).await.0, message_type::CONNECT);
-            write_frame(
-                &mut first,
-                message_type::HELLO,
-                &crate::codec::test_hello_payload(),
-            )
-            .await;
+            let mut first = accept_authenticated_session(&listener).await;
             let (kind, payload) = read_frame(&mut first).await;
             assert_eq!(kind, message_type::LEASE_SUBSCRIBE);
             let mut d = PayloadDecoder::new(&payload);
@@ -2321,14 +2320,7 @@ mod tests {
             .await;
             let _ = first.shutdown().await;
 
-            let (mut second, _) = listener.accept().await.unwrap();
-            assert_eq!(read_frame(&mut second).await.0, message_type::CONNECT);
-            write_frame(
-                &mut second,
-                message_type::HELLO,
-                &crate::codec::test_hello_payload(),
-            )
-            .await;
+            let mut second = accept_authenticated_session(&listener).await;
             // Restorable registration replay: the same SUBSCRIBE is re-sent
             // automatically by the connection layer, not by the observer.
             let (kind, payload) = read_frame(&mut second).await;
@@ -2514,7 +2506,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut stream = TcpStream::new(socket);
             assert_eq!(read_frame(&mut stream).await.0, message_type::CONNECT);
             write_frame(
                 &mut stream,

@@ -472,14 +472,22 @@ mod tests {
     fn should_preserve_coded_ingress_error_for_schedule_extension() {
         // Arrange
         let mut encoder = PayloadEncoder::new();
-        encoder.put_u8(1).put_u32(7010).put_string("broker busy");
+        encoder
+            .put_u8(1)
+            .put_u16(7006)
+            .put_u8(6)
+            .put_u8(1)
+            .put_string("broker busy");
         let payload = encoder.finish();
 
         // Act
         let result = plain_success(&payload, "LIST_V2");
 
         // Assert
-        assert!(matches!(result, Err(FitzError::Domain { code: 7010, .. })));
+        assert!(matches!(
+            result,
+            Err(FitzError::DomainWire { code: 7006, .. })
+        ));
     }
 
     #[tokio::test]

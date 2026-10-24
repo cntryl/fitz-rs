@@ -34,6 +34,8 @@ mod error;
 mod notifications;
 mod observability;
 mod protocol;
+#[cfg(test)]
+mod test_support;
 
 pub use error::error_code;
 pub use error::{FitzError, FitzErrorKind, Result};

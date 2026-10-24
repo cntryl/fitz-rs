@@ -165,7 +165,7 @@ mod tests {
     }
 
     #[test]
-    fn should_preserve_long_plain_error_without_inferring_capacity() {
+    fn should_reject_legacy_plain_error_without_inferring_capacity() {
         // Arrange
         let message = "x".repeat(4005);
         let mut encoder = PayloadEncoder::new();
@@ -173,9 +173,10 @@ mod tests {
         // Act
         let error = decode_queue_plain_ok(&encoder.finish()).unwrap_err();
         // Assert
-        assert!(
-            matches!(error, FitzError::Domain { code: 0, message: decoded } if decoded == message)
-        );
+        assert!(matches!(
+            error,
+            FitzError::Protocol(_) | FitzError::Codec(_)
+        ));
     }
 
     #[test]
@@ -184,12 +185,14 @@ mod tests {
         let mut encoder = PayloadEncoder::new();
         encoder
             .put_u8(1)
-            .put_u32(4007)
+            .put_u16(4007)
+            .put_u8(7)
+            .put_u8(1)
             .put_string("outcome unknown");
         // Act
         let error = decode_queue_plain_ok(&encoder.finish()).unwrap_err();
         // Assert
-        assert!(matches!(error, FitzError::Domain { code: 4007, .. }));
+        assert!(matches!(error, FitzError::DomainWire { code: 4007, .. }));
         assert!(!error.is_retryable());
     }
 
@@ -197,11 +200,16 @@ mod tests {
     fn should_preserve_coded_capacity_rejection_for_completion() {
         // Arrange
         let mut encoder = PayloadEncoder::new();
-        encoder.put_u8(1).put_u32(4005).put_string("not accepted");
+        encoder
+            .put_u8(1)
+            .put_u16(4005)
+            .put_u8(5)
+            .put_u8(0)
+            .put_string("not accepted");
         // Act
         let error = decode_queue_plain_ok(&encoder.finish()).unwrap_err();
         // Assert
-        assert!(matches!(error, FitzError::Domain { code: 4005, .. }));
+        assert!(matches!(error, FitzError::DomainWire { code: 4005, .. }));
     }
 
     #[test]

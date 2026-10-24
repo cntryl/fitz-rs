@@ -175,8 +175,10 @@ mod tests {
     #[test]
     fn should_classify_retryable_error_given_no_worker_code_when_is_retryable_called() {
         // Arrange
-        let error = FitzError::Domain {
-            code: 5001,
+        let error = FitzError::DomainWire {
+            code: 6051,
+            class: 0,
+            effect: 0,
             message: "no worker".to_string(),
         };
 
@@ -188,10 +190,12 @@ mod tests {
     }
 
     #[test]
-    fn should_classify_schedule_backend_error_as_retryable() {
+    fn should_classify_indeterminate_schedule_backend_error_as_terminal() {
         // Arrange
-        let error = FitzError::Domain {
-            code: error_code::SCHEDULE_BACKEND_ERROR,
+        let error = FitzError::DomainWire {
+            code: 7006,
+            class: 6,
+            effect: 1,
             message: "backend busy".to_string(),
         };
 
@@ -199,8 +203,8 @@ mod tests {
         let retryable = error.is_retryable();
 
         // Assert
-        assert_eq!(error_code::SCHEDULE_BACKEND_ERROR, 7010);
-        assert!(retryable);
+        assert_eq!(error_code::SCHEDULE_BACKEND_ERROR, 7006);
+        assert!(!retryable);
     }
 
     #[test]
@@ -234,14 +238,26 @@ mod tests {
     fn should_match_broker_retry_table_for_domain_codes() {
         // Arrange
         let retryable = [
-            1004, 1014, 2014, 3006, 4005, 5001, 5007, 6001, 6002, 6003, 6004, 7010,
+            (1005, 5, 0),
+            (2005, 5, 0),
+            (4005, 5, 0),
+            (5050, 0, 0),
+            (6051, 0, 0),
         ];
-        let terminal = [1009, 2009, 3005, 4006, 5009, 6009, 7009];
+        let terminal = [
+            (1009, 9, 0),
+            (2006, 6, 1),
+            (4007, 7, 1),
+            (7006, 6, 1),
+            (4005, 5, 1),
+        ];
 
         // Act
-        let classify = |code| {
-            FitzError::Domain {
+        let classify = |(code, class, effect)| {
+            FitzError::DomainWire {
                 code,
+                class,
+                effect,
                 message: String::new(),
             }
             .is_retryable()
