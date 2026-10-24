@@ -1155,7 +1155,7 @@ async fn read_tcp_record<R: AsyncRead + Unpin>(
 
 async fn read_tcp_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
     let len = reader.read_u32().await? as usize;
-    if len < crate::codec::FRAME_HEADER_LEN || len > MAX_MESSAGE_SIZE {
+    if !(crate::codec::FRAME_HEADER_LEN..=MAX_MESSAGE_SIZE).contains(&len) {
         return Err(FitzError::FrameTooLarge(len));
     }
     let mut frame = vec![0_u8; len];
@@ -1332,8 +1332,8 @@ mod tests {
             let _connect = read_tcp(&mut reader).await.unwrap();
             write_tcp(
                 &mut writer,
-                crate::protocol::message_type::SERVER_HELLO,
-                vec![0, 1, 0, 0, 0, 0],
+                crate::protocol::message_type::HELLO,
+                crate::codec::test_hello_payload(),
             )
             .await
             .unwrap();
@@ -1389,8 +1389,8 @@ mod tests {
             let _ = read_tcp(&mut second).await.unwrap();
             write_tcp(
                 &mut second,
-                crate::protocol::message_type::SERVER_HELLO,
-                vec![0, 1, 0, 0, 0, 0],
+                crate::protocol::message_type::HELLO,
+                crate::codec::test_hello_payload(),
             )
             .await
             .unwrap();

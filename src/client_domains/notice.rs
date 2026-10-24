@@ -288,7 +288,12 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             assert_eq!(read_frame(&mut stream).await.0, message_type::CONNECT);
-            write_frame(&mut stream, message_type::SERVER_HELLO, &[0, 1, 0, 0, 0, 0]).await;
+            write_frame(
+                &mut stream,
+                message_type::HELLO,
+                &crate::codec::test_hello_payload(),
+            )
+            .await;
             let (subscribe, _) = read_frame(&mut stream).await;
             assert_eq!(subscribe, message_type::NOTICE_SUBSCRIBE);
             let mut response = PayloadEncoder::new();
@@ -339,7 +344,12 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             assert_eq!(read_frame(&mut stream).await.0, message_type::CONNECT);
-            write_frame(&mut stream, message_type::SERVER_HELLO, &[0, 1, 0, 0, 0, 0]).await;
+            write_frame(
+                &mut stream,
+                message_type::HELLO,
+                &crate::codec::test_hello_payload(),
+            )
+            .await;
             assert_eq!(
                 read_frame(&mut stream).await.0,
                 message_type::NOTICE_SUBSCRIBE

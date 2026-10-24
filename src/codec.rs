@@ -128,13 +128,6 @@ impl<'a> PayloadDecoder<'a> {
         Ok(bytes)
     }
 
-    pub fn get_raw(&mut self, len: usize) -> Result<Vec<u8>> {
-        self.check_len(len)?;
-        let bytes = self.buf[self.pos..self.pos + len].to_vec();
-        self.pos += len;
-        Ok(bytes)
-    }
-
     pub fn get_fixed<const N: usize>(&mut self) -> Result<[u8; N]> {
         self.check_len(N)?;
         let mut value = [0_u8; N];
@@ -160,6 +153,18 @@ impl<'a> PayloadDecoder<'a> {
 pub const FRAME_HEADER_LEN: usize = 15;
 pub const MAX_MESSAGE_SIZE: usize = 1_048_576;
 pub const ACK_REQUESTED: u8 = 1;
+
+#[cfg(test)]
+pub(crate) fn test_hello_payload() -> Vec<u8> {
+    let mut encoder = PayloadEncoder::new();
+    encoder
+        .put_u16(2)
+        .put_u32(0)
+        .put_u32(u32::try_from(MAX_MESSAGE_SIZE).expect("frame limit fits in u32"))
+        .put_u32(256)
+        .put_u64(1);
+    encoder.finish()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameHeader {
@@ -242,48 +247,10 @@ pub fn decode_frame_header(buf: &[u8]) -> Result<FrameHeader> {
 }
 
 /// Decode a message frame: returns (`msg_type`, `payload_start`).
+#[cfg(test)]
 pub fn decode_message_frame(buf: &[u8]) -> Result<(u16, usize)> {
     let header = decode_frame_header(buf)?;
     Ok((header.message_type, header.payload_start))
-}
-
-/// Decode every TLV record in one message-bounded transport frame.
-pub fn decode_message_frames(mut buf: &[u8]) -> Result<Vec<(u16, Vec<u8>)>> {
-    let mut frames = Vec::with_capacity(2);
-    while !buf.is_empty() {
-        if buf.len() < FRAME_HEADER_LEN {
-            return Err(FitzError::Codec("truncated Wire-2 frame header".into()));
-        }
-        let message_type = u16::from_be_bytes([buf[0], buf[1]]);
-        let flags = buf[2];
-        if flags & !ACK_REQUESTED != 0 {
-            return Err(FitzError::Protocol(format!(
-                "unsupported frame flags {flags:#x}"
-            )));
-        }
-        let len = u32::from_be_bytes(buf[11..15].try_into().expect("fixed header slice")) as usize;
-        let end = FRAME_HEADER_LEN.saturating_add(len);
-        if end > MAX_MESSAGE_SIZE {
-            return Err(FitzError::FrameTooLarge(end));
-        }
-        if buf.len() < end {
-            return Err(FitzError::Codec("Incomplete payload bytes".into()));
-        }
-        frames.push((message_type, buf[FRAME_HEADER_LEN..end].to_vec()));
-        buf = &buf[end..];
-    }
-    Ok(frames)
-}
-
-pub fn try_encode_correlated_frame(
-    correlation_id: u64,
-    msg_type: u16,
-    payload: &[u8],
-) -> Result<Vec<u8>> {
-    if correlation_id == 0 {
-        return Err(FitzError::Codec("zero correlation identifier".into()));
-    }
-    try_encode_frame(msg_type, 0, correlation_id, payload)
 }
 
 #[cfg(test)]

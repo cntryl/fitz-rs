@@ -6,21 +6,6 @@ pub mod message_type {
     pub const HELLO: u16 = 2;
     pub const CONNECT_REJECTED: u16 = 3;
     pub const GOAWAY: u16 = 4;
-    #[deprecated(note = "Wire-2 correlation is carried by the frame header")]
-    pub const CORRELATE: u16 = 0;
-    #[deprecated(note = "Wire-2 correlation is carried by the frame header")]
-    pub const CORRELATED: u16 = 0;
-    #[deprecated(note = "Use HELLO; session metadata is part of CONNECT")]
-    pub const SERVER_HELLO: u16 = HELLO;
-    #[deprecated(note = "Service metadata is part of CONNECT in Wire-2")]
-    pub const SESSION_METADATA: u16 = 0;
-
-    // Wire 2 reserves capability bits; these names remain as zero-valued compatibility aliases.
-    pub const CAP_CORRELATION: u32 = 0;
-    pub const CAP_SESSION_METADATA: u32 = 0;
-    pub const CAP_KV_SCAN_EXCLUSIVE: u32 = 0;
-    pub const CAP_RPC_CANCELLATION: u32 = 0;
-
     // KV domain (100-199)
     pub const KV_BEGIN: u16 = 100;
     pub const KV_COMMIT: u16 = 101;
@@ -89,7 +74,6 @@ pub mod message_type {
     pub const SCHEDULE_UNSUBSCRIBE: u16 = 704;
     pub const SCHEDULE_NOTIFY: u16 = 705; // Server -> Client only
     pub const SCHEDULE_CREATE_BATCH: u16 = 706;
-    pub const SCHEDULE_LIST_V2: u16 = SCHEDULE_LIST_PAGE;
 }
 
 /// Transaction mode for KV operations.

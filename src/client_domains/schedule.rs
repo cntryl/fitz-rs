@@ -86,7 +86,7 @@ impl ScheduleClient {
         }
         Ok(route.into())
     }
-    /// Creates several schedules with Schedule CREATE_BATCH (706).
+    /// Creates several schedules with Schedule `CREATE_BATCH` (706).
     ///
     /// # Errors
     /// Returns a validation, transport, or broker error.
@@ -259,48 +259,6 @@ impl ScheduleClient {
     }
 }
 
-fn decode_list(mut d: PayloadDecoder<'_>) -> Result<ScheduleListPage> {
-    let total_count = d.get_u64()?;
-    let mut entries = Vec::new();
-    loop {
-        match d.get_u8()? {
-            0 => break,
-            1 => {}
-            value => {
-                return Err(FitzError::Protocol(format!(
-                    "invalid entry sentinel {value}"
-                )));
-            }
-        }
-        let route = d.get_string()?;
-        let cron = d.get_string()?;
-        let delivery_mode = match d.get_u8()? {
-            0 => ScheduleDeliveryMode::Broadcast,
-            1 => ScheduleDeliveryMode::Single,
-            v => {
-                return Err(FitzError::Protocol(format!(
-                    "invalid schedule delivery mode {v}"
-                )));
-            }
-        };
-        entries.push(ScheduleEntry {
-            route,
-            cron,
-            delivery_mode,
-            payload: d.get_bytes()?,
-        });
-    }
-    if !d.is_empty() {
-        return Err(FitzError::Protocol(
-            "schedule LIST response has trailing bytes".into(),
-        ));
-    }
-    Ok(ScheduleListPage {
-        entries,
-        total_count,
-    })
-}
-
 fn decode_cursor_page(mut decoder: PayloadDecoder<'_>) -> Result<ScheduleCursorPage> {
     if decoder.get_u8()? != 1 {
         return Err(FitzError::Protocol(
@@ -367,16 +325,6 @@ fn decode_cursor_page(mut decoder: PayloadDecoder<'_>) -> Result<ScheduleCursorP
     })
 }
 
-fn success<'a>(response: &'a [u8], operation: &str) -> Result<PayloadDecoder<'a>> {
-    let mut d = PayloadDecoder::new(response);
-    match d.get_u8()? {
-        0 => Ok(d),
-        1 => Err(decode_domain_error(&mut d)?),
-        v => Err(FitzError::Protocol(format!(
-            "Schedule {operation} returned status {v}"
-        ))),
-    }
-}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduleNotification {
     pub route: String,
@@ -495,31 +443,6 @@ mod tests {
     use tokio::sync::watch;
 
     #[test]
-    fn should_decode_schedule_list_total_count_given_valid_wire_payload() {
-        // Arrange
-        let mut encoder = PayloadEncoder::new();
-        encoder
-            .put_u64(7)
-            .put_u8(1)
-            .put_string("schedule://realm/area/job")
-            .put_string("*/5 * * * *")
-            .put_u8(ScheduleDeliveryMode::Single as u8)
-            .put_bytes(b"payload")
-            .put_u8(0);
-        let payload = encoder.finish();
-
-        // Act
-        let page = decode_list(PayloadDecoder::new(&payload)).unwrap();
-
-        // Assert
-        assert_eq!(page.total_count, 7);
-        assert_eq!(page.entries.len(), 1);
-        assert_eq!(page.entries[0].route, "schedule://realm/area/job");
-        assert_eq!(page.entries[0].delivery_mode, ScheduleDeliveryMode::Single);
-        assert_eq!(page.entries[0].payload, b"payload");
-    }
-
-    #[test]
     fn should_decode_versioned_schedule_cursor_page() {
         // Arrange
         let mut encoder = PayloadEncoder::new();
@@ -546,28 +469,6 @@ mod tests {
     }
 
     #[test]
-    fn should_preserve_schedule_backend_code_given_coded_error_response() {
-        // Arrange
-        let mut encoder = PayloadEncoder::new();
-        encoder
-            .put_u8(1)
-            .put_u32(crate::error::error_code::SCHEDULE_BACKEND_ERROR)
-            .put_string("backend busy");
-        let payload = encoder.finish();
-
-        // Act
-        let Err(error) = success(&payload, "LIST") else {
-            panic!("coded Schedule backend error unexpectedly decoded as success");
-        };
-
-        // Assert
-        assert!(matches!(
-            error,
-            FitzError::Domain { code: 7010, ref message } if message == "backend busy"
-        ));
-    }
-
-    #[test]
     fn should_preserve_coded_ingress_error_for_schedule_extension() {
         // Arrange
         let mut encoder = PayloadEncoder::new();
@@ -579,22 +480,6 @@ mod tests {
 
         // Assert
         assert!(matches!(result, Err(FitzError::Domain { code: 7010, .. })));
-    }
-
-    #[test]
-    fn should_reject_schedule_list_page_given_trailing_bytes() {
-        // Arrange
-        let mut encoder = PayloadEncoder::new();
-        encoder.put_u64(0).put_u8(0).put_u8(9);
-        let payload = encoder.finish();
-
-        // Act
-        let result = decode_list(PayloadDecoder::new(&payload));
-
-        // Assert
-        assert!(
-            matches!(result, Err(FitzError::Protocol(message)) if message.contains("trailing"))
-        );
     }
 
     #[tokio::test]
