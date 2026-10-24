@@ -1,4 +1,4 @@
-use super::decode_ok;
+use super::{decode_domain_error, decode_ok};
 use crate::async_connection::{AsyncConnection, RestorableRegistration};
 use crate::codec::{PayloadDecoder, PayloadEncoder};
 use crate::domains::routes::{validate_fixed_route, validate_registration_pattern};
@@ -46,6 +46,25 @@ impl NoticeClient {
         self.connection
             .send(message_type::NOTICE_PUBLISH, encoder.finish())
             .await
+    }
+
+    /// Publishes a notice and waits for a correlated broker acknowledgement.
+    ///
+    /// # Errors
+    /// Returns a broker or transport error when the publish is rejected or not acknowledged.
+    pub async fn publish_with_ack(&self, route: &str, body: &[u8]) -> Result<()> {
+        validate_fixed_route(route, "notice", 3)?;
+        let mut encoder = PayloadEncoder::new();
+        encoder
+            .put_string(route)
+            .put_u32(u32::try_from(body.len()).map_err(|_| FitzError::FrameTooLarge(body.len()))?)
+            .put_raw(body);
+        decode_ok(
+            &self
+                .connection
+                .request_with_flags(message_type::NOTICE_PUBLISH, encoder.finish(), 1)
+                .await?,
+        )
     }
 
     /// Performs the operation asynchronously.
@@ -125,10 +144,7 @@ fn decode_subscription_id(response: &[u8]) -> Result<u64> {
     match decoder.get_u8()? {
         0 => {}
         1 => {
-            return Err(FitzError::Domain {
-                code: decoder.get_u32()?,
-                message: decoder.get_string()?,
-            });
+            return Err(decode_domain_error(&mut decoder)?);
         }
         status => {
             return Err(FitzError::Protocol(format!(

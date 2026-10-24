@@ -29,12 +29,12 @@ async fn main() -> Result<()> {
 }
 ```
 
-`service_name` is optional. New brokers record it on the active session after
-advertising the `SESSION_METADATA` capability; older brokers receive no metadata frame.
+`service_name` is optional and is sent in the Wire-2 `CONNECT` payload with the
+client build identity. Capability bits are reserved as zero in Wire 2.
 
-`connect()` waits for `SERVER_HELLO` on both transports within the configured
-connection timeout, so negotiated capabilities are available before registration.
-An explicit legacy hello without cancellation support remains valid.
+`connect()` waits for Wire-2 `HELLO` on both transports within the configured
+connection timeout, so the negotiated message-size and in-flight-request limits
+are available before registration.
 
 For a broker that permits anonymous sessions, use
 `Client::anonymous("ws://127.0.0.1:4190/ws")`.
@@ -71,20 +71,23 @@ Route-less reserve/read/last responses are not supported. If any item contains a
 invalid concrete route, the entire response fails closed; the client never
 returns a partial reservation or read batch.
 
-Schedule listing uses `list(offset, limit)` on message 702 and returns
-`total_count`. Global stream continuations reuse the returned fingerprint and
-captured-watermark pair.
+Schedule LIST (702) uses cursor pagination. Use `list_v2(None, limit)` to start
+a page sequence and pass each returned continuation to the next call. The
+compatibility `list(offset, limit)` accepts only an absent or zero offset and
+returns the first page. Pages carry `has_more` and an opaque continuation, not a
+total count. Message 707 is retired. Global stream continuations reuse the
+returned fingerprint and captured-watermark pair.
 
 `NoticeClient::unsubscribe_all()` sends message 503 and completes existing
-Notice handles after broker acknowledgment. Schedule `create_batch()` (706) and
-`list_v2()` (707) expose broker extensions; `list()` (702) remains the portable
-pagination API. Terminal RPC error responses surface as `FitzError::Domain`.
+Notice handles after broker acknowledgment. Schedule `create_batch()` uses
+message 706; `list_v2()` is a compatibility API name for cursor LIST on 702.
+Terminal RPC error responses surface as `FitzError::Domain`.
 
 Workers can link a downstream call to an inbound request with
 `rpc.call_from_request(&request, route, body).await?`. This carries the current
 remaining budget and ends the downstream stream when the parent request is
-cancelled. Dropping a response stream also sends best-effort cancellation when
-the broker advertises `CAP_RPC_CANCELLATION`.
+cancelled. Dropping a response stream also sends best-effort cancellation using
+the Wire-2 RPC cancellation messages.
 
 RPC timeouts are remaining end-to-end budgets (up to one day). Worker budgets
 start at transport receipt, include local buffering time, and cancel

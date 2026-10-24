@@ -1,6 +1,5 @@
 use crate::codec::{
-    decode_message_frame, decode_message_frames, try_encode_correlated_frame,
-    try_encode_message_frame,
+    MAX_MESSAGE_SIZE, decode_frame_header, try_encode_frame, try_encode_message_frame,
 };
 use crate::notifications::{Notifications, ReceivedNotification};
 use crate::{
@@ -65,17 +64,8 @@ struct QueuedRequest {
     response: Option<Response>,
 }
 
-fn frame_correlatable(message_type: u16) -> bool {
-    !matches!(
-        message_type,
-        crate::protocol::message_type::RPC_REQUEST | crate::protocol::message_type::RPC_RESPONSE
-    )
-}
-
 fn supervisor_correlation_enabled(supervisor: &Supervisor) -> bool {
-    supervisor.capabilities.load(Ordering::Acquire)
-        & u64::from(crate::protocol::message_type::CAP_CORRELATION)
-        != 0
+    supervisor.capabilities.load(Ordering::Acquire) >> 32 >= 2
 }
 
 enum Command {
@@ -84,10 +74,12 @@ enum Command {
         id: u64,
         generation: u64,
         message_type: u16,
+        flags: u8,
         payload: Vec<u8>,
         response: Response,
     },
     Send {
+        id: u64,
         generation: u64,
         message_type: u16,
         payload: Vec<u8>,
@@ -149,7 +141,6 @@ impl AsyncConnection {
         let close_requested = Arc::new(AtomicBool::new(false));
         let registrations = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let capabilities = Arc::new(AtomicU64::new(0));
-        let service_metadata_sent = AtomicBool::new(false);
         tokio::spawn(supervise(Supervisor {
             endpoint,
             token_provider,
@@ -158,7 +149,6 @@ impl AsyncConnection {
             heartbeat,
             observability,
             service_name,
-            service_metadata_sent,
             state,
             commands: command_rx,
             cancellations: cancellation_rx,
@@ -169,6 +159,8 @@ impl AsyncConnection {
             close_requested: Arc::clone(&close_requested),
             registrations: Arc::clone(&registrations),
             capabilities: Arc::clone(&capabilities),
+            max_message_bytes: AtomicU64::new(MAX_MESSAGE_SIZE as u64),
+            max_in_flight: AtomicU64::new(u64::try_from(max_queued.max(1)).unwrap_or(u64::MAX)),
         }));
         Self {
             commands,
@@ -198,7 +190,7 @@ impl AsyncConnection {
     }
 
     pub(crate) fn correlation_enabled(&self) -> bool {
-        self.capability_bits() & crate::protocol::message_type::CAP_CORRELATION != 0
+        self.protocol_version() >= 2
     }
 
     pub(crate) async fn connect(&self) -> Result<()> {
@@ -217,6 +209,15 @@ impl AsyncConnection {
     }
 
     pub(crate) async fn request(&self, message_type: u16, payload: Vec<u8>) -> Result<Vec<u8>> {
+        self.request_with_flags(message_type, payload, 0).await
+    }
+
+    pub(crate) async fn request_with_flags(
+        &self,
+        message_type: u16,
+        payload: Vec<u8>,
+        flags: u8,
+    ) -> Result<Vec<u8>> {
         let span =
             tracing::info_span!("fitz.request", message_type, generation = self.generation());
         async {
@@ -232,6 +233,7 @@ impl AsyncConnection {
                     id,
                     generation: self.generation(),
                     message_type,
+                    flags,
                     payload,
                     response: tx,
                 })
@@ -323,9 +325,11 @@ impl AsyncConnection {
     }
 
     pub(crate) async fn send(&self, message_type: u16, payload: Vec<u8>) -> Result<()> {
+        let id = self.next_request_id.fetch_add(1, Ordering::Relaxed).max(1);
         let (tx, rx) = oneshot::channel();
         self.commands
             .try_send(Command::Send {
+                id,
                 generation: self.generation(),
                 message_type,
                 payload,
@@ -469,7 +473,6 @@ struct Supervisor {
     heartbeat: HeartbeatOptions,
     observability: FitzObservability,
     service_name: Option<String>,
-    service_metadata_sent: AtomicBool,
     state: watch::Sender<ConnectionState>,
     commands: mpsc::Receiver<Command>,
     cancellations: mpsc::UnboundedReceiver<u64>,
@@ -480,6 +483,8 @@ struct Supervisor {
     close_requested: Arc<AtomicBool>,
     registrations: Arc<parking_lot::Mutex<HashMap<u64, Registration>>>,
     capabilities: Arc<AtomicU64>,
+    max_message_bytes: AtomicU64,
+    max_in_flight: AtomicU64,
 }
 
 /// Returns (creating if absent) the per-message-type epoch counter's lock.
@@ -630,9 +635,6 @@ enum Session {
 
 async fn open_session(supervisor: &Supervisor) -> Result<Session> {
     supervisor.capabilities.store(0, Ordering::Release);
-    supervisor
-        .service_metadata_sent
-        .store(false, Ordering::Release);
     let token = supervisor.token_provider.token().await?;
     supervisor.state.send_replace(ConnectionState::Connecting);
     let mut session = if let Some(address) = supervisor.endpoint.strip_prefix("tcp://") {
@@ -669,40 +671,22 @@ async fn open_session(supervisor: &Supervisor) -> Result<Session> {
         .state
         .send_replace(ConnectionState::Authenticating);
     emit_lifecycle(supervisor, "auth_start");
+    let mut connect = crate::codec::PayloadEncoder::new();
+    connect
+        .put_u16(2)
+        .put_u16(2)
+        .put_u32(0)
+        .put_string(&token)
+        .put_string(supervisor.service_name.as_deref().unwrap_or(""))
+        .put_string(&format!("fitz-rs/{}", env!("CARGO_PKG_VERSION")));
     write_session(
         &mut session,
         crate::protocol::message_type::CONNECT,
-        token.into_bytes(),
+        connect.finish(),
     )
     .await?;
     settle_authentication(supervisor, &mut session).await?;
-    if let Some(payload) = take_session_metadata(supervisor) {
-        write_session(
-            &mut session,
-            crate::protocol::message_type::SESSION_METADATA,
-            payload,
-        )
-        .await?;
-    }
     Ok(session)
-}
-
-fn take_session_metadata(supervisor: &Supervisor) -> Option<Vec<u8>> {
-    if supervisor.capabilities.load(Ordering::Acquire)
-        & u64::from(crate::protocol::message_type::CAP_SESSION_METADATA)
-        == 0
-        || supervisor
-            .service_metadata_sent
-            .swap(true, Ordering::AcqRel)
-    {
-        return None;
-    }
-    let service_name = supervisor.service_name.as_ref()?;
-    let name = service_name.as_bytes();
-    let mut payload = Vec::with_capacity(4 + name.len());
-    payload.extend_from_slice(&u32::try_from(name.len()).ok()?.to_be_bytes());
-    payload.extend_from_slice(name);
-    Some(payload)
 }
 
 fn emit_lifecycle(supervisor: &Supervisor, name: &'static str) {
@@ -726,42 +710,47 @@ fn emit_lifecycle(supervisor: &Supervisor, name: &'static str) {
     }
 }
 
-fn apply_server_hello(supervisor: &Supervisor, payload: &[u8]) {
-    if payload.len() < 6 {
-        return;
+fn apply_server_hello(supervisor: &Supervisor, payload: &[u8]) -> Result<()> {
+    let mut decoder = crate::codec::PayloadDecoder::new(payload);
+    let version = decoder.get_u16()?;
+    let bits = decoder.get_u32()?;
+    let max_message_bytes = decoder.get_u32()?;
+    let max_in_flight = decoder.get_u32()?;
+    let _session_id = decoder.get_u64()?;
+    if version != 2 || max_message_bytes < 15 || max_in_flight == 0 {
+        return Err(FitzError::Protocol(
+            "broker advertised invalid Wire-2 limits".into(),
+        ));
     }
-    let version = u16::from_be_bytes([payload[0], payload[1]]);
-    let bits = u32::from_be_bytes([payload[2], payload[3], payload[4], payload[5]]);
+    let max_message_bytes = usize::try_from(max_message_bytes)
+        .unwrap_or(usize::MAX)
+        .min(MAX_MESSAGE_SIZE);
+    let max_in_flight =
+        u64::from(max_in_flight).min(supervisor.max_in_flight.load(Ordering::Acquire));
     supervisor.capabilities.store(
         (u64::from(version) << 32) | u64::from(bits),
         Ordering::Release,
     );
+    supervisor.max_message_bytes.store(
+        u64::try_from(max_message_bytes).unwrap_or(u64::MAX),
+        Ordering::Release,
+    );
+    supervisor
+        .max_in_flight
+        .store(max_in_flight, Ordering::Release);
+    Ok(())
 }
 
 async fn settle_authentication(supervisor: &Supervisor, session: &mut Session) -> Result<()> {
     match session {
         Session::Tcp(stream) => {
-            match tokio::time::timeout(supervisor.timeout, read_tcp(stream)).await {
+            match tokio::time::timeout(supervisor.timeout, read_tcp_record(stream)).await {
                 Err(_) => Err(FitzError::Timeout),
-                Ok(Ok((message_type, payload)))
-                    if message_type == crate::protocol::message_type::SERVER_HELLO
-                        && payload.len() >= 6 =>
-                {
-                    // SERVER_HELLO is an unsolicited capability advertisement. It may
-                    // arrive during the authentication settle window and is not an
-                    // authentication response.
-                    apply_server_hello(supervisor, &payload);
-                    Ok(())
-                }
-                Ok(Ok(_)) => Err(FitzError::Protocol(
-                    "broker sent an unexpected authentication response".into(),
-                )),
+                Ok(Ok((header, payload))) => process_auth_frame(supervisor, header, &payload),
                 Ok(Err(FitzError::ConnectionClosed)) => Err(FitzError::Authentication {
                     message: "broker closed the connection during authentication".into(),
                 }),
-                Ok(Err(error)) => Err(FitzError::Authentication {
-                    message: error.to_string(),
-                }),
+                Ok(Err(error)) => Err(error),
             }
         }
         Session::WebSocket(socket) => {
@@ -779,16 +768,12 @@ async fn settle_authentication(supervisor: &Supervisor, session: &mut Session) -
                         .map_err(|error| FitzError::Transport(error.to_string()))?,
                     Ok(Some(Ok(Message::Pong(_)))) => {}
                     Ok(Some(Ok(Message::Binary(frame)))) => {
-                        let (message_type, payload_start) = decode_message_frame(&frame)?;
-                        if message_type != crate::protocol::message_type::SERVER_HELLO
-                            || frame.len() - payload_start < 6
-                        {
-                            return Err(FitzError::Protocol(
-                                "broker sent an unexpected authentication response".into(),
-                            ));
-                        }
-                        apply_server_hello(supervisor, &frame[payload_start..]);
-                        return Ok(());
+                        let header = decode_frame_header(&frame)?;
+                        return process_auth_frame(
+                            supervisor,
+                            header,
+                            &frame[header.payload_start..],
+                        );
                     }
                     Ok(Some(Ok(_)) | None) => {
                         return Err(FitzError::Authentication {
@@ -804,6 +789,52 @@ async fn settle_authentication(supervisor: &Supervisor, session: &mut Session) -
             }
         }
     }
+}
+
+fn process_auth_frame(
+    supervisor: &Supervisor,
+    header: crate::codec::FrameHeader,
+    payload: &[u8],
+) -> Result<()> {
+    if header.flags != 0 || header.correlation_id != 0 {
+        return Err(FitzError::Protocol(
+            "authentication control frame has nonzero flags or correlation".into(),
+        ));
+    }
+    match header.message_type {
+        crate::protocol::message_type::HELLO => apply_server_hello(supervisor, payload),
+        crate::protocol::message_type::CONNECT_REJECTED => {
+            let mut decoder = crate::codec::PayloadDecoder::new(payload);
+            let code = decoder.get_u16()?;
+            let message = decoder.get_string()?;
+            if !decoder.is_empty() {
+                return Err(FitzError::Protocol(
+                    "CONNECT_REJECTED has trailing bytes".into(),
+                ));
+            }
+            Err(FitzError::Authentication {
+                message: format!("{code}: {message}"),
+            })
+        }
+        _ => Err(FitzError::Protocol(
+            "broker sent an unexpected authentication response".into(),
+        )),
+    }
+}
+
+fn encode_outbound(
+    supervisor: &Supervisor,
+    message_type: u16,
+    flags: u8,
+    correlation_id: u64,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    let frame = try_encode_frame(message_type, flags, correlation_id, payload)?;
+    let frame_len = u64::try_from(frame.len()).unwrap_or(u64::MAX);
+    if frame_len > supervisor.max_message_bytes.load(Ordering::Acquire) {
+        return Err(FitzError::FrameTooLarge(frame.len()));
+    }
+    Ok(frame)
 }
 
 enum SessionResult {
@@ -834,13 +865,20 @@ where
     loop {
         tokio::select! {
             command = supervisor.commands.recv() => match command {
-                Some(Command::Request { id, generation, message_type, payload, response }) => {
+                Some(Command::Request { id, generation, message_type, flags, payload, response }) => {
                     if generation != session_generation { let _ = response.send(Err(FitzError::ConnectionClosed)); continue; }
                     let response = (!canceled.remove(&id)).then_some(response);
-                    if supervisor_correlation_enabled(supervisor) && frame_correlatable(message_type) {
+                    if supervisor_correlation_enabled(supervisor) {
+                        if u64::try_from(correlated.len()).unwrap_or(u64::MAX) >= supervisor.max_in_flight.load(Ordering::Acquire) {
+                            if let Some(response) = response { let _ = response.send(Err(FitzError::Backpressure("broker max in-flight limit reached".into()))); }
+                            continue;
+                        }
+                        let frame = match encode_outbound(supervisor, message_type, flags, id, &payload) {
+                            Ok(frame) => frame,
+                            Err(error) => { if let Some(response) = response { let _ = response.send(Err(error)); } continue; }
+                        };
                         correlated.insert(id, PendingRequest { id, response });
-                        let frame = try_encode_correlated_frame(id, message_type, &payload);
-                        if frame.is_err() || write_tcp_frame(&mut writer, &frame.unwrap_or_default()).await.is_err() { fail_all(&mut pending, &mut correlated, &mut queued); return SessionResult::Disconnected; }
+                        if write_tcp_frame(&mut writer, &frame).await.is_err() { fail_all(&mut pending, &mut correlated, &mut queued); return SessionResult::Disconnected; }
                     } else if pending.get(&message_type).is_some_and(|items| !items.is_empty()) {
                         queued.entry(message_type).or_default().push_back(QueuedRequest { id, payload, response });
                     } else {
@@ -848,9 +886,14 @@ where
                         if write_tcp(&mut writer, message_type, payload).await.is_err() { fail_all(&mut pending, &mut correlated, &mut queued); return SessionResult::Disconnected; }
                     }
                 }
-                Some(Command::Send { generation, message_type, payload, response }) => {
+                Some(Command::Send { id, generation, message_type, payload, response }) => {
                     if generation != session_generation { let _ = response.send(Err(FitzError::ConnectionClosed)); continue; }
-                    let _ = response.send(write_tcp(&mut writer, message_type, payload).await);
+                    let correlation_id = if (300..=305).contains(&message_type) { id } else { 0 };
+                    let result = match encode_outbound(supervisor, message_type, 0, correlation_id, &payload) {
+                        Ok(frame) => write_tcp_frame(&mut writer, &frame).await,
+                        Err(error) => Err(error),
+                    };
+                    let _ = response.send(result);
                 }
                 Some(Command::Connect(response)) => { let _ = response.send(Ok(())); }
                 Some(Command::Close(response)) => { let _ = writer.shutdown().await; let _=response.send(()); fail_all(&mut pending, &mut correlated, &mut queued); supervisor.state.send_replace(ConnectionState::Closed); emit_lifecycle(supervisor, "closed"); return SessionResult::Closed; }
@@ -859,7 +902,6 @@ where
             Some(id) = supervisor.cancellations.recv() => if !cancel_all_pending(&mut pending, &mut correlated, &mut queued, id) { canceled.insert(id); },
             frame = read_tcp_frame(&mut reader) => if let Ok(frame) = frame {
                 let Ok(records) = decode_incoming(supervisor, &frame) else { fail_all(&mut pending, &mut correlated, &mut queued); return SessionResult::Disconnected; };
-                if let Some(payload) = take_session_metadata(supervisor) && write_tcp(&mut writer, crate::protocol::message_type::SESSION_METADATA, payload).await.is_err() { fail_all(&mut pending, &mut correlated, &mut queued); return SessionResult::Disconnected; }
                 for (message_type, payload, correlation_id) in records {
                     if correlation_id != 0 {
                         dispatch_correlated(supervisor, &mut correlated, correlation_id, message_type, payload);
@@ -898,13 +940,20 @@ async fn run_websocket(
     loop {
         tokio::select! {
             command = supervisor.commands.recv() => match command {
-                Some(Command::Request { id, generation, message_type, payload, response }) => {
+                Some(Command::Request { id, generation, message_type, flags, payload, response }) => {
                     if generation != session_generation { let _ = response.send(Err(FitzError::ConnectionClosed)); continue; }
                     let response = (!canceled.remove(&id)).then_some(response);
-                    if supervisor_correlation_enabled(supervisor) && frame_correlatable(message_type) {
+                    if supervisor_correlation_enabled(supervisor) {
+                        if u64::try_from(correlated.len()).unwrap_or(u64::MAX) >= supervisor.max_in_flight.load(Ordering::Acquire) {
+                            if let Some(response) = response { let _ = response.send(Err(FitzError::Backpressure("broker max in-flight limit reached".into()))); }
+                            continue;
+                        }
+                        let frame = match encode_outbound(supervisor, message_type, flags, id, &payload) {
+                            Ok(frame) => frame,
+                            Err(error) => { if let Some(response) = response { let _ = response.send(Err(error)); } continue; }
+                        };
                         correlated.insert(id, PendingRequest { id, response });
-                        let frame = try_encode_correlated_frame(id, message_type, &payload);
-                        if frame.is_err() || writer.send(Message::Binary(frame.unwrap_or_default().into())).await.is_err() { fail_all(&mut pending, &mut correlated, &mut queued); return SessionResult::Disconnected; }
+                        if writer.send(Message::Binary(frame.into())).await.is_err() { fail_all(&mut pending, &mut correlated, &mut queued); return SessionResult::Disconnected; }
                     } else if pending.get(&message_type).is_some_and(|items| !items.is_empty()) {
                         queued.entry(message_type).or_default().push_back(QueuedRequest { id, payload, response });
                     } else {
@@ -915,9 +964,14 @@ async fn run_websocket(
                     awaiting_pong = false;
                     heartbeat.as_mut().reset(tokio::time::Instant::now() + heartbeat_idle);
                 }
-                Some(Command::Send { generation, message_type, payload, response }) => {
+                Some(Command::Send { id, generation, message_type, payload, response }) => {
                     if generation != session_generation { let _ = response.send(Err(FitzError::ConnectionClosed)); continue; }
-                    let result = async { let frame=try_encode_message_frame(message_type,&payload)?; writer.send(Message::Binary(frame.into())).await.map_err(|e| FitzError::Transport(e.to_string())) }.await; let _=response.send(result);
+                    let correlation_id = if (300..=305).contains(&message_type) { id } else { 0 };
+                    let result = match encode_outbound(supervisor, message_type, 0, correlation_id, &payload) {
+                        Ok(frame) => writer.send(Message::Binary(frame.into())).await.map_err(|e| FitzError::Transport(e.to_string())),
+                        Err(error) => Err(error),
+                    };
+                    let _ = response.send(result);
                 }
                 Some(Command::Connect(response)) => { let _ = response.send(Ok(())); }
                 Some(Command::Close(response)) => { let _=writer.close().await; let _=response.send(()); fail_all(&mut pending, &mut correlated, &mut queued); supervisor.state.send_replace(ConnectionState::Closed); emit_lifecycle(supervisor, "closed"); return SessionResult::Closed; }
@@ -926,7 +980,6 @@ async fn run_websocket(
             Some(id) = supervisor.cancellations.recv() => if !cancel_all_pending(&mut pending, &mut correlated, &mut queued, id) { canceled.insert(id); },
             message = reader.next() => match message {
                 Some(Ok(Message::Binary(frame))) => if let Ok(records) = decode_incoming(supervisor, &frame) {
-                    if let Some(payload) = take_session_metadata(supervisor) { let frame=try_encode_message_frame(crate::protocol::message_type::SESSION_METADATA, &payload); if frame.is_err() || writer.send(Message::Binary(frame.unwrap_or_default().into())).await.is_err() { fail_all(&mut pending, &mut correlated, &mut queued); return SessionResult::Disconnected; } }
                     awaiting_pong = false;
                     heartbeat.as_mut().reset(tokio::time::Instant::now() + heartbeat_idle);
                     for (message_type, payload, correlation_id) in records {
@@ -1019,7 +1072,7 @@ async fn round_trip_session(
     expected_message_type: u16,
     payload: Vec<u8>,
 ) -> Result<Vec<u8>> {
-    write_session(session, expected_message_type, payload).await?;
+    write_session_correlated(session, expected_message_type, payload, 1).await?;
     loop {
         let (message_type, payload) =
             tokio::time::timeout(supervisor.timeout, read_session(session))
@@ -1038,14 +1091,35 @@ async fn read_session(session: &mut Session) -> Result<(u16, Vec<u8>)> {
         Session::WebSocket(socket) => loop {
             match socket.next().await {
                 Some(Ok(Message::Binary(frame))) => {
-                    let (message_type, payload_start) = decode_message_frame(&frame)?;
-                    return Ok((message_type, frame[payload_start..].to_vec()));
+                    let header = decode_frame_header(&frame)?;
+                    return Ok((header.message_type, frame[header.payload_start..].to_vec()));
                 }
                 Some(Ok(_)) => {}
                 Some(Err(error)) => return Err(FitzError::Transport(error.to_string())),
                 None => return Err(FitzError::ConnectionClosed),
             }
         },
+    }
+}
+
+async fn write_session_correlated(
+    session: &mut Session,
+    message_type: u16,
+    payload: Vec<u8>,
+    correlation_id: u64,
+) -> Result<()> {
+    match session {
+        Session::Tcp(stream) => {
+            let frame = try_encode_frame(message_type, 0, correlation_id, &payload)?;
+            write_tcp_frame(stream, &frame).await
+        }
+        Session::WebSocket(socket) => {
+            let frame = try_encode_frame(message_type, 0, correlation_id, &payload)?;
+            socket
+                .send(Message::Binary(frame.into()))
+                .await
+                .map_err(|e| FitzError::Transport(e.to_string()))
+        }
     }
 }
 
@@ -1067,52 +1141,73 @@ async fn write_tcp_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &[u8]) ->
 }
 
 async fn read_tcp<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(u16, Vec<u8>)> {
+    let (header, payload) = read_tcp_record(reader).await?;
+    Ok((header.message_type, payload))
+}
+
+async fn read_tcp_record<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<(crate::codec::FrameHeader, Vec<u8>)> {
     let frame = read_tcp_frame(reader).await?;
-    let (message_type, payload_start) = decode_message_frame(&frame)?;
-    Ok((message_type, frame[payload_start..].to_vec()))
+    let header = decode_frame_header(&frame)?;
+    Ok((header, frame[header.payload_start..].to_vec()))
 }
 
 async fn read_tcp_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
     let len = reader.read_u32().await? as usize;
+    if len < crate::codec::FRAME_HEADER_LEN || len > MAX_MESSAGE_SIZE {
+        return Err(FitzError::FrameTooLarge(len));
+    }
     let mut frame = vec![0_u8; len];
     reader.read_exact(&mut frame).await?;
     Ok(frame)
 }
 
 fn decode_incoming(supervisor: &Supervisor, frame: &[u8]) -> Result<Vec<(u16, Vec<u8>, u64)>> {
-    let mut result = Vec::new();
-    let mut correlation_id = 0_u64;
-    for (message_type, payload) in decode_message_frames(frame)? {
-        match message_type {
-            crate::protocol::message_type::SERVER_HELLO => {
-                if correlation_id != 0 {
-                    return Err(FitzError::Protocol(
-                        "CORRELATED record cannot label SERVER_HELLO".into(),
-                    ));
-                }
-                apply_server_hello(supervisor, &payload);
+    if u64::try_from(frame.len()).unwrap_or(u64::MAX)
+        > supervisor.max_message_bytes.load(Ordering::Acquire)
+    {
+        return Err(FitzError::FrameTooLarge(frame.len()));
+    }
+    let header = decode_frame_header(frame)?;
+    let payload = &frame[header.payload_start..];
+    match header.message_type {
+        crate::protocol::message_type::HELLO => {
+            if header.flags != 0 || header.correlation_id != 0 {
+                return Err(FitzError::Protocol("HELLO has flags or correlation".into()));
             }
-            crate::protocol::message_type::CORRELATED => {
-                if payload.len() != 8 || correlation_id != 0 {
-                    return Err(FitzError::Protocol("malformed CORRELATED record".into()));
-                }
-                correlation_id = u64::from_be_bytes(payload.try_into().expect("length checked"));
-                if correlation_id == 0 {
-                    return Err(FitzError::Protocol("zero CORRELATED identifier".into()));
-                }
-            }
-            _ => {
-                result.push((message_type, payload, correlation_id));
-                correlation_id = 0;
-            }
+            apply_server_hello(supervisor, payload)?;
+            return Ok(Vec::new());
         }
+        crate::protocol::message_type::GOAWAY => {
+            if header.flags != 0 || header.correlation_id != 0 {
+                return Err(FitzError::Protocol(
+                    "GOAWAY has flags or correlation".into(),
+                ));
+            }
+            let mut decoder = crate::codec::PayloadDecoder::new(payload);
+            let code = decoder.get_u16()?;
+            let grace_ms = decoder.get_u32()?;
+            let reason = decoder.get_string()?;
+            if !decoder.is_empty() {
+                return Err(FitzError::Protocol("GOAWAY has trailing bytes".into()));
+            }
+            tracing::warn!(code, grace_ms, reason, "broker sent GOAWAY");
+            emit_lifecycle(supervisor, "goaway");
+            return Ok(Vec::new());
+        }
+        crate::protocol::message_type::CONNECT_REJECTED => {
+            return Err(FitzError::Authentication {
+                message: "broker rejected CONNECT after authentication".into(),
+            });
+        }
+        _ => {}
     }
-    if correlation_id != 0 {
-        return Err(FitzError::Protocol(
-            "CORRELATED record did not label a response".into(),
-        ));
-    }
-    Ok(result)
+    Ok(vec![(
+        header.message_type,
+        payload.to_vec(),
+        header.correlation_id,
+    )])
 }
 
 fn dispatch(
@@ -1348,7 +1443,6 @@ mod tests {
             heartbeat: HeartbeatOptions::default(),
             observability: FitzObservability::default(),
             service_name: None,
-            service_metadata_sent: AtomicBool::new(false),
             state,
             commands,
             cancellations,
@@ -1359,6 +1453,8 @@ mod tests {
             close_requested: Arc::new(AtomicBool::new(false)),
             registrations: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             capabilities: Arc::new(AtomicU64::new(0)),
+            max_message_bytes: AtomicU64::new(MAX_MESSAGE_SIZE as u64),
+            max_in_flight: AtomicU64::new(256),
         };
         let (io, _peer) = tokio::io::duplex(64);
         let (reader, writer) = tokio::io::split(io);
@@ -1370,6 +1466,7 @@ mod tests {
                 id: 1,
                 generation: 0,
                 message_type: 100,
+                flags: 0,
                 payload: vec![1],
                 response: response_tx,
             })
@@ -1441,7 +1538,6 @@ mod tests {
             heartbeat: HeartbeatOptions::default(),
             observability: FitzObservability::default(),
             service_name: None,
-            service_metadata_sent: AtomicBool::new(false),
             state,
             commands,
             cancellations,
@@ -1452,6 +1548,8 @@ mod tests {
             close_requested: Arc::new(AtomicBool::new(false)),
             registrations,
             capabilities: Arc::new(AtomicU64::new(0)),
+            max_message_bytes: AtomicU64::new(MAX_MESSAGE_SIZE as u64),
+            max_in_flight: AtomicU64::new(256),
         };
         // Act
         restore_registrations(&supervisor, &mut session).await;

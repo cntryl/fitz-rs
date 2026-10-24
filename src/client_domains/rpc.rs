@@ -1,4 +1,4 @@
-use super::decode_ok;
+use super::{decode_domain_error, decode_ok};
 use crate::async_connection::{AsyncConnection, RestorableRegistration};
 use crate::codec::{PayloadDecoder, PayloadEncoder};
 use crate::domains::routes::{
@@ -65,16 +65,17 @@ impl RpcClient {
         let lifecycle_receiver = self
             .connection
             .notifications(message_type::RPC_LIFECYCLE, 64);
-        let supports_cancellation =
-            self.connection.capability_bits() & message_type::CAP_RPC_CANCELLATION != 0;
+        let supports_cancellation = true;
         let mut e = PayloadEncoder::new();
         e.put_raw(&correlation_id).put_string(route).put_bytes(body);
-        if supports_cancellation && let Some(deadline) = deadline {
+        if let Some(deadline) = deadline {
             let budget_ms = deadline
                 .saturating_duration_since(tokio::time::Instant::now())
                 .as_millis()
                 .min(86_400_000) as u32;
-            e.put_u8(1).put_u8(1).put_u32(budget_ms);
+            e.put_u8(1).put_u32(budget_ms);
+        } else {
+            e.put_u8(0);
         }
         let mut generations = self.connection.generation_changes();
         self.connection
@@ -174,11 +175,8 @@ impl RpcClient {
             .notifications(message_type::RPC_LIFECYCLE, 1024);
         let mut e = PayloadEncoder::new();
         e.put_string(pattern).put_u32(max_concurrency);
-        let supports_cancellation =
-            self.connection.capability_bits() & message_type::CAP_RPC_CANCELLATION != 0;
-        if supports_cancellation {
-            e.put_u8(1).put_u8(1);
-        }
+        let supports_cancellation = true;
+        e.put_u8(1);
         let payload = e.finish();
         decode_ok(
             &self
@@ -498,18 +496,19 @@ async fn send_cancellation_message(
 }
 
 fn decode_terminal_error(body: &[u8]) -> Option<FitzError> {
-    let mut decoder = PayloadDecoder::new(body);
-    if decoder.get_u8().ok()? != 1 {
+    if body.first() != Some(&1) {
         return None;
     }
-    let code = decoder.get_u32().ok()?;
-    if !(6001..=6013).contains(&code) {
-        return None;
+    let mut decoder = PayloadDecoder::new(&body[1..]);
+    let error = decode_domain_error(&mut decoder).ok()?;
+    match &error {
+        FitzError::DomainWire { code, .. }
+            if (6001..=6010).contains(code) || (6050..=6055).contains(code) =>
+        {
+            Some(error)
+        }
+        _ => None,
     }
-    let message = decoder.get_string().ok()?;
-    decoder
-        .is_empty()
-        .then_some(FitzError::Domain { code, message })
 }
 
 fn decode_rpc_response_frame(decoder: &mut PayloadDecoder<'_>) -> Result<(u64, bool, Vec<u8>)> {
@@ -554,13 +553,17 @@ fn cancel_worker_call(active_calls: &Mutex<HashMap<[u8; 16], ActiveWorkerCall>>,
 }
 
 fn decode_rpc_request_budget(decoder: &mut PayloadDecoder<'_>) -> Result<Option<Duration>> {
-    if decoder.is_empty() {
+    let flag = decoder.get_u8()?;
+    if flag == 0 {
+        if !decoder.is_empty() {
+            return Err(FitzError::Protocol(
+                "RPC budget flag has trailing bytes".into(),
+            ));
+        }
         return Ok(None);
     }
-    let version = decoder.get_u8()?;
-    let flags = decoder.get_u8()?;
     let budget_ms = decoder.get_u32()?;
-    if !decoder.is_empty() || version != 1 || flags != 1 || budget_ms > 86_400_000 {
+    if flag != 1 || !decoder.is_empty() || budget_ms > 86_400_000 {
         return Err(FitzError::Protocol(
             "invalid RPC request budget extension".into(),
         ));

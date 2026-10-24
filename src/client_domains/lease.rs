@@ -1,3 +1,4 @@
+use super::decode_domain_error;
 use crate::async_connection::{AsyncConnection, RestorableRegistration};
 use crate::codec::{PayloadDecoder, PayloadEncoder};
 use crate::domains::routes::{validate_fixed_route, validate_registration_pattern};
@@ -1087,16 +1088,7 @@ fn lease_success<'a>(response: &'a [u8], operation: &str) -> Result<PayloadDecod
     let mut d = PayloadDecoder::new(response);
     match d.get_u8()? {
         0 => Ok(d),
-        1 => {
-            let code = d.get_u32()?;
-            let message = d.get_string()?;
-            if !d.is_empty() {
-                return Err(FitzError::Protocol(format!(
-                    "Lease {operation} error response has trailing bytes"
-                )));
-            }
-            Err(FitzError::Domain { code, message })
-        }
+        1 => Err(decode_domain_error(&mut d)?),
         v => Err(FitzError::Protocol(format!(
             "Lease {operation} returned status {v}"
         ))),

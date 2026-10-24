@@ -2,27 +2,27 @@ use std::io::ErrorKind;
 
 /// Authoritative broker error codes used by live registration APIs.
 pub mod error_code {
-    pub const KV_INVALID_SUBSCRIPTION_PATTERN: u32 = 1012;
-    pub const KV_SUBSCRIPTION_LIMIT: u32 = 1013;
-    pub const KV_BUSY: u32 = 1014;
-    pub const STREAM_INVALID_SUBSCRIPTION_PATTERN: u32 = 2010;
-    pub const STREAM_SUBSCRIPTION_LIMIT: u32 = 2011;
-    pub const STREAM_BUSY: u32 = 2014;
-    pub const NOTICE_INVALID_PATTERN: u32 = 3002;
-    pub const NOTICE_SUBSCRIPTION_LIMIT: u32 = 3003;
-    pub const NOTICE_BUSY: u32 = 3006;
-    pub const QUEUE_INVALID_SUBSCRIPTION_PATTERN: u32 = 4010;
-    pub const QUEUE_SUBSCRIPTION_LIMIT: u32 = 4011;
+    pub const KV_INVALID_SUBSCRIPTION_PATTERN: u32 = 1003;
+    pub const KV_SUBSCRIPTION_LIMIT: u32 = 1004;
+    pub const KV_BUSY: u32 = 1005;
+    pub const STREAM_INVALID_SUBSCRIPTION_PATTERN: u32 = 2003;
+    pub const STREAM_SUBSCRIPTION_LIMIT: u32 = 2004;
+    pub const STREAM_BUSY: u32 = 2005;
+    pub const NOTICE_INVALID_PATTERN: u32 = 3003;
+    pub const NOTICE_SUBSCRIPTION_LIMIT: u32 = 3004;
+    pub const NOTICE_BUSY: u32 = 3005;
+    pub const QUEUE_INVALID_SUBSCRIPTION_PATTERN: u32 = 4003;
+    pub const QUEUE_SUBSCRIPTION_LIMIT: u32 = 4004;
     pub const LEASE_BAD_REQUEST: u32 = 5008;
-    pub const LEASE_QUEUE_FULL: u32 = 5007;
-    pub const LEASE_INVALID_SUBSCRIPTION_ROUTE: u32 = 5010;
-    pub const LEASE_INVALID_LIST_CURSOR: u32 = 5011;
-    pub const LEASE_INVALID_LIST_PATTERN: u32 = 5012;
-    pub const RPC_INVALID_SUBSCRIPTION_PATTERN: u32 = 6012;
-    pub const RPC_SUBSCRIPTION_LIMIT: u32 = 6013;
-    pub const SCHEDULE_INVALID_SUBSCRIPTION_PATTERN: u32 = 7006;
-    pub const SCHEDULE_SUBSCRIPTION_LIMIT: u32 = 7007;
-    pub const SCHEDULE_BACKEND_ERROR: u32 = 7010;
+    pub const LEASE_QUEUE_FULL: u32 = 5005;
+    pub const LEASE_INVALID_SUBSCRIPTION_ROUTE: u32 = 5002;
+    pub const LEASE_INVALID_LIST_CURSOR: u32 = 5057;
+    pub const LEASE_INVALID_LIST_PATTERN: u32 = 5003;
+    pub const RPC_INVALID_SUBSCRIPTION_PATTERN: u32 = 6003;
+    pub const RPC_SUBSCRIPTION_LIMIT: u32 = 6004;
+    pub const SCHEDULE_INVALID_SUBSCRIPTION_PATTERN: u32 = 7003;
+    pub const SCHEDULE_SUBSCRIPTION_LIMIT: u32 = 7004;
+    pub const SCHEDULE_BACKEND_ERROR: u32 = 7006;
 }
 
 /// Stable error categories exposed by the SDK.
@@ -66,6 +66,13 @@ pub enum FitzError {
     StaleHandle,
     #[error("domain error {code}: {message}")]
     Domain { code: u32, message: String },
+    #[error("domain error {code} (class {class}, effect {effect}): {message}")]
+    DomainWire {
+        code: u16,
+        class: u8,
+        effect: u8,
+        message: String,
+    },
     #[error("domain error: {0}")]
     DomainError(String),
     #[error("authentication rejected: {0}")]
@@ -95,7 +102,9 @@ impl FitzError {
             | Self::SerializationError(_) => FitzErrorKind::Protocol,
             Self::Backpressure(_) => FitzErrorKind::Backpressure,
             Self::StaleHandle => FitzErrorKind::StaleHandle,
-            Self::Domain { .. } | Self::DomainError(_) => FitzErrorKind::Domain,
+            Self::Domain { .. } | Self::DomainWire { .. } | Self::DomainError(_) => {
+                FitzErrorKind::Domain
+            }
             Self::Closed => FitzErrorKind::Closed,
             Self::ConnectionClosed => FitzErrorKind::ConnectionClosed,
         }
@@ -109,10 +118,12 @@ impl FitzError {
             | Self::Transport(_)
             | Self::Backpressure(_)
             | Self::ConnectionClosed => true,
-            Self::Domain { code, .. } => matches!(
+            Self::DomainWire {
                 code,
-                1004 | 1014 | 2014 | 3006 | 4005 | 5001 | 5007 | 6001..=6004 | 7010
-            ),
+                class,
+                effect,
+                ..
+            } => *effect == 0 && (*class == 5 || matches!(*code, 1053 | 5050 | 5056 | 6051)),
             _ => false,
         }
     }
@@ -120,7 +131,9 @@ impl FitzError {
     #[must_use]
     pub fn domain_message(&self) -> Option<&str> {
         match self {
-            Self::Domain { message, .. } | Self::DomainError(message) => Some(message),
+            Self::Domain { message, .. }
+            | Self::DomainWire { message, .. }
+            | Self::DomainError(message) => Some(message),
             _ => None,
         }
     }

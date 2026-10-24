@@ -1,3 +1,4 @@
+use super::decode_domain_error;
 use crate::async_connection::{AsyncConnection, RestorableRegistration};
 use crate::codec::{PayloadDecoder, PayloadEncoder};
 use crate::domains::routes::{
@@ -240,10 +241,7 @@ mod tests {
 }
 
 fn is_retryable_enqueue_rejection(response: &[u8]) -> bool {
-    matches!(
-        success_decoder(response, "ENQUEUE"),
-        Err(FitzError::Domain { code: 4005, .. })
-    )
+    matches!(success_decoder(response, "ENQUEUE"), Err(error) if error.is_retryable())
 }
 
 pub struct QueueItem {
@@ -430,20 +428,14 @@ fn decode_queue_plain_ok(response: &[u8]) -> Result<()> {
     }
 }
 
-fn decode_queue_error(response: &[u8], coded_only: bool) -> Result<FitzError> {
-    let plain = response.len() >= 5
-        && u32::from_be_bytes(response[1..5].try_into().unwrap()) as usize == response.len() - 5;
-    let coded = response.len() >= 9
-        && u32::from_be_bytes(response[5..9].try_into().unwrap()) as usize == response.len() - 9;
-    if (coded_only && !coded) || (!coded_only && plain == coded) {
+fn decode_queue_error(response: &[u8], _coded_only: bool) -> Result<FitzError> {
+    if response.first() != Some(&1) {
         return Err(FitzError::Protocol(
-            "Malformed or ambiguous Queue error response".into(),
+            "Queue error response has no error status".into(),
         ));
     }
     let mut decoder = PayloadDecoder::new(&response[1..]);
-    let code = if coded { decoder.get_u32()? } else { 0 };
-    let message = decoder.get_string()?;
-    Ok(FitzError::Domain { code, message })
+    decode_domain_error(&mut decoder)
 }
 
 struct CompletionGuard<'a>(&'a AtomicU8);

@@ -106,7 +106,7 @@ pub(super) fn start(
                         if let Some(request) = request
                             && let Some(Ok(mut rejected)) = inbox.push(request) {
                                 let mut body = PayloadEncoder::new();
-                                body.put_u8(1).put_u32(6003).put_string("Local RPC worker is overloaded");
+                                body.put_u8(1).put_u16(6005).put_u8(5).put_u8(0).put_string("Local RPC worker is overloaded");
                                 let _ = rejected.respond(&body.finish(), true).await;
                         }
                     }
