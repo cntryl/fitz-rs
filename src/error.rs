@@ -38,6 +38,7 @@ pub enum FitzErrorKind {
     Backpressure,
     StaleHandle,
     Domain,
+    LeaseAlreadyQueued,
     Closed,
     ConnectionClosed,
 }
@@ -75,6 +76,8 @@ pub enum FitzError {
     },
     #[error("domain error: {0}")]
     DomainError(String),
+    #[error("lease acquisition is already queued")]
+    LeaseAlreadyQueued,
     #[error("authentication rejected: {0}")]
     AuthFailed(String),
     #[error("connection is closed")]
@@ -105,6 +108,7 @@ impl FitzError {
             Self::Domain { .. } | Self::DomainWire { .. } | Self::DomainError(_) => {
                 FitzErrorKind::Domain
             }
+            Self::LeaseAlreadyQueued => FitzErrorKind::LeaseAlreadyQueued,
             Self::Closed => FitzErrorKind::Closed,
             Self::ConnectionClosed => FitzErrorKind::ConnectionClosed,
         }

@@ -153,6 +153,8 @@ impl<'a> PayloadDecoder<'a> {
 pub const FRAME_HEADER_LEN: usize = 15;
 pub const MAX_MESSAGE_SIZE: usize = 1_048_576;
 pub const ACK_REQUESTED: u8 = 1;
+pub const RESPONSE_FINAL: u8 = 2;
+const VALID_FLAGS: u8 = ACK_REQUESTED | RESPONSE_FINAL;
 
 #[cfg(test)]
 pub(crate) fn test_hello_payload() -> Vec<u8> {
@@ -196,7 +198,7 @@ pub fn try_encode_frame(
     if message_size > MAX_MESSAGE_SIZE || u32::try_from(payload.len()).is_err() {
         return Err(FitzError::FrameTooLarge(message_size));
     }
-    if flags & !ACK_REQUESTED != 0 {
+    if flags & !VALID_FLAGS != 0 {
         return Err(FitzError::Protocol(format!(
             "unsupported frame flags {flags:#x}"
         )));
@@ -221,7 +223,7 @@ pub fn decode_frame_header(buf: &[u8]) -> Result<FrameHeader> {
     }
     let message_type = u16::from_be_bytes([buf[0], buf[1]]);
     let flags = buf[2];
-    if flags & !ACK_REQUESTED != 0 {
+    if flags & !VALID_FLAGS != 0 {
         return Err(FitzError::Protocol(format!(
             "unsupported frame flags {flags:#x}"
         )));
@@ -328,6 +330,19 @@ mod tests {
         // Assert
         assert_eq!(msg_type, 100);
         assert_eq!(&frame[payload_start..], b"hello");
+    }
+
+    #[test]
+    fn should_decode_response_final_flag_given_correlated_terminal_response() {
+        // Arrange
+        let frame = try_encode_frame(104, RESPONSE_FINAL, 1, b"ok").unwrap();
+
+        // Act
+        let header = decode_frame_header(&frame).unwrap();
+
+        // Assert
+        assert_eq!(header.flags, RESPONSE_FINAL);
+        assert_eq!(header.correlation_id, 1);
     }
 
     #[test]

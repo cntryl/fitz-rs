@@ -92,9 +92,12 @@ impl LeaseClient {
             .await?;
         let mut d = lease_success(&response, "ACQUIRE")?;
         let kind = d.get_u8()?;
+        if kind == 3 {
+            return Err(FitzError::LeaseAlreadyQueued);
+        }
         let fencing_token = if kind < 2 {
             d.get_u64()?
-        } else if kind <= 3 && options.wait_seconds > 0 {
+        } else if kind == 2 && options.wait_seconds > 0 {
             let payload = deferred
                 .recv()
                 .await
@@ -1335,6 +1338,36 @@ mod tests {
 
         // Assert: use the token carried by the successful AlreadyHeld response.
         assert_eq!(result.unwrap(), 43);
+        server.await.unwrap();
+        connection.close().await;
+    }
+
+    #[tokio::test]
+    async fn should_return_typed_error_given_already_queued_acquire_outcome() {
+        // Arrange
+        let (client, connection, server) = connected_lease_client(|mut stream| async move {
+            assert_eq!(read_frame(&mut stream).await.0, message_type::LEASE_ACQUIRE);
+            write_frame(
+                &mut stream,
+                message_type::LEASE_ACQUIRE,
+                &acquire_response(3, 0),
+            )
+            .await;
+        })
+        .await;
+
+        // Act
+        let result = client
+            .acquire(
+                "lease://realm/area/resource",
+                "worker-1",
+                30,
+                LeaseAcquireOptions { wait_seconds: 5 },
+            )
+            .await;
+
+        // Assert
+        assert!(matches!(result, Err(FitzError::LeaseAlreadyQueued)));
         server.await.unwrap();
         connection.close().await;
     }
