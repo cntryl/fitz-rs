@@ -223,7 +223,12 @@ async fn write_websocket_frame(
 }
 
 fn encode_frame(kind: u16, payload: &[u8]) -> Vec<u8> {
-    support::encode(kind, u64::from(kind == NOTICE_SUBSCRIBE), payload)
+    let correlation = u64::from(kind == NOTICE_SUBSCRIBE);
+    let mut frame = support::encode(kind, correlation, payload);
+    if correlation != 0 {
+        frame[2] = 2;
+    }
+    frame
 }
 fn decode_frame(frame: &[u8]) -> (u16, Vec<u8>) {
     let (kind, _, payload) = support::decode(frame);

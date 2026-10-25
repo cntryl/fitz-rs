@@ -19,6 +19,35 @@ use tracing::Instrument;
 
 type Response = oneshot::Sender<Result<Vec<u8>>>;
 type RegistrationDecoder = Arc<dyn Fn(&[u8]) -> Result<u64> + Send + Sync>;
+type IncomingRecord = (u16, Vec<u8>, u64, bool);
+
+fn allocate_request_id(sequence: &AtomicU64) -> Result<u64> {
+    let mut current = sequence.load(Ordering::Relaxed);
+    loop {
+        if current == 0 {
+            return Err(FitzError::Protocol(
+                "correlation identifiers exhausted; reconnect before another request".into(),
+            ));
+        }
+        let next = if current == u64::MAX { 0 } else { current + 1 };
+        match sequence.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Ok(current),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn send_correlation_id(message_type: u16, payload: &[u8], request_id: u64) -> u64 {
+    if !(300..=305).contains(&message_type)
+        || message_type == 303
+        || message_type == 305
+        || (message_type == 304 && payload.first() != Some(&1))
+    {
+        0
+    } else {
+        request_id
+    }
+}
 
 #[derive(Clone)]
 struct Registration {
@@ -141,6 +170,7 @@ impl AsyncConnection {
         let close_requested = Arc::new(AtomicBool::new(false));
         let registrations = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let capabilities = Arc::new(AtomicU64::new(0));
+        let next_request_id = Arc::new(AtomicU64::new(1));
         tokio::spawn(supervise(Supervisor {
             endpoint,
             token_provider,
@@ -159,13 +189,14 @@ impl AsyncConnection {
             close_requested: Arc::clone(&close_requested),
             registrations: Arc::clone(&registrations),
             capabilities: Arc::clone(&capabilities),
+            next_request_id: Arc::clone(&next_request_id),
             max_message_bytes: AtomicU64::new(MAX_MESSAGE_SIZE as u64),
             max_in_flight: AtomicU64::new(u64::try_from(max_queued.max(1)).unwrap_or(u64::MAX)),
         }));
         Self {
             commands,
             cancellations,
-            next_request_id: Arc::new(AtomicU64::new(1)),
+            next_request_id,
             capabilities,
             generation,
             generation_watch,
@@ -221,12 +252,7 @@ impl AsyncConnection {
         let span =
             tracing::info_span!("fitz.request", message_type, generation = self.generation());
         async {
-            let id = loop {
-                let candidate = self.next_request_id.fetch_add(1, Ordering::Relaxed);
-                if candidate != 0 {
-                    break candidate;
-                }
-            };
+            let id = allocate_request_id(&self.next_request_id)?;
             let (tx, rx) = oneshot::channel();
             self.commands
                 .try_send(Command::Request {
@@ -325,7 +351,7 @@ impl AsyncConnection {
     }
 
     pub(crate) async fn send(&self, message_type: u16, payload: Vec<u8>) -> Result<()> {
-        let id = self.next_request_id.fetch_add(1, Ordering::Relaxed).max(1);
+        let id = allocate_request_id(&self.next_request_id)?;
         let (tx, rx) = oneshot::channel();
         self.commands
             .try_send(Command::Send {
@@ -483,6 +509,7 @@ struct Supervisor {
     close_requested: Arc<AtomicBool>,
     registrations: Arc<parking_lot::Mutex<HashMap<u64, Registration>>>,
     capabilities: Arc<AtomicU64>,
+    next_request_id: Arc<AtomicU64>,
     max_message_bytes: AtomicU64,
     max_in_flight: AtomicU64,
 }
@@ -544,6 +571,7 @@ async fn connect_and_run(
                 {
                     restore_registrations(supervisor, &mut session).await;
                     let reconnected = initial_response.is_none();
+                    supervisor.next_request_id.store(1, Ordering::Release);
                     supervisor
                         .state
                         .send_replace(ConnectionState::Authenticated);
@@ -599,31 +627,40 @@ async fn connect_and_run(
             Err(_) => emit_lifecycle(supervisor, "reconnect_failed"),
         }
         attempts += 1;
-        if supervisor.reconnect.maximum_attempts != 0
-            && attempts > supervisor.reconnect.maximum_attempts
-        {
-            supervisor.state.send_replace(ConnectionState::Disconnected);
-            if let Some(response) = initial_response.take() {
-                let _ = response.send(Err(FitzError::Connection(
-                    "reconnect attempts exhausted".into(),
-                )));
-            }
-            return Err(FitzError::Connection("reconnect attempts exhausted".into()));
-        }
-        supervisor.state.send_replace(ConnectionState::Reconnecting);
-        emit_lifecycle(supervisor, "reconnect_start");
-        let multiplier = supervisor
-            .reconnect
-            .multiplier
-            .powi(i32::try_from(attempts - 1).unwrap_or(i32::MAX));
-        let delay = supervisor
-            .reconnect
-            .base_delay
-            .mul_f64(multiplier)
-            .min(supervisor.reconnect.maximum_delay);
-        tracing::warn!(attempts, ?delay, "fitz reconnect scheduled");
-        tokio::time::sleep(delay).await;
+        reconnect_delay(supervisor, attempts, &mut initial_response).await?;
     }
+}
+
+async fn reconnect_delay(
+    supervisor: &Supervisor,
+    attempts: usize,
+    initial_response: &mut Option<oneshot::Sender<Result<()>>>,
+) -> Result<()> {
+    if supervisor.reconnect.maximum_attempts != 0
+        && attempts > supervisor.reconnect.maximum_attempts
+    {
+        supervisor.state.send_replace(ConnectionState::Disconnected);
+        if let Some(response) = initial_response.take() {
+            let _ = response.send(Err(FitzError::Connection(
+                "reconnect attempts exhausted".into(),
+            )));
+        }
+        return Err(FitzError::Connection("reconnect attempts exhausted".into()));
+    }
+    supervisor.state.send_replace(ConnectionState::Reconnecting);
+    emit_lifecycle(supervisor, "reconnect_start");
+    let multiplier = supervisor
+        .reconnect
+        .multiplier
+        .powi(i32::try_from(attempts - 1).unwrap_or(i32::MAX));
+    let delay = supervisor
+        .reconnect
+        .base_delay
+        .mul_f64(multiplier)
+        .min(supervisor.reconnect.maximum_delay);
+    tracing::warn!(attempts, ?delay, "fitz reconnect scheduled");
+    tokio::time::sleep(delay).await;
+    Ok(())
 }
 
 enum Session {
@@ -888,7 +925,7 @@ where
                 }
                 Some(Command::Send { id, generation, message_type, payload, response }) => {
                     if generation != session_generation { let _ = response.send(Err(FitzError::ConnectionClosed)); continue; }
-                    let correlation_id = if (300..=305).contains(&message_type) { id } else { 0 };
+                    let correlation_id = send_correlation_id(message_type, &payload, id);
                     let result = match encode_outbound(supervisor, message_type, 0, correlation_id, &payload) {
                         Ok(frame) => write_tcp_frame(&mut writer, &frame).await,
                         Err(error) => Err(error),
@@ -902,9 +939,12 @@ where
             Some(id) = supervisor.cancellations.recv() => if !cancel_all_pending(&mut pending, &mut correlated, &mut queued, id) { canceled.insert(id); },
             frame = read_tcp_frame(&mut reader) => if let Ok(frame) = frame {
                 let Ok(records) = decode_incoming(supervisor, &frame) else { fail_all(&mut pending, &mut correlated, &mut queued); return SessionResult::Disconnected; };
-                for (message_type, payload, correlation_id) in records {
+                for (message_type, payload, correlation_id, response_final) in records {
                     if correlation_id != 0 {
-                        dispatch_correlated(supervisor, &mut correlated, correlation_id, message_type, payload);
+                        if dispatch_correlated(&mut correlated, correlation_id, payload, response_final).is_err() {
+                            fail_all(&mut pending, &mut correlated, &mut queued);
+                            return SessionResult::Disconnected;
+                        }
                     } else {
                         let completed = dispatch(supervisor, &mut pending, message_type, payload);
                         if completed && let Some(next) = queued.get_mut(&message_type).and_then(VecDeque::pop_front) {
@@ -966,7 +1006,7 @@ async fn run_websocket(
                 }
                 Some(Command::Send { id, generation, message_type, payload, response }) => {
                     if generation != session_generation { let _ = response.send(Err(FitzError::ConnectionClosed)); continue; }
-                    let correlation_id = if (300..=305).contains(&message_type) { id } else { 0 };
+                    let correlation_id = send_correlation_id(message_type, &payload, id);
                     let result = match encode_outbound(supervisor, message_type, 0, correlation_id, &payload) {
                         Ok(frame) => writer.send(Message::Binary(frame.into())).await.map_err(|e| FitzError::Transport(e.to_string())),
                         Err(error) => Err(error),
@@ -982,9 +1022,12 @@ async fn run_websocket(
                 Some(Ok(Message::Binary(frame))) => if let Ok(records) = decode_incoming(supervisor, &frame) {
                     awaiting_pong = false;
                     heartbeat.as_mut().reset(tokio::time::Instant::now() + heartbeat_idle);
-                    for (message_type, payload, correlation_id) in records {
+                    for (message_type, payload, correlation_id, response_final) in records {
                         if correlation_id != 0 {
-                            dispatch_correlated(supervisor, &mut correlated, correlation_id, message_type, payload);
+                            if dispatch_correlated(&mut correlated, correlation_id, payload, response_final).is_err() {
+                                fail_all(&mut pending, &mut correlated, &mut queued);
+                                return SessionResult::Disconnected;
+                            }
                         } else {
                             let completed = dispatch(supervisor, &mut pending, message_type, payload);
                             if completed && let Some(next) = queued.get_mut(&message_type).and_then(VecDeque::pop_front) {
@@ -1163,7 +1206,7 @@ async fn read_tcp_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>>
     Ok(frame)
 }
 
-fn decode_incoming(supervisor: &Supervisor, frame: &[u8]) -> Result<Vec<(u16, Vec<u8>, u64)>> {
+fn decode_incoming(supervisor: &Supervisor, frame: &[u8]) -> Result<Vec<IncomingRecord>> {
     if u64::try_from(frame.len()).unwrap_or(u64::MAX)
         > supervisor.max_message_bytes.load(Ordering::Acquire)
     {
@@ -1207,6 +1250,7 @@ fn decode_incoming(supervisor: &Supervisor, frame: &[u8]) -> Result<Vec<(u16, Ve
         header.message_type,
         payload.to_vec(),
         header.correlation_id,
+        header.flags & crate::codec::RESPONSE_FINAL != 0,
     )])
 }
 
@@ -1227,19 +1271,23 @@ fn dispatch(
 }
 
 fn dispatch_correlated(
-    supervisor: &Supervisor,
     pending: &mut HashMap<u64, PendingRequest>,
     correlation_id: u64,
-    message_type: u16,
     payload: Vec<u8>,
-) {
-    if let Some(slot) = pending.remove(&correlation_id) {
-        if let Some(response) = slot.response {
-            let _ = response.send(Ok(payload));
-        }
-    } else {
-        publish_notification(supervisor, message_type, payload);
+    response_final: bool,
+) -> Result<()> {
+    if !pending.contains_key(&correlation_id) {
+        return Err(FitzError::Protocol(format!(
+            "unexpected response correlation {correlation_id}"
+        )));
     }
+    if response_final
+        && let Some(slot) = pending.remove(&correlation_id)
+        && let Some(response) = slot.response
+    {
+        let _ = response.send(Ok(payload));
+    }
+    Ok(())
 }
 
 fn publish_notification(supervisor: &Supervisor, message_type: u16, payload: Vec<u8>) {
@@ -1271,8 +1319,8 @@ fn cancel_all_pending(
     queued: &mut HashMap<u16, VecDeque<QueuedRequest>>,
     id: u64,
 ) -> bool {
-    if let Some(slot) = correlated.remove(&id) {
-        drop(slot);
+    if let Some(slot) = correlated.get_mut(&id) {
+        slot.response = None;
         return true;
     }
     if cancel_pending(pending, id) {
@@ -1318,6 +1366,54 @@ fn fail_all(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_exhaust_correlation_ids_without_wrapping_or_reusing() {
+        // Arrange
+        let sequence = AtomicU64::new(u64::MAX);
+
+        // Act
+        let last = allocate_request_id(&sequence).unwrap();
+        let next = allocate_request_id(&sequence);
+
+        // Assert
+        assert_eq!(last, u64::MAX);
+        assert!(matches!(next, Err(FitzError::Protocol(_))));
+    }
+
+    #[test]
+    fn should_keep_correlated_request_until_final_response_frame() {
+        // Arrange
+        let (response, mut received) = oneshot::channel();
+        let mut pending = HashMap::from([(
+            17,
+            PendingRequest {
+                id: 17,
+                response: Some(response),
+            },
+        )]);
+
+        // Act
+        assert!(dispatch_correlated(&mut pending, 17, b"queued".to_vec(), false).is_ok());
+        assert!(received.try_recv().is_err());
+        assert!(dispatch_correlated(&mut pending, 17, b"grant".to_vec(), true).is_ok());
+
+        // Assert
+        assert_eq!(received.try_recv().unwrap().unwrap(), b"grant");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn should_reject_unknown_correlated_response_without_notification_fallback() {
+        // Arrange
+        let mut pending = HashMap::new();
+
+        // Act
+        let result = dispatch_correlated(&mut pending, 99, b"late".to_vec(), true);
+
+        // Assert
+        assert!(matches!(result, Err(FitzError::Protocol(_))));
+    }
     use std::sync::atomic::AtomicUsize;
     use tokio::net::TcpListener;
 
@@ -1465,6 +1561,7 @@ mod tests {
             close_requested: Arc::new(AtomicBool::new(false)),
             registrations: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             capabilities: Arc::new(AtomicU64::new(0)),
+            next_request_id: Arc::new(AtomicU64::new(1)),
             max_message_bytes: AtomicU64::new(MAX_MESSAGE_SIZE as u64),
             max_in_flight: AtomicU64::new(256),
         };
@@ -1560,6 +1657,7 @@ mod tests {
             close_requested: Arc::new(AtomicBool::new(false)),
             registrations,
             capabilities: Arc::new(AtomicU64::new(0)),
+            next_request_id: Arc::new(AtomicU64::new(1)),
             max_message_bytes: AtomicU64::new(MAX_MESSAGE_SIZE as u64),
             max_in_flight: AtomicU64::new(256),
         };

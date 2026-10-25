@@ -34,12 +34,22 @@ impl Session {
         Ok((kind, payload))
     }
     pub async fn write_frame(&mut self, kind: u16, payload: &[u8]) -> std::io::Result<()> {
+        let queued = kind == 400 && payload.starts_with(&[0, 2]);
         let correlation = self
             .pending
             .get_mut(&kind)
-            .and_then(VecDeque::pop_front)
+            .and_then(|requests| {
+                if queued {
+                    requests.front().copied()
+                } else {
+                    requests.pop_front()
+                }
+            })
             .unwrap_or(0);
-        let frame = encode(kind, correlation, payload);
+        let mut frame = encode(kind, correlation, payload);
+        if correlation != 0 && !queued {
+            frame[2] = 2;
+        }
         self.stream
             .write_u32(u32::try_from(frame.len()).unwrap())
             .await?;

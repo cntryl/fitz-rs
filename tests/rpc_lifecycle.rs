@@ -507,8 +507,9 @@ async fn read_frame(stream: &mut TcpStream) -> (u16, Vec<u8>) {
 
 fn encode_message_frame(kind: u16, payload: &[u8]) -> Vec<u8> {
     let mut body = kind.to_be_bytes().to_vec();
-    body.push(0);
-    body.extend_from_slice(&u64::from(kind == 300).to_be_bytes());
+    let correlation = u64::from(kind == 300);
+    body.push(u8::from(correlation != 0) * 2);
+    body.extend_from_slice(&correlation.to_be_bytes());
     body.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
     body.extend_from_slice(payload);
     let mut frame = u32::try_from(body.len()).unwrap().to_be_bytes().to_vec();

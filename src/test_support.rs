@@ -129,7 +129,13 @@ async fn write<W: AsyncWrite + Unpin>(
             })
             .unwrap_or(0)
     };
-    let frame = try_encode_frame(kind, 0, correlation, payload).unwrap();
+    let response_final = correlation != 0 && !(kind == 400 && payload.starts_with(&[0, 2]));
+    let flags = if response_final {
+        crate::codec::RESPONSE_FINAL
+    } else {
+        0
+    };
+    let frame = try_encode_frame(kind, flags, correlation, payload).unwrap();
     writer
         .write_u32(u32::try_from(frame.len()).unwrap())
         .await
