@@ -131,14 +131,20 @@ fn unique_route(scheme: &str) -> String {
 }
 
 async fn kv_round_trip(client: &Client, durability: KvDurability) -> Result<(), FitzError> {
+    let route = unique_route("kv");
     let transaction = client
         .kv()?
-        .begin(&unique_route("kv"), TransactionMode::ReadWrite)
+        .begin(&route, TransactionMode::ReadWrite)
         .await?;
     transaction.put(b"key", b"value").await?;
-    let value = transaction.get(b"key").await?;
+    transaction.commit(durability).await?;
+    let read = client
+        .kv()?
+        .begin(&route, TransactionMode::ReadOnly)
+        .await?;
+    let value = read.get(b"key").await?;
     assert_eq!(value, KvGetResult::Found(b"value".to_vec()));
-    transaction.commit(durability).await
+    read.rollback().await
 }
 
 async fn reject_invalid_jwt(transport: Transport) -> Result<(), FitzError> {
@@ -203,6 +209,10 @@ async fn reject_held_lease(
         panic!("held lease must reject a competing acquisition");
     };
     assert!(matches!(error, FitzError::DomainWire { code: 5050, .. }));
+    assert!(
+        error.is_retryable(),
+        "held lease should be classified as retryable"
+    );
     contender.close().await?;
     owner.release().await
 }
@@ -247,6 +257,7 @@ async fn should_run_scenario(
                 .create(&route, "invalid cron", ScheduleDeliveryMode::Single, b"")
                 .await;
             assert!(matches!(result, Err(FitzError::DomainWire { .. })));
+            kv_round_trip(connected, KvDurability::Buffered).await?;
         }
         6 => reject_held_lease(connected, transport, auth_mode).await?,
         7 => {
@@ -291,13 +302,27 @@ async fn should_run_scenario(
             connected.stream()?.metadata(&route).await?;
         }
         17 => return global_replay::exercise(connected, &unique_route("stream")).await,
+        19 => {
+            exercise_same_type_requests(connected).await;
+            return Ok(vec![
+                "second reserve resolved first; each caller received its own payload".into(),
+            ]);
+        }
+        24 => {
+            exercise_stream_boundary(connected).await;
+            return Ok(vec![
+                "409600 combined bytes accepted; 409601 rejected with BAD_REQUEST/NOT_APPLIED"
+                    .into(),
+                "three events replayed across multiple pages on a 4096-byte route".into(),
+            ]);
+        }
         _ => unreachable!("scenario IDs are fixed"),
     }
     Ok(vec![format!("default async client completed CS-{id:03}")])
 }
 
 fn scenario_title(id: u8) -> &'static str {
-    const TITLES: [&str; 17] = [
+    const TITLES: [&str; 24] = [
         "connect success",
         "auth failure",
         "request success",
@@ -315,6 +340,13 @@ fn scenario_title(id: u8) -> &'static str {
         "shutdown during active work",
         "filtered stream replay",
         "global filtered multi-page replay",
+        "bounded concurrency under burst load",
+        "concurrent same-message-type requests",
+        "handshake negotiation",
+        "correlation survives an ingress-synthesized error",
+        "notifications are never correlated",
+        "one request yields exactly one terminal frame",
+        "400 KiB Stream event boundary and replay",
     ];
     TITLES[usize::from(id - 1)]
 }
@@ -327,27 +359,66 @@ async fn should_complete_default_async_conformance_suite() {
     let auth_mode = AuthMode::from_env();
     let connected = client(transport, auth_mode);
     connected.connect().await.expect("broker connection");
-    let mut scenarios = Vec::with_capacity(17);
+    let mut scenarios = Vec::with_capacity(24);
 
     // Act
-    for id in 1..=17 {
+    for id in 1..=24 {
         let started = Instant::now();
-        let evidence = should_run_scenario(id, &connected, transport, auth_mode)
-            .await
-            .unwrap_or_else(|error| panic!("CS-{id:03} failed: {error}"));
+        let (verdict, evidence) = if matches!(id, 18 | 20..=23) {
+            (
+                "not_implemented",
+                vec!["scenario is not implemented by this runner".into()],
+            )
+        } else {
+            let mut evidence = should_run_scenario(id, &connected, transport, auth_mode)
+                .await
+                .unwrap_or_else(|error| panic!("CS-{id:03} failed: {error}"));
+            let verdict = if (7..=16).contains(&id) {
+                evidence.push(
+                    "this smoke check does not establish all shared scenario expectations".into(),
+                );
+                "partial"
+            } else {
+                "pass"
+            };
+            (verdict, evidence)
+        };
         scenarios.push(ScenarioResult {
             scenario_id: format!("CS-{id:03}"),
             title: scenario_title(id).into(),
-            priority: if id <= 8 { "P0" } else { "P1" }.into(),
+            priority: if id <= 8 || matches!(id, 19 | 20 | 24) {
+                "P0"
+            } else {
+                "P1"
+            }
+            .into(),
             client: CLIENT_NAME.into(),
             transport: transport.name().into(),
             auth_mode: auth_mode.name().into(),
-            verdict: "pass",
+            verdict,
             evidence,
             latency_ms: started.elapsed().as_millis(),
         });
     }
     connected.close().await.expect("close client");
+    let rate = |priority: &str| {
+        let selected: Vec<_> = scenarios
+            .iter()
+            .filter(|row| row.priority == priority)
+            .collect();
+        let passed = selected.iter().filter(|row| row.verdict == "pass").count();
+        f64::from(u32::try_from(passed).expect("scenario count"))
+            / f64::from(u32::try_from(selected.len()).expect("scenario count"))
+    };
+    let p0_pass_rate = rate("P0");
+    let p1_pass_rate = rate("P1");
+    let overall_status = if p0_pass_rate < 1.0 {
+        "fail"
+    } else if p1_pass_rate < 1.0 {
+        "partial"
+    } else {
+        "pass"
+    };
     let aggregate = AggregateResult {
         suite: "fitz-cross-language-client-conformance",
         version: "1.0",
@@ -359,9 +430,9 @@ async fn should_complete_default_async_conformance_suite() {
         client: CLIENT_NAME,
         transport: transport.name().into(),
         auth_mode: auth_mode.name().into(),
-        p0_pass_rate: 1.0,
-        p1_pass_rate: 1.0,
-        overall_status: "pass",
+        p0_pass_rate,
+        p1_pass_rate,
+        overall_status,
         scenarios,
     };
     let output = std::env::var_os("CONFORMANCE_OUTPUT").map_or_else(
@@ -378,8 +449,11 @@ async fn should_complete_default_async_conformance_suite() {
     .expect("write result");
 
     // Assert
-    assert_eq!(aggregate.scenarios.len(), 17);
-    assert!(aggregate.scenarios.iter().all(|row| row.verdict == "pass"));
+    assert_eq!(aggregate.scenarios.len(), 24);
+    assert_eq!(
+        aggregate.overall_status, "pass",
+        "shared conformance gate is incomplete"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -388,6 +462,15 @@ async fn should_correlate_same_type_requests_out_of_order() {
     // Arrange
     let connected = client(Transport::from_env(), AuthMode::from_env());
     connected.connect().await.expect("broker connection");
+
+    // Act
+    exercise_same_type_requests(&connected).await;
+
+    // Assert
+    connected.close().await.expect("close client");
+}
+
+async fn exercise_same_type_requests(connected: &Client) {
     assert!(connected.correlation_enabled());
     assert_eq!(connected.server_capabilities(), (2, 0));
     let parked_route = unique_route("queue");
@@ -401,13 +484,13 @@ async fn should_correlate_same_type_requests_out_of_order() {
 
     let parked_queue = connected.queue().expect("queue client");
     let parked_request_route = parked_route.clone();
-    // Act
     let parked = tokio::spawn(async move {
         parked_queue
             .reserve(&parked_request_route, 30, 1, Some(5))
             .await
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!parked.is_finished(), "first reserve must remain parked");
     let mut second = tokio::time::timeout(
         Duration::from_secs(2),
         connected
@@ -419,6 +502,7 @@ async fn should_correlate_same_type_requests_out_of_order() {
     .expect("second reserve was serialized")
     .expect("second reserve failed");
     assert_eq!(second.pop().expect("second item").body, b"second");
+    assert!(!parked.is_finished(), "second reserve must resolve first");
 
     connected
         .queue()
@@ -431,9 +515,7 @@ async fn should_correlate_same_type_requests_out_of_order() {
         .expect("parked reserve timed out")
         .expect("parked task panicked")
         .expect("parked reserve failed");
-    // Assert
     assert_eq!(first.pop().expect("first item").body, b"first");
-    connected.close().await.expect("close client");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -474,13 +556,21 @@ async fn should_replay_boundary_sized_events_on_the_longest_route() {
     // Arrange
     let connected = client(Transport::from_env(), AuthMode::from_env());
     connected.connect().await.unwrap();
+
+    // Act
+    exercise_stream_boundary(&connected).await;
+
+    // Assert
+    connected.close().await.unwrap();
+}
+
+async fn exercise_stream_boundary(connected: &Client) {
     let prefix = unique_route("stream");
     let route = format!("{prefix}{}", "r".repeat(4096 - prefix.len()));
     let metadata = [7_u8; 16];
     let body = vec![42_u8; 400 * 1024 - metadata.len()];
     let stream = connected.stream().unwrap();
 
-    // Act
     for offset in 0..3_u64 {
         let mut session = stream.begin(&route, None).await.unwrap();
         if offset == 0 {
@@ -527,7 +617,6 @@ async fn should_replay_boundary_sized_events_on_the_longest_route() {
         next = page.cursor.last_resource_offset + 1;
     }
 
-    // Assert
     assert!(pages > 1);
     assert_eq!(records.len(), 3);
     for (offset, record) in records.iter().enumerate() {
@@ -536,7 +625,6 @@ async fn should_replay_boundary_sized_events_on_the_longest_route() {
         assert_eq!(record.body, body);
         assert_eq!(record.metadata.as_deref(), Some(metadata.as_slice()));
     }
-    connected.close().await.unwrap();
 }
 
 async fn exercise_queue_workflow(connected: &Client) {
