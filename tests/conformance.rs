@@ -83,6 +83,10 @@ struct AggregateResult {
     client: &'static str,
     transport: String,
     auth_mode: String,
+    p0_pass: u32,
+    p0_total: u32,
+    p1_pass: u32,
+    p1_total: u32,
     p0_pass_rate: f64,
     p1_pass_rate: f64,
     overall_status: &'static str,
@@ -351,6 +355,18 @@ fn scenario_title(id: u8) -> &'static str {
     TITLES[usize::from(id - 1)]
 }
 
+fn scenario_counts(scenarios: &[ScenarioResult], priority: &str) -> (u32, u32) {
+    let selected: Vec<_> = scenarios
+        .iter()
+        .filter(|row| row.priority == priority)
+        .collect();
+    let passed = selected.iter().filter(|row| row.verdict == "pass").count();
+    (
+        u32::try_from(passed).expect("scenario count"),
+        u32::try_from(selected.len()).expect("scenario count"),
+    )
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires fitz-auth and fitz-anon from compose.yml"]
 async fn should_complete_default_async_conformance_suite() {
@@ -401,17 +417,10 @@ async fn should_complete_default_async_conformance_suite() {
         });
     }
     connected.close().await.expect("close client");
-    let rate = |priority: &str| {
-        let selected: Vec<_> = scenarios
-            .iter()
-            .filter(|row| row.priority == priority)
-            .collect();
-        let passed = selected.iter().filter(|row| row.verdict == "pass").count();
-        f64::from(u32::try_from(passed).expect("scenario count"))
-            / f64::from(u32::try_from(selected.len()).expect("scenario count"))
-    };
-    let p0_pass_rate = rate("P0");
-    let p1_pass_rate = rate("P1");
+    let (p0_pass, p0_total) = scenario_counts(&scenarios, "P0");
+    let (p1_pass, p1_total) = scenario_counts(&scenarios, "P1");
+    let p0_pass_rate = f64::from(p0_pass) / f64::from(p0_total);
+    let p1_pass_rate = f64::from(p1_pass) / f64::from(p1_total);
     let overall_status = if p0_pass_rate < 1.0 {
         "fail"
     } else if p1_pass_rate < 1.0 {
@@ -430,6 +439,10 @@ async fn should_complete_default_async_conformance_suite() {
         client: CLIENT_NAME,
         transport: transport.name().into(),
         auth_mode: auth_mode.name().into(),
+        p0_pass,
+        p0_total,
+        p1_pass,
+        p1_total,
         p0_pass_rate,
         p1_pass_rate,
         overall_status,
