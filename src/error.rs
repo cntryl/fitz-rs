@@ -59,6 +59,8 @@ pub enum FitzError {
     Transport(String),
     #[error("protocol error: {0}")]
     Protocol(String),
+    #[error("wire version mismatch ({code}): {message}")]
+    VersionMismatch { code: u16, message: String },
     #[error("codec error: {0}")]
     Codec(String),
     #[error("backpressure limit reached: {0}")]
@@ -100,6 +102,7 @@ impl FitzError {
             Self::Connection(_) => FitzErrorKind::Connection,
             Self::Transport(_) => FitzErrorKind::Transport,
             Self::Protocol(_)
+            | Self::VersionMismatch { .. }
             | Self::Codec(_)
             | Self::FrameTooLarge(_)
             | Self::SerializationError(_) => FitzErrorKind::Protocol,

@@ -482,7 +482,7 @@ impl Client {
                 () = options.cancellation.cancelled() => return Err(FitzError::Canceled),
                 result = self.connect() => match result {
                     Ok(()) => return Ok(()),
-                    Err(error) if error.is_auth_failure() || matches!(error, FitzError::Closed) => return Err(error),
+                    Err(error) if error.is_auth_failure() || matches!(error, FitzError::Closed | FitzError::VersionMismatch { .. }) => return Err(error),
                     Err(_) => {}
                 }
             }

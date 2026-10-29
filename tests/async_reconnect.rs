@@ -15,6 +15,53 @@ const NOTICE_SUBSCRIBE: u16 = 501;
 const NOTICE_NOTIFY: u16 = 504;
 
 #[tokio::test]
+async fn should_stop_reconnecting_given_version_mismatch() -> Result<()> {
+    // Arrange
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (drop_tx, drop_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (first, _) = listener.accept().await.unwrap();
+        let mut first = Session::new(first);
+        assert_eq!(read_frame(&mut first).await.unwrap().0, CONNECT);
+        write_frame(&mut first, 2, &support::hello()).await.unwrap();
+        drop_rx.await.unwrap();
+        first.shutdown().await.unwrap();
+        let (second, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("reconnect did not start")
+            .unwrap();
+        let mut second = Session::new(second);
+        assert_eq!(read_frame(&mut second).await.unwrap().0, CONNECT);
+        let mut payload = 50_u16.to_be_bytes().to_vec();
+        put_bytes(&mut payload, b"no common wire version");
+        write_frame(&mut second, 3, &payload).await.unwrap();
+        tokio::time::timeout(Duration::from_millis(250), listener.accept())
+            .await
+            .is_err()
+    });
+    let client = Client::anonymous(format!("tcp://{address}"))
+        .reconnect_policy(ReconnectPolicy {
+            base_delay: Duration::from_millis(5),
+            maximum_delay: Duration::from_millis(5),
+            maximum_attempts: 5,
+            ..ReconnectPolicy::default()
+        })
+        .build()?;
+    client.connect().await?;
+
+    // Act
+    drop_tx.send(()).unwrap();
+    let no_more_attempts = server.await.expect("server task panicked");
+
+    // Assert
+    assert!(no_more_attempts);
+    assert_eq!(client.state(), ConnectionState::Disconnected);
+    client.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn should_restore_notice_subscription_given_real_transport_loss() -> Result<()> {
     // Arrange
     let listener = TcpListener::bind("127.0.0.1:0").await?;

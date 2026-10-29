@@ -79,6 +79,62 @@ async fn should_reject_legacy_broker_hello() -> Result<()> {
 }
 
 #[tokio::test]
+async fn should_surface_version_mismatch_without_retrying_connect_when_ready() -> Result<()> {
+    // Arrange
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut length = [0_u8; 4];
+        stream.read_exact(&mut length).await.unwrap();
+        let mut connect = vec![0; u32::from_be_bytes(length) as usize];
+        stream.read_exact(&mut connect).await.unwrap();
+        let message = b"no common wire version";
+        let mut payload = 50_u16.to_be_bytes().to_vec();
+        payload.extend_from_slice(&u32::try_from(message.len()).unwrap().to_be_bytes());
+        payload.extend_from_slice(message);
+        let mut frame = vec![0, 3, 0];
+        frame.extend_from_slice(&0_u64.to_be_bytes());
+        frame.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
+        frame.extend_from_slice(&payload);
+        stream
+            .write_all(&u32::try_from(frame.len()).unwrap().to_be_bytes())
+            .await
+            .unwrap();
+        stream.write_all(&frame).await.unwrap();
+        tokio::time::timeout(Duration::from_millis(250), listener.accept())
+            .await
+            .is_err()
+    });
+    let client = Client::anonymous(format!("tcp://{address}")).build()?;
+
+    // Act
+    let result = client
+        .connect_when_ready(ConnectWhenReadyOptions {
+            timeout: Duration::from_secs(1),
+            initial_delay: Duration::from_millis(10),
+            maximum_delay: Duration::from_millis(10),
+            ..ConnectWhenReadyOptions::default()
+        })
+        .await;
+
+    // Assert
+    let error = result.expect_err("version mismatch must fail");
+    assert_eq!(error.kind(), cntryl_fitz::FitzErrorKind::Protocol);
+    assert!(error.to_string().contains("50"));
+    assert!(error.to_string().contains("no common wire version"));
+    assert!(
+        matches!(error, FitzError::VersionMismatch { code: 50, ref message } if message == "no common wire version")
+    );
+    assert!(
+        server.await.expect("server task panicked"),
+        "version mismatch retried"
+    );
+    client.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn should_return_after_one_attempt_given_unavailable_broker_when_connect_called() -> Result<()>
 {
     // Arrange

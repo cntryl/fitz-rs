@@ -599,6 +599,24 @@ async fn connect_and_run(
                     );
                 }
             }
+            Err(FitzError::VersionMismatch { code, message }) => {
+                supervisor.state.send_replace(ConnectionState::Disconnected);
+                emit_lifecycle(
+                    supervisor,
+                    if initial_response.is_some() {
+                        "connect_failed"
+                    } else {
+                        "reconnect_failed"
+                    },
+                );
+                if let Some(response) = initial_response.take() {
+                    let _ = response.send(Err(FitzError::VersionMismatch {
+                        code,
+                        message: message.clone(),
+                    }));
+                }
+                return Err(FitzError::VersionMismatch { code, message });
+            }
             Err(error) if error.is_auth_failure() => {
                 supervisor.state.send_replace(ConnectionState::Closed);
                 emit_lifecycle(supervisor, "auth_rejected");
@@ -849,9 +867,13 @@ fn process_auth_frame(
                     "CONNECT_REJECTED has trailing bytes".into(),
                 ));
             }
-            Err(FitzError::Authentication {
-                message: format!("{code}: {message}"),
-            })
+            if code == 50 {
+                Err(FitzError::VersionMismatch { code, message })
+            } else {
+                Err(FitzError::Authentication {
+                    message: format!("{code}: {message}"),
+                })
+            }
         }
         _ => Err(FitzError::Protocol(
             "broker sent an unexpected authentication response".into(),
