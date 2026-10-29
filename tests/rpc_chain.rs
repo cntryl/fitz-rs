@@ -10,7 +10,7 @@ use tokio::sync::oneshot;
 mod jwt;
 
 #[tokio::test]
-#[ignore = "requires a broker advertising CAP_RPC_CANCELLATION at FITZ_RPC_CHAIN_ADDR"]
+#[ignore = "requires a Wire 2 broker at FITZ_RPC_CHAIN_ADDR"]
 async fn should_receive_worker_responses_given_opaque_dispatch_identity() -> Result<()> {
     // Arrange
     let endpoint =
@@ -57,7 +57,7 @@ fn client(endpoint: &str) -> Result<Client> {
 }
 
 #[tokio::test]
-#[ignore = "requires a broker advertising CAP_RPC_CANCELLATION at FITZ_RPC_CHAIN_ADDR"]
+#[ignore = "requires a Wire 2 broker at FITZ_RPC_CHAIN_ADDR"]
 async fn should_cancel_real_sdk_call_chain_given_caller_cancellation() -> Result<()> {
     // Arrange
     let chain = Chain::start(Duration::from_secs(3)).await?;
@@ -72,7 +72,7 @@ async fn should_cancel_real_sdk_call_chain_given_caller_cancellation() -> Result
 }
 
 #[tokio::test]
-#[ignore = "requires a broker advertising CAP_RPC_CANCELLATION at FITZ_RPC_CHAIN_ADDR"]
+#[ignore = "requires a Wire 2 broker at FITZ_RPC_CHAIN_ADDR"]
 async fn should_expire_real_sdk_call_chain_within_inherited_deadline() -> Result<()> {
     // Arrange
     let chain = Chain::start(Duration::from_millis(700)).await?;
@@ -101,7 +101,7 @@ impl Chain {
         let clients = [client(&endpoint)?, client(&endpoint)?, client(&endpoint)?];
         for client in &clients {
             client.connect().await?;
-            assert_ne!(client.server_capabilities().1 & (1 << 3), 0);
+            assert_eq!(client.server_capabilities().0, 2);
         }
         let suffix = uuid::Uuid::new_v4();
         let route_b = format!("rpc://chain/app/b-{suffix}");
@@ -163,7 +163,7 @@ impl Chain {
         let timed_out = matches!(
             self.call.next().await,
             Some(Err(
-                FitzError::Timeout | FitzError::Domain { code: 6001, .. }
+                FitzError::Timeout | FitzError::DomainWire { code: 6007, .. }
             ))
         );
         let elapsed = self.started.elapsed();
