@@ -1,3 +1,5 @@
+#[path = "support/global_replay.rs"]
+mod global_replay;
 mod jwt;
 
 use cntryl_fitz::client_domains::kv::KvGetResult;
@@ -288,7 +290,7 @@ async fn should_run_scenario(
             session.commit(StreamCommitMode::Sync).await?;
             connected.stream()?.metadata(&route).await?;
         }
-        17 => kv_round_trip(connected, KvDurability::Sync).await?,
+        17 => return global_replay::exercise(connected, &unique_route("stream")).await,
         _ => unreachable!("scenario IDs are fixed"),
     }
     Ok(vec![format!("default async client completed CS-{id:03}")])
@@ -309,10 +311,10 @@ fn scenario_title(id: u8) -> &'static str {
         "stream receive sequence",
         "stream completion",
         "stream error mid-flight",
-        "concurrent requests",
-        "backpressure",
-        "metadata",
-        "durability",
+        "concurrent in-flight requests",
+        "shutdown during active work",
+        "filtered stream replay",
+        "global filtered multi-page replay",
     ];
     TITLES[usize::from(id - 1)]
 }
