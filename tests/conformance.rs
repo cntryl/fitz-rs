@@ -3,7 +3,7 @@ mod jwt;
 use cntryl_fitz::client_domains::kv::KvGetResult;
 use cntryl_fitz::client_domains::lease::LeaseAcquireOptions;
 use cntryl_fitz::client_domains::schedule::{ScheduleDeliveryMode, ScheduleEntry};
-use cntryl_fitz::client_domains::stream::StreamCommitMode;
+use cntryl_fitz::client_domains::stream::{StreamCommitMode, StreamReadItem, StreamReadOptions};
 use cntryl_fitz::{Client, FitzError, KvDurability, TransactionMode};
 use futures_util::StreamExt;
 use serde::Serialize;
@@ -432,6 +432,109 @@ async fn should_correlate_same_type_requests_out_of_order() {
     // Assert
     assert_eq!(first.pop().expect("first item").body, b"first");
     connected.close().await.expect("close client");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires fitz-auth and fitz-anon from compose.yml"]
+async fn should_preserve_empty_and_absent_stream_event_metadata() {
+    // Arrange
+    let connected = client(Transport::from_env(), AuthMode::from_env());
+    connected.connect().await.expect("broker connection");
+    let route = unique_route("stream");
+    let mut session = connected
+        .stream()
+        .unwrap()
+        .begin(&route, None)
+        .await
+        .unwrap();
+
+    // Act
+    session.append(0, b"empty", Some(b""), None).await.unwrap();
+    session.append(1, b"absent", None, None).await.unwrap();
+    session.commit(StreamCommitMode::Sync).await.unwrap();
+    let records = connected
+        .stream()
+        .unwrap()
+        .read(&route, 0, 10, None, None, None)
+        .await
+        .unwrap();
+
+    // Assert
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].metadata, Some(Vec::new()));
+    assert_eq!(records[1].metadata, None);
+    connected.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires fitz-auth and fitz-anon from compose.yml"]
+async fn should_replay_boundary_sized_events_on_the_longest_route() {
+    // Arrange
+    let connected = client(Transport::from_env(), AuthMode::from_env());
+    connected.connect().await.unwrap();
+    let prefix = unique_route("stream");
+    let route = format!("{prefix}{}", "r".repeat(4096 - prefix.len()));
+    let metadata = [7_u8; 16];
+    let body = vec![42_u8; 400 * 1024 - metadata.len()];
+    let stream = connected.stream().unwrap();
+
+    // Act
+    for offset in 0..3_u64 {
+        let mut session = stream.begin(&route, None).await.unwrap();
+        if offset == 0 {
+            let oversized = vec![42_u8; body.len() + 1];
+            let error = session
+                .append(0, &oversized, Some(&metadata), None)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                FitzError::DomainWire {
+                    code: 2008,
+                    effect: 0,
+                    ..
+                }
+            ));
+        }
+        assert_eq!(
+            session
+                .append(offset, &body, Some(&metadata), None)
+                .await
+                .unwrap(),
+            Some(offset)
+        );
+        session.commit(StreamCommitMode::Sync).await.unwrap();
+    }
+    let mut records = Vec::new();
+    let mut next = 0;
+    let mut pages = 0;
+    loop {
+        let page = stream
+            .read_page(&route, next, 10, StreamReadOptions::default())
+            .await
+            .unwrap();
+        pages += 1;
+        records.extend(page.items.into_iter().map(|item| match item {
+            StreamReadItem::Event(record) => record,
+            _ => panic!("unexpected filtered item"),
+        }));
+        if !page.cursor.has_more {
+            break;
+        }
+        assert!(page.cursor.last_resource_offset >= next);
+        next = page.cursor.last_resource_offset + 1;
+    }
+
+    // Assert
+    assert!(pages > 1);
+    assert_eq!(records.len(), 3);
+    for (offset, record) in records.iter().enumerate() {
+        assert_eq!(record.route, route);
+        assert_eq!(record.offset, u64::try_from(offset).unwrap());
+        assert_eq!(record.body, body);
+        assert_eq!(record.metadata.as_deref(), Some(metadata.as_slice()));
+    }
+    connected.close().await.unwrap();
 }
 
 async fn exercise_queue_workflow(connected: &Client) {
