@@ -6,8 +6,8 @@ on:
       broker_tag:
         description: Fitz broker image tag
         type: choice
-        options: [main, develop]
-        default: main
+        options: [0.3.0, main, develop]
+        default: 0.3.0
   push:
   pull_request:
   schedule:
@@ -21,7 +21,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  FITZ_BROKER_IMAGE: ghcr.io/cntryl/fitz:${{ inputs.broker_tag || 'develop' }}
+  FITZ_BROKER_IMAGE: ghcr.io/cntryl/fitz:${{ inputs.broker_tag || '0.3.0' }}
 
 jobs:
   spec:
@@ -62,8 +62,8 @@ jobs:
           path: artifacts/conformance-*.json
           if-no-files-found: warn
 
-      - name: Run cancellation chains against candidate broker
-        if: github.event_name == 'workflow_dispatch' && inputs.broker_tag == 'develop'
+      - name: Run cancellation chains against selected broker
+        if: github.event_name == 'workflow_dispatch' && inputs.broker_tag == '0.3.0'
         shell: bash
         run: |
           for transport in tcp ws; do
