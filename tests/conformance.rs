@@ -262,7 +262,7 @@ async fn exercise_timeout_and_reuse(
         .await?;
     tokio::time::timeout(Duration::from_secs(2), accepted_rx)
         .await
-        .map_err(|_| FitzError::Timeout)?
+        .map_err(|_| FitzError::Protocol("CS-007 worker did not receive the stalled RPC".into()))?
         .map_err(|_| FitzError::ConnectionClosed)?;
     assert!(matches!(
         response.next().await,
@@ -299,7 +299,7 @@ async fn exercise_cancellation_and_reuse(
     let mut canceled = caller.rpc()?.call(&route, b"cancel").await?;
     tokio::time::timeout(Duration::from_secs(2), accepted_rx)
         .await
-        .map_err(|_| FitzError::Timeout)?
+        .map_err(|_| FitzError::Protocol("CS-008 worker did not receive the canceled RPC".into()))?
         .map_err(|_| FitzError::ConnectionClosed)?;
     let outcome = canceled.cancel().await;
     assert_eq!(
@@ -309,7 +309,7 @@ async fn exercise_cancellation_and_reuse(
     let mut next = caller.rpc()?.call(&route, b"next").await?;
     let result = tokio::time::timeout(Duration::from_secs(2), next.next())
         .await
-        .map_err(|_| FitzError::Timeout)?
+        .map_err(|_| FitzError::Protocol("CS-008 follow-up RPC did not receive a response".into()))?
         .expect("worker response stream ended without a terminal frame")?;
     assert_eq!(result.body, b"after-cancel");
     serving.await.map_err(|_| FitzError::ConnectionClosed)??;
