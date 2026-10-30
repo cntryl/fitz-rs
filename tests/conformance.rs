@@ -13,7 +13,7 @@ use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio_util::sync::CancellationToken;
+use tokio::sync::oneshot;
 
 const CLIENT_NAME: &str = "fitz-rs";
 static ROUTE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -237,6 +237,89 @@ async fn stream_round_trip(connected: &Client) -> Result<(), FitzError> {
     Ok(())
 }
 
+async fn exercise_timeout_and_reuse(
+    connected: &Client,
+    transport: Transport,
+    auth_mode: AuthMode,
+) -> Result<Vec<String>, FitzError> {
+    let route = unique_route("rpc");
+    let mut worker = connected.rpc()?.register_worker(&route, 1).await?;
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let serving = tokio::spawn(async move {
+        let request = worker.next().await.expect("worker stream closed")?;
+        accepted_tx
+            .send(())
+            .expect("caller is waiting for the request");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(request);
+        Ok::<(), FitzError>(())
+    });
+    let caller = client(transport, auth_mode);
+    caller.connect().await?;
+    let mut response = caller
+        .rpc()?
+        .call_with_timeout(&route, b"timeout", Some(Duration::from_millis(75)))
+        .await?;
+    tokio::time::timeout(Duration::from_secs(2), accepted_rx)
+        .await
+        .map_err(|_| FitzError::Timeout)?
+        .map_err(|_| FitzError::ConnectionClosed)?;
+    assert!(matches!(
+        response.next().await,
+        Some(Err(FitzError::Timeout))
+    ));
+    kv_round_trip(&caller, KvDurability::Buffered).await?;
+    serving.await.map_err(|_| FitzError::ConnectionClosed)??;
+    caller.close().await?;
+    Ok(vec![
+        "a stalled RPC timed out as Timeout rather than cancellation".into(),
+        "a KV transaction succeeded on the same connection after timeout".into(),
+    ])
+}
+
+async fn exercise_cancellation_and_reuse(
+    connected: &Client,
+    transport: Transport,
+    auth_mode: AuthMode,
+) -> Result<Vec<String>, FitzError> {
+    let route = unique_route("rpc");
+    let mut worker = connected.rpc()?.register_worker(&route, 1).await?;
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let serving = tokio::spawn(async move {
+        let canceled = worker.next().await.expect("worker stream closed")?;
+        accepted_tx
+            .send(())
+            .expect("caller is waiting for the request");
+        drop(canceled);
+        let mut next = worker.next().await.expect("worker stream closed")?;
+        next.respond(b"after-cancel", true).await
+    });
+    let caller = client(transport, auth_mode);
+    caller.connect().await?;
+    let mut canceled = caller.rpc()?.call(&route, b"cancel").await?;
+    tokio::time::timeout(Duration::from_secs(2), accepted_rx)
+        .await
+        .map_err(|_| FitzError::Timeout)?
+        .map_err(|_| FitzError::ConnectionClosed)?;
+    let outcome = canceled.cancel().await;
+    assert_eq!(
+        outcome,
+        cntryl_fitz::client_domains::rpc::RpcCancellationOutcome::Forwarded
+    );
+    let mut next = caller.rpc()?.call(&route, b"next").await?;
+    let result = tokio::time::timeout(Duration::from_secs(2), next.next())
+        .await
+        .map_err(|_| FitzError::Timeout)?
+        .expect("worker response stream ended without a terminal frame")?;
+    assert_eq!(result.body, b"after-cancel");
+    serving.await.map_err(|_| FitzError::ConnectionClosed)??;
+    caller.close().await?;
+    Ok(vec![
+        "explicit RPC cancellation was acknowledged as Forwarded, not Timeout".into(),
+        "a subsequent request succeeded on the same connection".into(),
+    ])
+}
+
 async fn should_run_scenario(
     id: u8,
     connected: &Client,
@@ -265,23 +348,10 @@ async fn should_run_scenario(
         }
         6 => reject_held_lease(connected, transport, auth_mode).await?,
         7 => {
-            let unavailable = Client::anonymous("tcp://127.0.0.1:1")
-                .request_timeout(Duration::from_millis(100))
-                .build()?;
-            assert!(unavailable.connect().await.is_err());
+            return exercise_timeout_and_reuse(connected, transport, auth_mode).await;
         }
         8 => {
-            let cancellation = CancellationToken::new();
-            cancellation.cancel();
-            let options = cntryl_fitz::ConnectWhenReadyOptions {
-                cancellation,
-                ..Default::default()
-            };
-            let unavailable = Client::anonymous("tcp://127.0.0.1:1").build()?;
-            assert!(matches!(
-                unavailable.connect_when_ready(options).await,
-                Err(FitzError::Canceled)
-            ));
+            return exercise_cancellation_and_reuse(connected, transport, auth_mode).await;
         }
         9 | 10 => {
             let probe = client(transport, AuthMode::Anonymous);
@@ -403,7 +473,7 @@ async fn should_complete_default_async_conformance_suite() {
             let mut evidence = should_run_scenario(id, &connected, transport, auth_mode)
                 .await
                 .unwrap_or_else(|error| panic!("CS-{id:03} failed: {error}"));
-            let verdict = if (7..=16).contains(&id) {
+            let verdict = if (9..=16).contains(&id) {
                 evidence.push(
                     "this smoke check does not establish all shared scenario expectations".into(),
                 );
