@@ -377,6 +377,15 @@ impl Client {
                 (connection.protocol_version(), connection.capability_bits())
             })
     }
+    /// The current effective negotiated message and in-flight limits.
+    #[must_use]
+    pub fn server_limits(&self) -> (usize, usize) {
+        self.inner
+            .connection
+            .lock()
+            .as_ref()
+            .map_or((0, 0), AsyncConnection::negotiated_limits)
+    }
     #[must_use]
     pub fn subscribe_state(&self) -> watch::Receiver<ConnectionState> {
         self.inner.state_tx.subscribe()

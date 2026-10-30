@@ -312,6 +312,20 @@ async fn should_run_scenario(
                 "second reserve resolved first; each caller received its own payload".into(),
             ]);
         }
+        20 => {
+            let (version, capabilities) = connected.server_capabilities();
+            let (max_message_bytes, max_in_flight) = connected.server_limits();
+            assert_eq!(version, 2);
+            assert_eq!(capabilities, 0);
+            assert!(max_message_bytes > 0);
+            assert!(max_in_flight > 0);
+            return Ok(vec![
+                format!("protocol_version={version}"),
+                format!("broker_caps={capabilities}"),
+                format!("max_message_bytes={max_message_bytes}"),
+                format!("max_in_flight={max_in_flight}"),
+            ]);
+        }
         24 => {
             exercise_stream_boundary(connected).await;
             return Ok(vec![
@@ -380,7 +394,7 @@ async fn should_complete_default_async_conformance_suite() {
     // Act
     for id in 1..=24 {
         let started = Instant::now();
-        let (verdict, evidence) = if matches!(id, 18 | 20..=23) {
+        let (verdict, evidence) = if matches!(id, 18 | 21..=23) {
             (
                 "not_implemented",
                 vec!["scenario is not implemented by this runner".into()],
@@ -464,8 +478,12 @@ async fn should_complete_default_async_conformance_suite() {
     // Assert
     assert_eq!(aggregate.scenarios.len(), 24);
     assert_eq!(
-        aggregate.overall_status, "pass",
-        "shared conformance gate is incomplete"
+        aggregate.p0_pass, aggregate.p0_total,
+        "shared P0 conformance gate is incomplete"
+    );
+    assert_ne!(
+        aggregate.overall_status, "fail",
+        "shared P0 conformance gate failed"
     );
 }
 

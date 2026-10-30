@@ -123,6 +123,8 @@ pub(crate) struct AsyncConnection {
     cancellations: mpsc::UnboundedSender<u64>,
     next_request_id: Arc<AtomicU64>,
     capabilities: Arc<AtomicU64>,
+    max_message_bytes: Arc<AtomicU64>,
+    max_in_flight: Arc<AtomicU64>,
     generation: Arc<AtomicU64>,
     generation_watch: watch::Sender<u64>,
     close_requested: Arc<AtomicBool>,
@@ -170,6 +172,10 @@ impl AsyncConnection {
         let close_requested = Arc::new(AtomicBool::new(false));
         let registrations = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let capabilities = Arc::new(AtomicU64::new(0));
+        let max_message_bytes = Arc::new(AtomicU64::new(MAX_MESSAGE_SIZE as u64));
+        let max_in_flight = Arc::new(AtomicU64::new(
+            u64::try_from(max_queued.max(1)).unwrap_or(u64::MAX),
+        ));
         let next_request_id = Arc::new(AtomicU64::new(1));
         tokio::spawn(supervise(Supervisor {
             endpoint,
@@ -190,14 +196,16 @@ impl AsyncConnection {
             registrations: Arc::clone(&registrations),
             capabilities: Arc::clone(&capabilities),
             next_request_id: Arc::clone(&next_request_id),
-            max_message_bytes: AtomicU64::new(MAX_MESSAGE_SIZE as u64),
-            max_in_flight: AtomicU64::new(u64::try_from(max_queued.max(1)).unwrap_or(u64::MAX)),
+            max_message_bytes: Arc::clone(&max_message_bytes),
+            max_in_flight: Arc::clone(&max_in_flight),
         }));
         Self {
             commands,
             cancellations,
             next_request_id,
             capabilities,
+            max_message_bytes,
+            max_in_flight,
             generation,
             generation_watch,
             close_requested,
@@ -218,6 +226,13 @@ impl AsyncConnection {
     pub(crate) fn capability_bits(&self) -> u32 {
         u32::try_from(self.capabilities.load(Ordering::Acquire) & u64::from(u32::MAX))
             .expect("capability bits were masked to u32")
+    }
+
+    pub(crate) fn negotiated_limits(&self) -> (usize, usize) {
+        (
+            usize::try_from(self.max_message_bytes.load(Ordering::Acquire)).unwrap_or(usize::MAX),
+            usize::try_from(self.max_in_flight.load(Ordering::Acquire)).unwrap_or(usize::MAX),
+        )
     }
 
     pub(crate) fn correlation_enabled(&self) -> bool {
@@ -510,8 +525,8 @@ struct Supervisor {
     registrations: Arc<parking_lot::Mutex<HashMap<u64, Registration>>>,
     capabilities: Arc<AtomicU64>,
     next_request_id: Arc<AtomicU64>,
-    max_message_bytes: AtomicU64,
-    max_in_flight: AtomicU64,
+    max_message_bytes: Arc<AtomicU64>,
+    max_in_flight: Arc<AtomicU64>,
 }
 
 /// Returns (creating if absent) the per-message-type epoch counter's lock.
@@ -1584,8 +1599,8 @@ mod tests {
             registrations: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             capabilities: Arc::new(AtomicU64::new(0)),
             next_request_id: Arc::new(AtomicU64::new(1)),
-            max_message_bytes: AtomicU64::new(MAX_MESSAGE_SIZE as u64),
-            max_in_flight: AtomicU64::new(256),
+            max_message_bytes: Arc::new(AtomicU64::new(MAX_MESSAGE_SIZE as u64)),
+            max_in_flight: Arc::new(AtomicU64::new(256)),
         };
         let (io, _peer) = tokio::io::duplex(64);
         let (reader, writer) = tokio::io::split(io);
@@ -1680,8 +1695,8 @@ mod tests {
             registrations,
             capabilities: Arc::new(AtomicU64::new(0)),
             next_request_id: Arc::new(AtomicU64::new(1)),
-            max_message_bytes: AtomicU64::new(MAX_MESSAGE_SIZE as u64),
-            max_in_flight: AtomicU64::new(256),
+            max_message_bytes: Arc::new(AtomicU64::new(MAX_MESSAGE_SIZE as u64)),
+            max_in_flight: Arc::new(AtomicU64::new(256)),
         };
         // Act
         restore_registrations(&supervisor, &mut session).await;
