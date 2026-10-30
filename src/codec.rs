@@ -20,6 +20,11 @@ impl PayloadEncoder {
         self
     }
 
+    pub fn put_u16(&mut self, value: u16) -> &mut Self {
+        self.buf.extend_from_slice(&value.to_be_bytes());
+        self
+    }
+
     pub fn put_u32(&mut self, value: u32) -> &mut Self {
         self.buf.extend_from_slice(&value.to_be_bytes());
         self
@@ -92,6 +97,13 @@ impl<'a> PayloadDecoder<'a> {
         Ok(value)
     }
 
+    pub fn get_u16(&mut self) -> Result<u16> {
+        self.check_len(2)?;
+        let bytes = &self.buf[self.pos..self.pos + 2];
+        self.pos += 2;
+        Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+    }
+
     pub fn get_u32(&mut self) -> Result<u32> {
         self.check_len(4)?;
         let bytes = &self.buf[self.pos..self.pos + 4];
@@ -110,13 +122,6 @@ impl<'a> PayloadDecoder<'a> {
 
     pub fn get_bytes(&mut self) -> Result<Vec<u8>> {
         let len = self.get_u32()? as usize;
-        self.check_len(len)?;
-        let bytes = self.buf[self.pos..self.pos + len].to_vec();
-        self.pos += len;
-        Ok(bytes)
-    }
-
-    pub fn get_raw(&mut self, len: usize) -> Result<Vec<u8>> {
         self.check_len(len)?;
         let bytes = self.buf[self.pos..self.pos + len].to_vec();
         self.pos += len;
@@ -145,127 +150,109 @@ impl<'a> PayloadDecoder<'a> {
     }
 }
 
-/// Encode a message frame: [u16 `msg_type`][payload]
+pub const FRAME_HEADER_LEN: usize = 15;
+pub const MAX_MESSAGE_SIZE: usize = 1_048_576;
+pub const ACK_REQUESTED: u8 = 1;
+pub const RESPONSE_FINAL: u8 = 2;
+const VALID_FLAGS: u8 = ACK_REQUESTED | RESPONSE_FINAL;
+
+#[cfg(test)]
+pub(crate) fn test_hello_payload() -> Vec<u8> {
+    let mut encoder = PayloadEncoder::new();
+    encoder
+        .put_u16(2)
+        .put_u32(0)
+        .put_u32(u32::try_from(MAX_MESSAGE_SIZE).expect("frame limit fits in u32"))
+        .put_u32(256)
+        .put_u64(1);
+    encoder.finish()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameHeader {
+    pub message_type: u16,
+    pub flags: u8,
+    pub correlation_id: u64,
+    pub payload_start: usize,
+}
+
+/// Encode one Wire-2 message frame with an empty header correlation.
 #[cfg(test)]
 pub fn encode_message_frame(msg_type: u16, payload: &[u8]) -> Vec<u8> {
-    assert!(
-        u16::try_from(payload.len()).is_ok(),
-        "payload exceeds u16 frame limit"
-    );
-
-    try_encode_message_frame(msg_type, payload).expect("payload length checked above")
+    try_encode_message_frame(msg_type, payload).expect("payload fits Wire-2 message limit")
 }
 
-/// Checked message frame encoding used by transport-facing code.
+/// Checked Wire-2 message frame encoding used by transport-facing code.
 pub fn try_encode_message_frame(msg_type: u16, payload: &[u8]) -> Result<Vec<u8>> {
-    if payload.len() > u16::MAX as usize {
-        return Err(FitzError::FrameTooLarge(payload.len()));
-    }
-
-    let mut frame = Vec::new();
-
-    // Encode message type (multi-byte for type ≥ 255)
-    if msg_type < 255 {
-        frame.push(u8::try_from(msg_type).expect("single-byte message type"));
-    } else {
-        frame.push(0xFF);
-        frame.extend_from_slice(&msg_type.to_be_bytes());
-    }
-
-    // Encode length (u16 BE)
-    frame.extend_from_slice(
-        &u16::try_from(payload.len())
-            .expect("payload size checked above")
-            .to_be_bytes(),
-    );
-
-    // Append payload
-    frame.extend_from_slice(payload);
-
-    Ok(frame)
+    try_encode_frame(msg_type, 0, 0, payload)
 }
 
-/// Decode a message frame: returns (`msg_type`, `payload_start`)
-pub fn decode_message_frame(buf: &[u8]) -> Result<(u16, usize)> {
-    if buf.is_empty() {
-        return Err(FitzError::Codec("Empty frame".to_string()));
-    }
-
-    let (msg_type, header_len) = if buf[0] == 0xFF {
-        if buf.len() < 3 {
-            return Err(FitzError::Codec(
-                "Incomplete multi-byte message type".to_string(),
-            ));
-        }
-        let msg_type = u16::from_be_bytes([buf[1], buf[2]]);
-        (msg_type, 3)
-    } else {
-        (u16::from(buf[0]), 1)
-    };
-
-    if buf.len() < header_len + 2 {
-        return Err(FitzError::Codec("Incomplete length field".to_string()));
-    }
-
-    let len = u16::from_be_bytes([buf[header_len], buf[header_len + 1]]) as usize;
-    let payload_start = header_len + 2;
-
-    if buf.len() < payload_start + len {
-        return Err(FitzError::Codec("Incomplete payload bytes".to_string()));
-    }
-
-    if buf.len() != payload_start + len {
-        return Err(FitzError::Codec(
-            "Frame length does not match payload size".to_string(),
-        ));
-    }
-
-    Ok((msg_type, payload_start))
-}
-
-/// Decode every TLV record in one message-bounded transport frame.
-pub fn decode_message_frames(mut buf: &[u8]) -> Result<Vec<(u16, Vec<u8>)>> {
-    let mut frames = Vec::with_capacity(2);
-    while !buf.is_empty() {
-        let (msg_type, header_len) = if buf[0] == 0xFF {
-            if buf.len() < 3 {
-                return Err(FitzError::Codec(
-                    "Incomplete multi-byte message type".into(),
-                ));
-            }
-            (u16::from_be_bytes([buf[1], buf[2]]), 3)
-        } else {
-            (u16::from(buf[0]), 1)
-        };
-        if buf.len() < header_len + 2 {
-            return Err(FitzError::Codec("Incomplete length field".into()));
-        }
-        let len = u16::from_be_bytes([buf[header_len], buf[header_len + 1]]) as usize;
-        let start = header_len + 2;
-        let end = start + len;
-        if buf.len() < end {
-            return Err(FitzError::Codec("Incomplete payload bytes".into()));
-        }
-        frames.push((msg_type, buf[start..end].to_vec()));
-        buf = &buf[end..];
-    }
-    Ok(frames)
-}
-
-pub fn try_encode_correlated_frame(
-    correlation_id: u64,
+/// Encode one Wire-2 message with explicit flags and correlation.
+pub fn try_encode_frame(
     msg_type: u16,
+    flags: u8,
+    correlation_id: u64,
     payload: &[u8],
 ) -> Result<Vec<u8>> {
-    if correlation_id == 0 {
-        return Err(FitzError::Codec("zero correlation identifier".into()));
+    let message_size = FRAME_HEADER_LEN.saturating_add(payload.len());
+    if message_size > MAX_MESSAGE_SIZE || u32::try_from(payload.len()).is_err() {
+        return Err(FitzError::FrameTooLarge(message_size));
     }
-    let mut frame = try_encode_message_frame(
-        crate::protocol::message_type::CORRELATE,
-        &correlation_id.to_be_bytes(),
-    )?;
-    frame.extend_from_slice(&try_encode_message_frame(msg_type, payload)?);
+    if flags & !VALID_FLAGS != 0 {
+        return Err(FitzError::Protocol(format!(
+            "unsupported frame flags {flags:#x}"
+        )));
+    }
+    let mut frame = Vec::with_capacity(message_size);
+    frame.extend_from_slice(&msg_type.to_be_bytes());
+    frame.push(flags);
+    frame.extend_from_slice(&correlation_id.to_be_bytes());
+    frame.extend_from_slice(
+        &u32::try_from(payload.len())
+            .expect("payload length checked above")
+            .to_be_bytes(),
+    );
+    frame.extend_from_slice(payload);
     Ok(frame)
+}
+
+/// Decode and validate one Wire-2 message header and exact payload length.
+pub fn decode_frame_header(buf: &[u8]) -> Result<FrameHeader> {
+    if buf.len() < FRAME_HEADER_LEN {
+        return Err(FitzError::Codec("truncated Wire-2 frame header".into()));
+    }
+    let message_type = u16::from_be_bytes([buf[0], buf[1]]);
+    let flags = buf[2];
+    if flags & !VALID_FLAGS != 0 {
+        return Err(FitzError::Protocol(format!(
+            "unsupported frame flags {flags:#x}"
+        )));
+    }
+    let correlation_id = u64::from_be_bytes(buf[3..11].try_into().expect("fixed header slice"));
+    let payload_len =
+        u32::from_be_bytes(buf[11..15].try_into().expect("fixed header slice")) as usize;
+    let expected = FRAME_HEADER_LEN.saturating_add(payload_len);
+    if expected > MAX_MESSAGE_SIZE {
+        return Err(FitzError::FrameTooLarge(expected));
+    }
+    if buf.len() != expected {
+        return Err(FitzError::Codec(
+            "Wire-2 frame length does not match payload size".into(),
+        ));
+    }
+    Ok(FrameHeader {
+        message_type,
+        flags,
+        correlation_id,
+        payload_start: FRAME_HEADER_LEN,
+    })
+}
+
+/// Decode a message frame: returns (`msg_type`, `payload_start`).
+#[cfg(test)]
+pub fn decode_message_frame(buf: &[u8]) -> Result<(u16, usize)> {
+    let header = decode_frame_header(buf)?;
+    Ok((header.message_type, header.payload_start))
 }
 
 #[cfg(test)]
@@ -346,10 +333,28 @@ mod tests {
     }
 
     #[test]
-    fn should_encode_message_type_zero_as_single_byte() {
-        let frame = encode_message_frame(0, b"ok");
-        assert_eq!(frame[0], 0);
-        assert_eq!(&frame[1..3], &[0, 2]);
+    fn should_decode_response_final_flag_given_correlated_terminal_response() {
+        // Arrange
+        let frame = try_encode_frame(104, RESPONSE_FINAL, 1, b"ok").unwrap();
+
+        // Act
+        let header = decode_frame_header(&frame).unwrap();
+
+        // Assert
+        assert_eq!(header.flags, RESPONSE_FINAL);
+        assert_eq!(header.correlation_id, 1);
+    }
+
+    #[test]
+    fn should_encode_message_type_zero_in_fixed_header() {
+        // Arrange
+        let payload = b"ok";
+        // Act
+        let frame = encode_message_frame(0, payload);
+        let header = decode_frame_header(&frame).unwrap();
+        // Assert
+        assert_eq!(header.message_type, 0);
+        assert_eq!(&frame[FRAME_HEADER_LEN..], payload);
     }
 
     #[test]
@@ -370,7 +375,7 @@ mod tests {
     #[test]
     fn should_reject_oversized_payload_given_value_above_frame_limit_when_encoding_attempted() {
         // Arrange
-        let payload = vec![0u8; (u16::MAX as usize) + 1];
+        let payload = vec![0u8; MAX_MESSAGE_SIZE - FRAME_HEADER_LEN + 1];
 
         // Act
         let err = try_encode_message_frame(100, &payload).unwrap_err();
@@ -394,13 +399,14 @@ mod tests {
     #[test]
     fn should_reject_trailing_bytes_given_extra_frame_data_when_strict_decoding_used() {
         // Arrange
-        let frame = vec![100, 0, 2, b'h', b'i', b'!'];
+        let mut frame = encode_message_frame(100, b"hi");
+        frame.push(b'!');
 
         // Act
         let err = decode_message_frame(&frame).unwrap_err();
 
         // Assert
-        assert!(err.to_string().contains("Frame length does not match"));
+        assert_eq!(err.kind(), crate::error::FitzErrorKind::Protocol);
     }
 
     #[test]

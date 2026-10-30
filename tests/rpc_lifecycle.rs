@@ -159,7 +159,7 @@ async fn should_report_connection_closed_while_waiting_for_cancellation_confirma
         let (mut stream, _) = listener.accept().await.unwrap();
         assert_eq!(read_frame(&mut stream).await.0, 1);
         stream
-            .write_all(&encode_message_frame(4, &[0, 1, 0, 0, 0, 8]))
+            .write_all(&encode_message_frame(2, &hello()))
             .await
             .unwrap();
         assert_eq!(read_frame(&mut stream).await.0, 302);
@@ -193,7 +193,7 @@ async fn should_wait_for_delayed_server_hello_before_negotiating_worker_cancella
         assert_eq!(read_frame(&mut stream).await.0, 1);
         tokio::time::sleep(Duration::from_millis(200)).await;
         stream
-            .write_all(&encode_message_frame(4, &[0, 1, 0, 0, 0, 8]))
+            .write_all(&encode_message_frame(2, &hello()))
             .await
             .unwrap();
         let registration = read_frame(&mut stream).await;
@@ -216,7 +216,7 @@ async fn should_wait_for_delayed_server_hello_before_negotiating_worker_cancella
     // Assert
     assert_eq!(kind, 300);
     assert!(
-        registration.ends_with(&[1, 1]),
+        registration.ends_with(&[1]),
         "worker registration omitted negotiated cancellation"
     );
     drop(worker);
@@ -233,13 +233,14 @@ async fn should_wait_for_delayed_websocket_hello_before_negotiating_worker_cance
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-        assert_eq!(socket.next().await.unwrap().unwrap().into_data()[0], 1);
+        assert_eq!(
+            &socket.next().await.unwrap().unwrap().into_data()[..2],
+            &[0, 1]
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
         socket
             .send(tokio_tungstenite::tungstenite::Message::Binary(
-                encode_message_frame(4, &[0, 1, 0, 0, 0, 8])[4..]
-                    .to_vec()
-                    .into(),
+                encode_message_frame(2, &hello())[4..].to_vec().into(),
             ))
             .await
             .unwrap();
@@ -265,8 +266,8 @@ async fn should_wait_for_delayed_websocket_hello_before_negotiating_worker_cance
     let registration = server.await.unwrap();
 
     // Assert
-    assert_eq!(&registration[..3], &[255, 1, 44]);
-    assert!(registration.ends_with(&[1, 1]));
+    assert_eq!(&registration[..2], &[1, 44]);
+    assert!(registration.ends_with(&[1]));
     drop(worker);
     client.close().await?;
     Ok(())
@@ -299,7 +300,7 @@ async fn should_bound_connection_wait_given_missing_server_hello() -> Result<()>
 async fn handshake_worker(stream: &mut TcpStream) {
     assert_eq!(read_frame(stream).await.0, 1);
     stream
-        .write_all(&encode_message_frame(4, &[0, 1, 0, 0, 0, 8]))
+        .write_all(&encode_message_frame(2, &hello()))
         .await
         .unwrap();
     assert_eq!(read_frame(stream).await.0, 300);
@@ -428,7 +429,7 @@ async fn should_reject_downstream_work_when_parent_is_already_cancelled() -> Res
 }
 
 #[tokio::test]
-async fn should_preserve_legacy_caller_framing_given_local_timeout() -> Result<()> {
+async fn should_cancel_timed_out_call_given_no_optional_capabilities() -> Result<()> {
     // Arrange
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
@@ -436,12 +437,12 @@ async fn should_preserve_legacy_caller_framing_given_local_timeout() -> Result<(
         let (mut stream, _) = listener.accept().await.unwrap();
         assert_eq!(read_frame(&mut stream).await.0, 1);
         stream
-            .write_all(&encode_message_frame(4, &[0, 1, 0, 0, 0, 0]))
+            .write_all(&encode_message_frame(2, &hello()))
             .await
             .unwrap();
         let request = read_frame(&mut stream).await;
         let extra = tokio::time::timeout(Duration::from_millis(100), read_frame(&mut stream)).await;
-        (request, extra.is_err())
+        (request, extra.unwrap())
     });
     let client = Client::anonymous(format!("tcp://{address}")).build()?;
     client.connect().await?;
@@ -457,17 +458,21 @@ async fn should_preserve_legacy_caller_framing_given_local_timeout() -> Result<(
     // Act
     let result = call.next().await;
     let outcome = call.cancel().await;
-    let ((kind, payload), omitted_cancellation) = server.await.unwrap();
+    let ((kind, payload), cancellation) = server.await.unwrap();
 
     // Assert
     assert!(matches!(result, Some(Err(cntryl_fitz::FitzError::Timeout))));
     assert_eq!(
         outcome,
-        cntryl_fitz::client_domains::rpc::RpcCancellationOutcome::Unsupported
+        cntryl_fitz::client_domains::rpc::RpcCancellationOutcome::ConnectionClosed
     );
     assert_eq!(kind, 302);
-    assert_eq!(payload.len(), 16 + 4 + "rpc://prod/app/work".len() + 4 + 4);
-    assert!(omitted_cancellation);
+    assert_eq!(
+        payload.len(),
+        16 + 4 + "rpc://prod/app/work".len() + 4 + 4 + 5
+    );
+    assert_eq!(cancellation.0, 304);
+    assert_eq!(cancellation.1[0], 1);
     client.close().await?;
     Ok(())
 }
@@ -481,7 +486,7 @@ async fn write_request_with_id(stream: &mut TcpStream, budget_ms: u32, correlati
     let mut payload = correlation_id.to_vec();
     payload.extend_from_slice(&u32::try_from(route.len()).unwrap().to_be_bytes());
     payload.extend_from_slice(route);
-    payload.extend_from_slice(&[0, 0, 0, 0, 1, 1]);
+    payload.extend_from_slice(&[0, 0, 0, 0, 1]);
     payload.extend_from_slice(&budget_ms.to_be_bytes());
     stream
         .write_all(&encode_message_frame(302, &payload))
@@ -494,25 +499,28 @@ async fn read_frame(stream: &mut TcpStream) -> (u16, Vec<u8>) {
     stream.read_exact(&mut length).await.unwrap();
     let mut body = vec![0; u32::from_be_bytes(length) as usize];
     stream.read_exact(&mut body).await.unwrap();
-    let (kind, header) = if body[0] == 255 {
-        (u16::from_be_bytes([body[1], body[2]]), 5)
-    } else {
-        (u16::from(body[0]), 3)
-    };
-    (kind, body[header..].to_vec())
+    (
+        u16::from_be_bytes(body[..2].try_into().unwrap()),
+        body[15..].to_vec(),
+    )
 }
 
 fn encode_message_frame(kind: u16, payload: &[u8]) -> Vec<u8> {
-    let mut body = if kind < 255 {
-        vec![u8::try_from(kind).unwrap()]
-    } else {
-        let mut header = vec![255];
-        header.extend_from_slice(&kind.to_be_bytes());
-        header
-    };
-    body.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_be_bytes());
+    let mut body = kind.to_be_bytes().to_vec();
+    let correlation = u64::from(kind == 300);
+    body.push(u8::from(correlation != 0) * 2);
+    body.extend_from_slice(&correlation.to_be_bytes());
+    body.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
     body.extend_from_slice(payload);
     let mut frame = u32::try_from(body.len()).unwrap().to_be_bytes().to_vec();
     frame.extend_from_slice(&body);
     frame
+}
+fn hello() -> Vec<u8> {
+    let mut p = 2_u16.to_be_bytes().to_vec();
+    p.extend_from_slice(&0_u32.to_be_bytes());
+    p.extend_from_slice(&1_048_576_u32.to_be_bytes());
+    p.extend_from_slice(&64_u32.to_be_bytes());
+    p.extend_from_slice(&1_u64.to_be_bytes());
+    p
 }

@@ -1,9 +1,11 @@
+#[path = "support/global_replay.rs"]
+mod global_replay;
 mod jwt;
 
 use cntryl_fitz::client_domains::kv::KvGetResult;
 use cntryl_fitz::client_domains::lease::LeaseAcquireOptions;
 use cntryl_fitz::client_domains::schedule::{ScheduleDeliveryMode, ScheduleEntry};
-use cntryl_fitz::client_domains::stream::StreamCommitMode;
+use cntryl_fitz::client_domains::stream::{StreamCommitMode, StreamReadItem, StreamReadOptions};
 use cntryl_fitz::{Client, FitzError, KvDurability, TransactionMode};
 use futures_util::StreamExt;
 use serde::Serialize;
@@ -11,7 +13,7 @@ use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio_util::sync::CancellationToken;
+use tokio::sync::oneshot;
 
 const CLIENT_NAME: &str = "fitz-rs";
 static ROUTE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -81,6 +83,10 @@ struct AggregateResult {
     client: &'static str,
     transport: String,
     auth_mode: String,
+    p0_pass: u32,
+    p0_total: u32,
+    p1_pass: u32,
+    p1_total: u32,
     p0_pass_rate: f64,
     p1_pass_rate: f64,
     overall_status: &'static str,
@@ -129,14 +135,20 @@ fn unique_route(scheme: &str) -> String {
 }
 
 async fn kv_round_trip(client: &Client, durability: KvDurability) -> Result<(), FitzError> {
+    let route = unique_route("kv");
     let transaction = client
         .kv()?
-        .begin(&unique_route("kv"), TransactionMode::ReadWrite)
+        .begin(&route, TransactionMode::ReadWrite)
         .await?;
     transaction.put(b"key", b"value").await?;
-    let value = transaction.get(b"key").await?;
+    transaction.commit(durability).await?;
+    let read = client
+        .kv()?
+        .begin(&route, TransactionMode::ReadOnly)
+        .await?;
+    let value = read.get(b"key").await?;
     assert_eq!(value, KvGetResult::Found(b"value".to_vec()));
-    transaction.commit(durability).await
+    read.rollback().await
 }
 
 async fn reject_invalid_jwt(transport: Transport) -> Result<(), FitzError> {
@@ -200,7 +212,11 @@ async fn reject_held_lease(
     let Err(error) = result else {
         panic!("held lease must reject a competing acquisition");
     };
-    assert!(matches!(error, FitzError::Domain { code: 5001, .. }));
+    assert!(matches!(error, FitzError::DomainWire { code: 5050, .. }));
+    assert!(
+        error.is_retryable(),
+        "held lease should be classified as retryable"
+    );
     contender.close().await?;
     owner.release().await
 }
@@ -221,6 +237,90 @@ async fn stream_round_trip(connected: &Client) -> Result<(), FitzError> {
     Ok(())
 }
 
+async fn exercise_timeout_and_reuse(
+    connected: &Client,
+    transport: Transport,
+    auth_mode: AuthMode,
+) -> Result<Vec<String>, FitzError> {
+    let route = unique_route("rpc");
+    let mut worker = connected.rpc()?.register_worker(&route, 1).await?;
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let serving = tokio::spawn(async move {
+        let request = worker.next().await.expect("worker stream closed")?;
+        accepted_tx
+            .send(())
+            .expect("caller is waiting for the request");
+        request.cancellation.cancelled().await;
+        drop(request);
+        Ok::<(), FitzError>(())
+    });
+    let caller = client(transport, auth_mode);
+    caller.connect().await?;
+    let mut response = caller
+        .rpc()?
+        .call_with_timeout(&route, b"timeout", Some(Duration::from_millis(75)))
+        .await?;
+    tokio::time::timeout(Duration::from_secs(2), accepted_rx)
+        .await
+        .map_err(|_| FitzError::Protocol("CS-007 worker did not receive the stalled RPC".into()))?
+        .map_err(|_| FitzError::ConnectionClosed)?;
+    assert!(matches!(
+        response.next().await,
+        Some(Err(FitzError::Timeout))
+    ));
+    kv_round_trip(&caller, KvDurability::Buffered).await?;
+    serving.await.map_err(|_| FitzError::ConnectionClosed)??;
+    caller.close().await?;
+    Ok(vec![
+        "a stalled RPC timed out as Timeout rather than cancellation".into(),
+        "a KV transaction succeeded on the same connection after timeout".into(),
+    ])
+}
+
+async fn exercise_cancellation_and_reuse(
+    connected: &Client,
+    transport: Transport,
+    auth_mode: AuthMode,
+) -> Result<Vec<String>, FitzError> {
+    let route = unique_route("rpc");
+    let mut worker = connected.rpc()?.register_worker(&route, 1).await?;
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let serving = tokio::spawn(async move {
+        let canceled = worker.next().await.expect("worker stream closed")?;
+        accepted_tx
+            .send(())
+            .expect("caller is waiting for the request");
+        canceled.cancellation.cancelled().await;
+        drop(canceled);
+        let mut next = worker.next().await.expect("worker stream closed")?;
+        next.respond(b"after-cancel", true).await
+    });
+    let caller = client(transport, auth_mode);
+    caller.connect().await?;
+    let mut canceled = caller.rpc()?.call(&route, b"cancel").await?;
+    tokio::time::timeout(Duration::from_secs(2), accepted_rx)
+        .await
+        .map_err(|_| FitzError::Protocol("CS-008 worker did not receive the canceled RPC".into()))?
+        .map_err(|_| FitzError::ConnectionClosed)?;
+    let outcome = canceled.cancel().await;
+    assert_eq!(
+        outcome,
+        cntryl_fitz::client_domains::rpc::RpcCancellationOutcome::Forwarded
+    );
+    let mut next = caller.rpc()?.call(&route, b"next").await?;
+    let result = tokio::time::timeout(Duration::from_secs(2), next.next())
+        .await
+        .map_err(|_| FitzError::Protocol("CS-008 follow-up RPC did not receive a response".into()))?
+        .expect("worker response stream ended without a terminal frame")?;
+    assert_eq!(result.body, b"after-cancel");
+    serving.await.map_err(|_| FitzError::ConnectionClosed)??;
+    caller.close().await?;
+    Ok(vec![
+        "explicit RPC cancellation was acknowledged as Forwarded, not Timeout".into(),
+        "a subsequent request succeeded on the same connection".into(),
+    ])
+}
+
 async fn should_run_scenario(
     id: u8,
     connected: &Client,
@@ -235,7 +335,7 @@ async fn should_run_scenario(
             let mut response = connected.rpc()?.call(&route, b"unknown route").await?;
             assert!(matches!(
                 response.next().await,
-                Some(Err(FitzError::Domain { code: 6004, .. }))
+                Some(Err(FitzError::DomainWire { code: 6051, .. }))
             ));
         }
         5 => {
@@ -244,27 +344,15 @@ async fn should_run_scenario(
                 .schedule()?
                 .create(&route, "invalid cron", ScheduleDeliveryMode::Single, b"")
                 .await;
-            assert!(matches!(result, Err(FitzError::Domain { .. })));
+            assert!(matches!(result, Err(FitzError::DomainWire { .. })));
+            kv_round_trip(connected, KvDurability::Buffered).await?;
         }
         6 => reject_held_lease(connected, transport, auth_mode).await?,
         7 => {
-            let unavailable = Client::anonymous("tcp://127.0.0.1:1")
-                .request_timeout(Duration::from_millis(100))
-                .build()?;
-            assert!(unavailable.connect().await.is_err());
+            return exercise_timeout_and_reuse(connected, transport, auth_mode).await;
         }
         8 => {
-            let cancellation = CancellationToken::new();
-            cancellation.cancel();
-            let options = cntryl_fitz::ConnectWhenReadyOptions {
-                cancellation,
-                ..Default::default()
-            };
-            let unavailable = Client::anonymous("tcp://127.0.0.1:1").build()?;
-            assert!(matches!(
-                unavailable.connect_when_ready(options).await,
-                Err(FitzError::Canceled)
-            ));
+            return exercise_cancellation_and_reuse(connected, transport, auth_mode).await;
         }
         9 | 10 => {
             let probe = client(transport, AuthMode::Anonymous);
@@ -288,14 +376,42 @@ async fn should_run_scenario(
             session.commit(StreamCommitMode::Sync).await?;
             connected.stream()?.metadata(&route).await?;
         }
-        17 => kv_round_trip(connected, KvDurability::Sync).await?,
+        17 => return global_replay::exercise(connected, &unique_route("stream")).await,
+        19 => {
+            exercise_same_type_requests(connected).await;
+            return Ok(vec![
+                "second reserve resolved first; each caller received its own payload".into(),
+            ]);
+        }
+        20 => {
+            let (version, capabilities) = connected.server_capabilities();
+            let (max_message_bytes, max_in_flight) = connected.server_limits();
+            assert_eq!(version, 2);
+            assert_eq!(capabilities, 0);
+            assert!(max_message_bytes > 0);
+            assert!(max_in_flight > 0);
+            return Ok(vec![
+                format!("protocol_version={version}"),
+                format!("broker_caps={capabilities}"),
+                format!("max_message_bytes={max_message_bytes}"),
+                format!("max_in_flight={max_in_flight}"),
+            ]);
+        }
+        24 => {
+            exercise_stream_boundary(connected).await;
+            return Ok(vec![
+                "409600 combined bytes accepted; 409601 rejected with BAD_REQUEST/NOT_APPLIED"
+                    .into(),
+                "three events replayed across multiple pages on a 4096-byte route".into(),
+            ]);
+        }
         _ => unreachable!("scenario IDs are fixed"),
     }
     Ok(vec![format!("default async client completed CS-{id:03}")])
 }
 
 fn scenario_title(id: u8) -> &'static str {
-    const TITLES: [&str; 17] = [
+    const TITLES: [&str; 24] = [
         "connect success",
         "auth failure",
         "request success",
@@ -309,12 +425,31 @@ fn scenario_title(id: u8) -> &'static str {
         "stream receive sequence",
         "stream completion",
         "stream error mid-flight",
-        "concurrent requests",
-        "backpressure",
-        "metadata",
-        "durability",
+        "concurrent in-flight requests",
+        "shutdown during active work",
+        "filtered stream replay",
+        "global filtered multi-page replay",
+        "bounded concurrency under burst load",
+        "concurrent same-message-type requests",
+        "handshake negotiation",
+        "correlation survives an ingress-synthesized error",
+        "notifications are never correlated",
+        "one request yields exactly one terminal frame",
+        "400 KiB Stream event boundary and replay",
     ];
     TITLES[usize::from(id - 1)]
+}
+
+fn scenario_counts(scenarios: &[ScenarioResult], priority: &str) -> (u32, u32) {
+    let selected: Vec<_> = scenarios
+        .iter()
+        .filter(|row| row.priority == priority)
+        .collect();
+    let passed = selected.iter().filter(|row| row.verdict == "pass").count();
+    (
+        u32::try_from(passed).expect("scenario count"),
+        u32::try_from(selected.len()).expect("scenario count"),
+    )
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -325,27 +460,59 @@ async fn should_complete_default_async_conformance_suite() {
     let auth_mode = AuthMode::from_env();
     let connected = client(transport, auth_mode);
     connected.connect().await.expect("broker connection");
-    let mut scenarios = Vec::with_capacity(17);
+    let mut scenarios = Vec::with_capacity(24);
 
     // Act
-    for id in 1..=17 {
+    for id in 1..=24 {
         let started = Instant::now();
-        let evidence = should_run_scenario(id, &connected, transport, auth_mode)
-            .await
-            .unwrap_or_else(|error| panic!("CS-{id:03} failed: {error}"));
+        let (verdict, evidence) = if matches!(id, 18 | 21..=23) {
+            (
+                "not_implemented",
+                vec!["scenario is not implemented by this runner".into()],
+            )
+        } else {
+            let mut evidence = should_run_scenario(id, &connected, transport, auth_mode)
+                .await
+                .unwrap_or_else(|error| panic!("CS-{id:03} failed: {error}"));
+            let verdict = if (9..=16).contains(&id) {
+                evidence.push(
+                    "this smoke check does not establish all shared scenario expectations".into(),
+                );
+                "partial"
+            } else {
+                "pass"
+            };
+            (verdict, evidence)
+        };
         scenarios.push(ScenarioResult {
             scenario_id: format!("CS-{id:03}"),
             title: scenario_title(id).into(),
-            priority: if id <= 8 { "P0" } else { "P1" }.into(),
+            priority: if id <= 8 || matches!(id, 19 | 20 | 24) {
+                "P0"
+            } else {
+                "P1"
+            }
+            .into(),
             client: CLIENT_NAME.into(),
             transport: transport.name().into(),
             auth_mode: auth_mode.name().into(),
-            verdict: "pass",
+            verdict,
             evidence,
             latency_ms: started.elapsed().as_millis(),
         });
     }
     connected.close().await.expect("close client");
+    let (p0_pass, p0_total) = scenario_counts(&scenarios, "P0");
+    let (p1_pass, p1_total) = scenario_counts(&scenarios, "P1");
+    let p0_pass_rate = f64::from(p0_pass) / f64::from(p0_total);
+    let p1_pass_rate = f64::from(p1_pass) / f64::from(p1_total);
+    let overall_status = if p0_pass_rate < 1.0 {
+        "fail"
+    } else if p1_pass_rate < 1.0 {
+        "partial"
+    } else {
+        "pass"
+    };
     let aggregate = AggregateResult {
         suite: "fitz-cross-language-client-conformance",
         version: "1.0",
@@ -357,9 +524,13 @@ async fn should_complete_default_async_conformance_suite() {
         client: CLIENT_NAME,
         transport: transport.name().into(),
         auth_mode: auth_mode.name().into(),
-        p0_pass_rate: 1.0,
-        p1_pass_rate: 1.0,
-        overall_status: "pass",
+        p0_pass,
+        p0_total,
+        p1_pass,
+        p1_total,
+        p0_pass_rate,
+        p1_pass_rate,
+        overall_status,
         scenarios,
     };
     let output = std::env::var_os("CONFORMANCE_OUTPUT").map_or_else(
@@ -376,18 +547,34 @@ async fn should_complete_default_async_conformance_suite() {
     .expect("write result");
 
     // Assert
-    assert_eq!(aggregate.scenarios.len(), 17);
-    assert!(aggregate.scenarios.iter().all(|row| row.verdict == "pass"));
+    assert_eq!(aggregate.scenarios.len(), 24);
+    assert_eq!(
+        aggregate.p0_pass, aggregate.p0_total,
+        "shared P0 conformance gate is incomplete"
+    );
+    assert_ne!(
+        aggregate.overall_status, "fail",
+        "shared P0 conformance gate failed"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires fitz-auth and fitz-anon from compose.yml"]
 async fn should_correlate_same_type_requests_out_of_order() {
+    // Arrange
     let connected = client(Transport::from_env(), AuthMode::from_env());
     connected.connect().await.expect("broker connection");
+
+    // Act
+    exercise_same_type_requests(&connected).await;
+
+    // Assert
+    connected.close().await.expect("close client");
+}
+
+async fn exercise_same_type_requests(connected: &Client) {
     assert!(connected.correlation_enabled());
-    assert_eq!(connected.server_capabilities().0, 1);
-    assert_ne!(connected.server_capabilities().1 & 1, 0);
+    assert_eq!(connected.server_capabilities(), (2, 0));
     let parked_route = unique_route("queue");
     let ready_route = unique_route("queue");
     connected
@@ -405,6 +592,7 @@ async fn should_correlate_same_type_requests_out_of_order() {
             .await
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!parked.is_finished(), "first reserve must remain parked");
     let mut second = tokio::time::timeout(
         Duration::from_secs(2),
         connected
@@ -416,6 +604,7 @@ async fn should_correlate_same_type_requests_out_of_order() {
     .expect("second reserve was serialized")
     .expect("second reserve failed");
     assert_eq!(second.pop().expect("second item").body, b"second");
+    assert!(!parked.is_finished(), "second reserve must resolve first");
 
     connected
         .queue()
@@ -429,7 +618,115 @@ async fn should_correlate_same_type_requests_out_of_order() {
         .expect("parked task panicked")
         .expect("parked reserve failed");
     assert_eq!(first.pop().expect("first item").body, b"first");
-    connected.close().await.expect("close client");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires fitz-auth and fitz-anon from compose.yml"]
+async fn should_preserve_empty_and_absent_stream_event_metadata() {
+    // Arrange
+    let connected = client(Transport::from_env(), AuthMode::from_env());
+    connected.connect().await.expect("broker connection");
+    let route = unique_route("stream");
+    let mut session = connected
+        .stream()
+        .unwrap()
+        .begin(&route, None)
+        .await
+        .unwrap();
+
+    // Act
+    session.append(0, b"empty", Some(b""), None).await.unwrap();
+    session.append(1, b"absent", None, None).await.unwrap();
+    session.commit(StreamCommitMode::Sync).await.unwrap();
+    let records = connected
+        .stream()
+        .unwrap()
+        .read(&route, 0, 10, None, None, None)
+        .await
+        .unwrap();
+
+    // Assert
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].metadata, Some(Vec::new()));
+    assert_eq!(records[1].metadata, None);
+    connected.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires fitz-auth and fitz-anon from compose.yml"]
+async fn should_replay_boundary_sized_events_on_the_longest_route() {
+    // Arrange
+    let connected = client(Transport::from_env(), AuthMode::from_env());
+    connected.connect().await.unwrap();
+
+    // Act
+    exercise_stream_boundary(&connected).await;
+
+    // Assert
+    connected.close().await.unwrap();
+}
+
+async fn exercise_stream_boundary(connected: &Client) {
+    let prefix = unique_route("stream");
+    let route = format!("{prefix}{}", "r".repeat(4096 - prefix.len()));
+    let metadata = [7_u8; 16];
+    let body = vec![42_u8; 400 * 1024 - metadata.len()];
+    let stream = connected.stream().unwrap();
+
+    for offset in 0..3_u64 {
+        let mut session = stream.begin(&route, None).await.unwrap();
+        if offset == 0 {
+            let oversized = vec![42_u8; body.len() + 1];
+            let error = session
+                .append(0, &oversized, Some(&metadata), None)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                FitzError::DomainWire {
+                    code: 2008,
+                    effect: 0,
+                    ..
+                }
+            ));
+        }
+        assert_eq!(
+            session
+                .append(offset, &body, Some(&metadata), None)
+                .await
+                .unwrap(),
+            Some(offset)
+        );
+        session.commit(StreamCommitMode::Sync).await.unwrap();
+    }
+    let mut records = Vec::new();
+    let mut next = 0;
+    let mut pages = 0;
+    loop {
+        let page = stream
+            .read_page(&route, next, 10, StreamReadOptions::default())
+            .await
+            .unwrap();
+        pages += 1;
+        records.extend(page.items.into_iter().map(|item| match item {
+            StreamReadItem::Event(record) => record,
+            _ => panic!("unexpected filtered item"),
+        }));
+        if !page.cursor.has_more {
+            break;
+        }
+        assert!(page.cursor.last_resource_offset >= next);
+        next = page.cursor.last_resource_offset + 1;
+    }
+
+    assert!(pages > 1);
+    assert_eq!(records.len(), 3);
+    for (offset, record) in records.iter().enumerate() {
+        assert_eq!(record.route, route);
+        assert_eq!(record.offset, u64::try_from(offset).unwrap());
+        assert_eq!(record.body, body);
+        assert_eq!(record.metadata.as_deref(), Some(metadata.as_slice()));
+    }
 }
 
 async fn exercise_queue_workflow(connected: &Client) {

@@ -1,3 +1,4 @@
+use super::decode_domain_error;
 use crate::async_connection::{AsyncConnection, RestorableRegistration};
 use crate::codec::{PayloadDecoder, PayloadEncoder};
 use crate::domains::routes::{
@@ -164,7 +165,7 @@ mod tests {
     }
 
     #[test]
-    fn should_preserve_long_plain_error_without_inferring_capacity() {
+    fn should_reject_legacy_plain_error_without_inferring_capacity() {
         // Arrange
         let message = "x".repeat(4005);
         let mut encoder = PayloadEncoder::new();
@@ -172,9 +173,10 @@ mod tests {
         // Act
         let error = decode_queue_plain_ok(&encoder.finish()).unwrap_err();
         // Assert
-        assert!(
-            matches!(error, FitzError::Domain { code: 0, message: decoded } if decoded == message)
-        );
+        assert!(matches!(
+            error,
+            FitzError::Protocol(_) | FitzError::Codec(_)
+        ));
     }
 
     #[test]
@@ -183,12 +185,14 @@ mod tests {
         let mut encoder = PayloadEncoder::new();
         encoder
             .put_u8(1)
-            .put_u32(4007)
+            .put_u16(4007)
+            .put_u8(7)
+            .put_u8(1)
             .put_string("outcome unknown");
         // Act
         let error = decode_queue_plain_ok(&encoder.finish()).unwrap_err();
         // Assert
-        assert!(matches!(error, FitzError::Domain { code: 4007, .. }));
+        assert!(matches!(error, FitzError::DomainWire { code: 4007, .. }));
         assert!(!error.is_retryable());
     }
 
@@ -196,11 +200,16 @@ mod tests {
     fn should_preserve_coded_capacity_rejection_for_completion() {
         // Arrange
         let mut encoder = PayloadEncoder::new();
-        encoder.put_u8(1).put_u32(4005).put_string("not accepted");
+        encoder
+            .put_u8(1)
+            .put_u16(4005)
+            .put_u8(5)
+            .put_u8(0)
+            .put_string("not accepted");
         // Act
         let error = decode_queue_plain_ok(&encoder.finish()).unwrap_err();
         // Assert
-        assert!(matches!(error, FitzError::Domain { code: 4005, .. }));
+        assert!(matches!(error, FitzError::DomainWire { code: 4005, .. }));
     }
 
     #[test]
@@ -240,10 +249,7 @@ mod tests {
 }
 
 fn is_retryable_enqueue_rejection(response: &[u8]) -> bool {
-    matches!(
-        success_decoder(response, "ENQUEUE"),
-        Err(FitzError::Domain { code: 4005, .. })
-    )
+    matches!(success_decoder(response, "ENQUEUE"), Err(error) if error.is_retryable())
 }
 
 pub struct QueueItem {
@@ -430,20 +436,14 @@ fn decode_queue_plain_ok(response: &[u8]) -> Result<()> {
     }
 }
 
-fn decode_queue_error(response: &[u8], coded_only: bool) -> Result<FitzError> {
-    let plain = response.len() >= 5
-        && u32::from_be_bytes(response[1..5].try_into().unwrap()) as usize == response.len() - 5;
-    let coded = response.len() >= 9
-        && u32::from_be_bytes(response[5..9].try_into().unwrap()) as usize == response.len() - 9;
-    if (coded_only && !coded) || (!coded_only && plain == coded) {
+fn decode_queue_error(response: &[u8], _coded_only: bool) -> Result<FitzError> {
+    if response.first() != Some(&1) {
         return Err(FitzError::Protocol(
-            "Malformed or ambiguous Queue error response".into(),
+            "Queue error response has no error status".into(),
         ));
     }
     let mut decoder = PayloadDecoder::new(&response[1..]);
-    let code = if coded { decoder.get_u32()? } else { 0 };
-    let message = decoder.get_string()?;
-    Ok(FitzError::Domain { code, message })
+    decode_domain_error(&mut decoder)
 }
 
 struct CompletionGuard<'a>(&'a AtomicU8);

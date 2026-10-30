@@ -233,19 +233,25 @@ pub(crate) fn decode_stream_response(operation: &str, buf: &[u8]) -> Result<Stre
 
             Ok(StreamResponsePayload { session_id, data })
         }
-        1 | 2 => {
-            let (code, message) = if status == 2 || operation == "READ" {
-                (dec.get_u32()?, dec.get_string()?)
-            } else {
-                (0, dec.get_string()?)
-            };
+        1 => {
+            let code = dec.get_u16()?;
+            let class = dec.get_u8()?;
+            let effect = dec.get_u8()?;
+            let message = dec.get_string()?;
+            if class > 10 || effect > 2 {
+                return Err(FitzError::Protocol(format!(
+                    "{operation} error response has invalid class or effect"
+                )));
+            }
             if dec.remaining() != 0 {
                 return Err(FitzError::Protocol(format!(
                     "{operation} error response has trailing data"
                 )));
             }
-            Err(FitzError::Domain {
+            Err(FitzError::DomainWire {
                 code,
+                class,
+                effect,
                 message: format!("{operation} failed: {message}"),
             })
         }

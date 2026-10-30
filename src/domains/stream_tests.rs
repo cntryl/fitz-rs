@@ -376,7 +376,8 @@ fn should_surface_malformed_stream_notify_json() {
 fn should_decode_stream_error_response() {
     // Arrange
     let mut buf = vec![1];
-    buf.extend_from_slice(&2010u32.to_be_bytes());
+    buf.extend_from_slice(&2003u16.to_be_bytes());
+    buf.extend_from_slice(&[3, 0]);
     buf.extend_from_slice(&(4u32).to_be_bytes());
     buf.extend_from_slice(b"nope");
 
@@ -384,7 +385,7 @@ fn should_decode_stream_error_response() {
     let err = decode_stream_response("READ", &buf).unwrap_err();
     // Assert
     assert!(err.to_string().contains("nope"));
-    assert!(matches!(err, FitzError::Domain { code: 2010, .. }));
+    assert!(matches!(err, FitzError::DomainWire { code: 2003, .. }));
 }
 
 #[test]

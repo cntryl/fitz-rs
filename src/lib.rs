@@ -34,6 +34,8 @@ mod error;
 mod notifications;
 mod observability;
 mod protocol;
+#[cfg(test)]
+mod test_support;
 
 pub use error::error_code;
 pub use error::{FitzError, FitzErrorKind, Result};
@@ -375,6 +377,15 @@ impl Client {
                 (connection.protocol_version(), connection.capability_bits())
             })
     }
+    /// The current effective negotiated message and in-flight limits.
+    #[must_use]
+    pub fn server_limits(&self) -> (usize, usize) {
+        self.inner
+            .connection
+            .lock()
+            .as_ref()
+            .map_or((0, 0), AsyncConnection::negotiated_limits)
+    }
     #[must_use]
     pub fn subscribe_state(&self) -> watch::Receiver<ConnectionState> {
         self.inner.state_tx.subscribe()
@@ -480,7 +491,7 @@ impl Client {
                 () = options.cancellation.cancelled() => return Err(FitzError::Canceled),
                 result = self.connect() => match result {
                     Ok(()) => return Ok(()),
-                    Err(error) if error.is_auth_failure() || matches!(error, FitzError::Closed) => return Err(error),
+                    Err(error) if error.is_auth_failure() || matches!(error, FitzError::Closed | FitzError::VersionMismatch { .. }) => return Err(error),
                     Err(_) => {}
                 }
             }

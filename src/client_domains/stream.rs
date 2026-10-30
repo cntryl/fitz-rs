@@ -3,7 +3,8 @@ use crate::codec::{PayloadDecoder, PayloadEncoder};
 use crate::domains::routes::{validate_fixed_route, validate_stream_selector};
 pub use crate::domains::stream::{
     StreamCommitMode, StreamCommitNotification, StreamDiscriminator, StreamFilterClause,
-    StreamFilterSet, StreamMetadata, StreamReadPage, StreamRecord,
+    StreamFilterSet, StreamFilteredReason, StreamMetadata, StreamReadCursor, StreamReadItem,
+    StreamReadPage, StreamRecord,
 };
 use crate::domains::stream::{
     decode_stream_metadata, decode_stream_notify, decode_stream_response, encode_stream_filter_set,
@@ -248,7 +249,7 @@ impl StreamSession {
         e.put_u64(self.session_id)
             .put_u64(expected_offset)
             .put_bytes(body);
-        optional_bytes(&mut e, metadata.filter(|v| !v.is_empty()));
+        optional_bytes(&mut e, metadata);
         if let Some(value) = discriminator.filter(|v| !v.as_str().is_empty()) {
             e.put_u8(1).put_string(value.as_str());
         } else {

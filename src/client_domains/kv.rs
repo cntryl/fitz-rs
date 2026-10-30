@@ -1,4 +1,4 @@
-use super::decode_ok;
+use super::{decode_domain_error, decode_ok};
 use crate::async_connection::{AsyncConnection, RestorableRegistration};
 use crate::codec::{PayloadDecoder, PayloadEncoder};
 use crate::domains::routes::{validate_fixed_route, validate_registration_pattern};
@@ -40,10 +40,7 @@ impl KvClient {
                 route: route.to_owned(),
                 closed: false,
             }),
-            1 => Err(FitzError::Domain {
-                code: decoder.get_u32()?,
-                message: decoder.get_string()?,
-            }),
+            1 => Err(decode_domain_error(&mut decoder)?),
             status => Err(FitzError::Protocol(format!(
                 "KV BEGIN returned status {status}"
             ))),
@@ -104,7 +101,7 @@ pub struct KvScanOptions {
     /// Selects descending key order and reverse directional bounds.
     pub reverse: bool,
     /// Resume strictly after `start_key` in the selected direction.
-    /// Requires the broker to advertise `CAP_KV_SCAN_EXCLUSIVE`.
+    /// Uses the Wire-2 SCAN options byte for reverse and exclusive bounds.
     pub start_exclusive: bool,
 }
 
@@ -166,10 +163,7 @@ impl KvTransaction {
                     Ok(KvGetResult::NotFound)
                 }
             }
-            1 => Err(FitzError::Domain {
-                code: decoder.get_u32()?,
-                message: decoder.get_string()?,
-            }),
+            1 => Err(decode_domain_error(&mut decoder)?),
             status => Err(FitzError::Protocol(format!(
                 "KV GET returned status {status}"
             ))),
@@ -248,15 +242,6 @@ impl KvTransaction {
     /// Returns an error when validation, transport, or broker processing fails.
     pub async fn scan(&self, options: &KvScanOptions) -> Result<KvScanPage> {
         self.ensure_open()?;
-        if options.start_exclusive
-            && self.connection.capability_bits()
-                & crate::protocol::message_type::CAP_KV_SCAN_EXCLUSIVE
-                == 0
-        {
-            return Err(FitzError::DomainError(
-                "broker did not advertise exclusive KV SCAN resume support".into(),
-            ));
-        }
         if scan_range_is_empty(
             options.start_key.as_deref(),
             options.end_key.as_deref(),
@@ -276,10 +261,7 @@ impl KvTransaction {
         } else {
             encoder.put_u8(0);
         }
-        encoder.put_u8(u8::from(options.reverse));
-        if options.start_exclusive {
-            encoder.put_u8(1);
-        }
+        encoder.put_u8(u8::from(options.reverse) | (u8::from(options.start_exclusive) << 1));
         let response = self
             .connection
             .request_replayable_in_generation(
@@ -348,8 +330,14 @@ fn scan_range_is_empty(start: Option<&[u8]>, end: Option<&[u8]>, reverse: bool) 
 
 fn decode_scan_response(payload: &[u8]) -> Result<KvScanPage> {
     let mut decoder = PayloadDecoder::new(payload);
-    if decoder.get_u8()? != 0 {
-        return Err(FitzError::DomainError("KV SCAN failed".into()));
+    match decoder.get_u8()? {
+        0 => {}
+        1 => return Err(decode_domain_error(&mut decoder)?),
+        status => {
+            return Err(FitzError::Protocol(format!(
+                "KV SCAN returned status {status}"
+            )));
+        }
     }
     let count = decoder.get_u32()?;
     let available = decoder.remaining();
@@ -550,10 +538,7 @@ fn decode_subscription_id(response: &[u8]) -> Result<u64> {
     let mut decoder = PayloadDecoder::new(response);
     match decoder.get_u8()? {
         0 => decoder.get_u64(),
-        1 => Err(FitzError::Domain {
-            code: decoder.get_u32()?,
-            message: decoder.get_string()?,
-        }),
+        1 => Err(decode_domain_error(&mut decoder)?),
         status => Err(FitzError::Protocol(format!(
             "KV SUBSCRIBE returned status {status}"
         ))),

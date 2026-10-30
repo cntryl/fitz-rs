@@ -1,7 +1,8 @@
+mod support;
 use cntryl_fitz::client_domains::stream::StreamCommitMode;
 use cntryl_fitz::{Client, KvDurability, Result, TransactionMode};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use support::Session;
+use tokio::net::TcpListener;
 
 #[tokio::test]
 async fn should_encode_explicit_commit_persistence() -> Result<()> {
@@ -9,9 +10,10 @@ async fn should_encode_explicit_commit_persistence() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let client = Client::anonymous(format!("tcp://{}", listener.local_addr()?)).build()?;
     let server = tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await?;
+        let (socket, _) = listener.accept().await?;
+        let mut socket = Session::new(socket);
         assert_eq!(read_frame(&mut socket).await?.0, 1);
-        write_frame(&mut socket, 4, &[0, 1, 0, 0, 0, 0]).await?;
+        write_frame(&mut socket, 2, &support::hello()).await?;
         for wire in [0, 1] {
             let mut begin = 10_u32.to_be_bytes().to_vec();
             begin.extend_from_slice(b"kv://r/a/x");
@@ -61,38 +63,9 @@ async fn should_encode_explicit_commit_persistence() -> Result<()> {
     Ok(())
 }
 
-async fn read_frame(stream: &mut TcpStream) -> std::io::Result<(u16, Vec<u8>)> {
-    let length = stream.read_u32().await? as usize;
-    let mut frame = vec![0; length];
-    stream.read_exact(&mut frame).await?;
-    let (message_type, header_length) = if frame[0] == 0xff {
-        (u16::from_be_bytes([frame[1], frame[2]]), 3)
-    } else {
-        (u16::from(frame[0]), 1)
-    };
-    Ok((message_type, frame[header_length + 2..].to_vec()))
+async fn read_frame(stream: &mut Session) -> std::io::Result<(u16, Vec<u8>)> {
+    stream.read_frame().await
 }
-
-async fn write_frame(
-    stream: &mut TcpStream,
-    message_type: u16,
-    payload: &[u8],
-) -> std::io::Result<()> {
-    let mut frame = vec![0xff];
-    frame.extend_from_slice(&message_type.to_be_bytes());
-    frame.extend_from_slice(
-        &u16::try_from(payload.len())
-            .expect("test payload length")
-            .to_be_bytes(),
-    );
-    frame.extend_from_slice(payload);
-    stream
-        .write_all(
-            &u32::try_from(frame.len())
-                .expect("test frame length")
-                .to_be_bytes(),
-        )
-        .await?;
-    stream.write_all(&frame).await?;
-    stream.flush().await
+async fn write_frame(stream: &mut Session, kind: u16, payload: &[u8]) -> std::io::Result<()> {
+    stream.write_frame(kind, payload).await
 }

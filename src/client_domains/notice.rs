@@ -1,4 +1,4 @@
-use super::decode_ok;
+use super::{decode_domain_error, decode_ok};
 use crate::async_connection::{AsyncConnection, RestorableRegistration};
 use crate::codec::{PayloadDecoder, PayloadEncoder};
 use crate::domains::routes::{validate_fixed_route, validate_registration_pattern};
@@ -46,6 +46,25 @@ impl NoticeClient {
         self.connection
             .send(message_type::NOTICE_PUBLISH, encoder.finish())
             .await
+    }
+
+    /// Publishes a notice and waits for a correlated broker acknowledgement.
+    ///
+    /// # Errors
+    /// Returns a broker or transport error when the publish is rejected or not acknowledged.
+    pub async fn publish_with_ack(&self, route: &str, body: &[u8]) -> Result<()> {
+        validate_fixed_route(route, "notice", 3)?;
+        let mut encoder = PayloadEncoder::new();
+        encoder
+            .put_string(route)
+            .put_u32(u32::try_from(body.len()).map_err(|_| FitzError::FrameTooLarge(body.len()))?)
+            .put_raw(body);
+        decode_ok(
+            &self
+                .connection
+                .request_with_flags(message_type::NOTICE_PUBLISH, encoder.finish(), 1)
+                .await?,
+        )
     }
 
     /// Performs the operation asynchronously.
@@ -125,10 +144,7 @@ fn decode_subscription_id(response: &[u8]) -> Result<u64> {
     match decoder.get_u8()? {
         0 => {}
         1 => {
-            return Err(FitzError::Domain {
-                code: decoder.get_u32()?,
-                message: decoder.get_string()?,
-            });
+            return Err(decode_domain_error(&mut decoder)?);
         }
         status => {
             return Err(FitzError::Protocol(format!(
@@ -238,30 +254,20 @@ impl Stream for NoticeSubscription {
 mod tests {
     use super::*;
     use crate::async_connection::AsyncConnectionOptions;
+    use crate::test_support::TestSession as TcpStream;
     use crate::{
         ConnectionState, FitzObservability, HeartbeatOptions, ReconnectPolicy, RetryPolicy,
     };
     use std::time::Duration;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::net::TcpListener;
     use tokio::sync::watch;
 
     async fn read_frame(stream: &mut TcpStream) -> (u16, Vec<u8>) {
-        let len = stream.read_u32().await.unwrap() as usize;
-        let mut frame = vec![0; len];
-        stream.read_exact(&mut frame).await.unwrap();
-        let (kind, start) = crate::codec::decode_message_frame(&frame).unwrap();
-        (kind, frame[start..].to_vec())
+        stream.read_frame().await
     }
 
     async fn write_frame(stream: &mut TcpStream, kind: u16, payload: &[u8]) {
-        let frame = crate::codec::try_encode_message_frame(kind, payload).unwrap();
-        stream
-            .write_u32(u32::try_from(frame.len()).unwrap())
-            .await
-            .unwrap();
-        stream.write_all(&frame).await.unwrap();
-        stream.flush().await.unwrap();
+        stream.write_frame(kind, payload).await;
     }
 
     #[tokio::test]
@@ -270,9 +276,15 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut stream = TcpStream::new(socket);
             assert_eq!(read_frame(&mut stream).await.0, message_type::CONNECT);
-            write_frame(&mut stream, message_type::SERVER_HELLO, &[0, 1, 0, 0, 0, 0]).await;
+            write_frame(
+                &mut stream,
+                message_type::HELLO,
+                &crate::codec::test_hello_payload(),
+            )
+            .await;
             let (subscribe, _) = read_frame(&mut stream).await;
             assert_eq!(subscribe, message_type::NOTICE_SUBSCRIBE);
             let mut response = PayloadEncoder::new();
@@ -321,9 +333,15 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut stream = TcpStream::new(socket);
             assert_eq!(read_frame(&mut stream).await.0, message_type::CONNECT);
-            write_frame(&mut stream, message_type::SERVER_HELLO, &[0, 1, 0, 0, 0, 0]).await;
+            write_frame(
+                &mut stream,
+                message_type::HELLO,
+                &crate::codec::test_hello_payload(),
+            )
+            .await;
             assert_eq!(
                 read_frame(&mut stream).await.0,
                 message_type::NOTICE_SUBSCRIBE

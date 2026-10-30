@@ -1,9 +1,11 @@
+mod support;
 use cntryl_fitz::{Client, ConnectionState, ReconnectPolicy, Result};
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use support::Session;
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio_tungstenite::tungstenite::Message;
@@ -11,6 +13,53 @@ use tokio_tungstenite::tungstenite::Message;
 const CONNECT: u16 = 1;
 const NOTICE_SUBSCRIBE: u16 = 501;
 const NOTICE_NOTIFY: u16 = 504;
+
+#[tokio::test]
+async fn should_stop_reconnecting_given_version_mismatch() -> Result<()> {
+    // Arrange
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (drop_tx, drop_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (first, _) = listener.accept().await.unwrap();
+        let mut first = Session::new(first);
+        assert_eq!(read_frame(&mut first).await.unwrap().0, CONNECT);
+        write_frame(&mut first, 2, &support::hello()).await.unwrap();
+        drop_rx.await.unwrap();
+        first.shutdown().await.unwrap();
+        let (second, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("reconnect did not start")
+            .unwrap();
+        let mut second = Session::new(second);
+        assert_eq!(read_frame(&mut second).await.unwrap().0, CONNECT);
+        let mut payload = 50_u16.to_be_bytes().to_vec();
+        put_bytes(&mut payload, b"no common wire version");
+        write_frame(&mut second, 3, &payload).await.unwrap();
+        tokio::time::timeout(Duration::from_millis(250), listener.accept())
+            .await
+            .is_err()
+    });
+    let client = Client::anonymous(format!("tcp://{address}"))
+        .reconnect_policy(ReconnectPolicy {
+            base_delay: Duration::from_millis(5),
+            maximum_delay: Duration::from_millis(5),
+            maximum_attempts: 5,
+            ..ReconnectPolicy::default()
+        })
+        .build()?;
+    client.connect().await?;
+
+    // Act
+    drop_tx.send(()).unwrap();
+    let no_more_attempts = server.await.expect("server task panicked");
+
+    // Assert
+    assert!(no_more_attempts);
+    assert_eq!(client.state(), ConnectionState::Disconnected);
+    client.close().await?;
+    Ok(())
+}
 
 #[tokio::test]
 async fn should_restore_notice_subscription_given_real_transport_loss() -> Result<()> {
@@ -105,17 +154,19 @@ async fn run_reconnect_server(
     listener: TcpListener,
     drop_first_rx: oneshot::Receiver<()>,
 ) -> std::io::Result<()> {
-    let (mut first, _) = listener.accept().await?;
+    let (first, _) = listener.accept().await?;
+    let mut first = Session::new(first);
     assert_eq!(read_frame(&mut first).await?.0, CONNECT);
-    write_frame(&mut first, 4, &[0, 1, 0, 0, 0, 0]).await?;
+    write_frame(&mut first, 2, &support::hello()).await?;
     assert_eq!(read_frame(&mut first).await?.0, NOTICE_SUBSCRIBE);
     write_frame(&mut first, NOTICE_SUBSCRIBE, &subscribe_response(11)).await?;
     let _ = drop_first_rx.await;
     first.shutdown().await?;
 
-    let (mut second, _) = listener.accept().await?;
+    let (second, _) = listener.accept().await?;
+    let mut second = Session::new(second);
     assert_eq!(read_frame(&mut second).await?.0, CONNECT);
-    write_frame(&mut second, 4, &[0, 1, 0, 0, 0, 0]).await?;
+    write_frame(&mut second, 2, &support::hello()).await?;
     assert_eq!(read_frame(&mut second).await?.0, NOTICE_SUBSCRIBE);
     write_frame(&mut second, NOTICE_SUBSCRIBE, &subscribe_response(29)).await?;
     let mut notification = Vec::new();
@@ -136,7 +187,7 @@ async fn run_websocket_reconnect_server(
         .await
         .map_err(std::io::Error::other)?;
     assert_eq!(read_websocket_frame(&mut first).await?.0, CONNECT);
-    write_websocket_frame(&mut first, 4, &[0, 1, 0, 0, 0, 0]).await?;
+    write_websocket_frame(&mut first, 2, &support::hello()).await?;
     assert_eq!(read_websocket_frame(&mut first).await?.0, NOTICE_SUBSCRIBE);
     write_websocket_frame(&mut first, NOTICE_SUBSCRIBE, &subscribe_response(11)).await?;
     let _ = drop_first_rx.await;
@@ -147,7 +198,7 @@ async fn run_websocket_reconnect_server(
         .await
         .map_err(std::io::Error::other)?;
     assert_eq!(read_websocket_frame(&mut second).await?.0, CONNECT);
-    write_websocket_frame(&mut second, 4, &[0, 1, 0, 0, 0, 0]).await?;
+    write_websocket_frame(&mut second, 2, &support::hello()).await?;
     assert_eq!(read_websocket_frame(&mut second).await?.0, NOTICE_SUBSCRIBE);
     write_websocket_frame(&mut second, NOTICE_SUBSCRIBE, &subscribe_response(29)).await?;
     let mut notification = Vec::new();
@@ -187,40 +238,11 @@ fn put_bytes(target: &mut Vec<u8>, value: &[u8]) {
     target.extend_from_slice(value);
 }
 
-async fn read_frame(stream: &mut TcpStream) -> std::io::Result<(u16, Vec<u8>)> {
-    let length = stream.read_u32().await? as usize;
-    let mut frame = vec![0; length];
-    stream.read_exact(&mut frame).await?;
-    let (message_type, header_length) = if frame[0] == 0xff {
-        (u16::from_be_bytes([frame[1], frame[2]]), 3)
-    } else {
-        (u16::from(frame[0]), 1)
-    };
-    Ok((message_type, frame[header_length + 2..].to_vec()))
+async fn read_frame(stream: &mut Session) -> std::io::Result<(u16, Vec<u8>)> {
+    stream.read_frame().await
 }
-
-async fn write_frame(
-    stream: &mut TcpStream,
-    message_type: u16,
-    payload: &[u8],
-) -> std::io::Result<()> {
-    let mut frame = vec![0xff];
-    frame.extend_from_slice(&message_type.to_be_bytes());
-    frame.extend_from_slice(
-        &u16::try_from(payload.len())
-            .expect("test payload length")
-            .to_be_bytes(),
-    );
-    frame.extend_from_slice(payload);
-    stream
-        .write_all(
-            &u32::try_from(frame.len())
-                .expect("test frame length")
-                .to_be_bytes(),
-        )
-        .await?;
-    stream.write_all(&frame).await?;
-    stream.flush().await
+async fn write_frame(stream: &mut Session, kind: u16, payload: &[u8]) -> std::io::Result<()> {
+    stream.write_frame(kind, payload).await
 }
 
 async fn read_websocket_frame(
@@ -247,23 +269,15 @@ async fn write_websocket_frame(
         .map_err(std::io::Error::other)
 }
 
-fn encode_frame(message_type: u16, payload: &[u8]) -> Vec<u8> {
-    let mut frame = vec![0xff];
-    frame.extend_from_slice(&message_type.to_be_bytes());
-    frame.extend_from_slice(
-        &u16::try_from(payload.len())
-            .expect("test payload length")
-            .to_be_bytes(),
-    );
-    frame.extend_from_slice(payload);
+fn encode_frame(kind: u16, payload: &[u8]) -> Vec<u8> {
+    let correlation = u64::from(kind == NOTICE_SUBSCRIBE);
+    let mut frame = support::encode(kind, correlation, payload);
+    if correlation != 0 {
+        frame[2] = 2;
+    }
     frame
 }
-
 fn decode_frame(frame: &[u8]) -> (u16, Vec<u8>) {
-    let (message_type, header_length) = if frame[0] == 0xff {
-        (u16::from_be_bytes([frame[1], frame[2]]), 3)
-    } else {
-        (u16::from(frame[0]), 1)
-    };
-    (message_type, frame[header_length + 2..].to_vec())
+    let (kind, _, payload) = support::decode(frame);
+    (kind, payload)
 }
