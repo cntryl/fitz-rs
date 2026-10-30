@@ -21,7 +21,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  FITZ_BROKER_IMAGE: ghcr.io/cntryl/fitz:${{ inputs.broker_tag || 'main' }}
+  FITZ_BROKER_IMAGE: ghcr.io/cntryl/fitz:${{ inputs.broker_tag || 'develop' }}
 
 jobs:
   spec:
