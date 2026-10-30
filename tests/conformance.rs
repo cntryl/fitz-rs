@@ -250,7 +250,7 @@ async fn exercise_timeout_and_reuse(
         accepted_tx
             .send(())
             .expect("caller is waiting for the request");
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        request.cancellation.cancelled().await;
         drop(request);
         Ok::<(), FitzError>(())
     });
@@ -290,6 +290,7 @@ async fn exercise_cancellation_and_reuse(
         accepted_tx
             .send(())
             .expect("caller is waiting for the request");
+        canceled.cancellation.cancelled().await;
         drop(canceled);
         let mut next = worker.next().await.expect("worker stream closed")?;
         next.respond(b"after-cancel", true).await
