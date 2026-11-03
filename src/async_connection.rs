@@ -806,6 +806,11 @@ fn emit_lifecycle(supervisor: &Supervisor, name: &'static str) {
 }
 
 fn apply_server_hello(supervisor: &Supervisor, payload: &[u8], capability_mask: u16) -> Result<()> {
+    if supervisor.capabilities.load(Ordering::Acquire) != 0 {
+        return Err(FitzError::Protocol(
+            "repeated HELLO cannot renegotiate an established session".into(),
+        ));
+    }
     let mut decoder = crate::codec::PayloadDecoder::new(payload);
     let version = decoder.get_u16()?;
     let bits = decoder.get_u32()?;

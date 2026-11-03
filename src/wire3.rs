@@ -152,4 +152,38 @@ mod tests {
         // Assert
         assert_eq!(payload.as_ptr(), core.as_ptr());
     }
+
+    fn from_hex(hex: &str) -> Vec<u8> {
+        hex.as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn should_reject_every_truncated_prefix_of_wire_three_hello() {
+        // Arrange
+        let line = include_str!("../tests/fixtures/wire3_vectors.txt")
+            .lines()
+            .find(|line| line.starts_with("hello_wire3_queue_capabilities "))
+            .unwrap();
+        let frame = from_hex(line.split_once(' ').unwrap().1);
+        let payload = &frame[15..];
+        // Act
+        let rejected = (0..payload.len()).all(|size| decode(&payload[..size], 2, 4).is_err());
+        // Assert
+        assert!(rejected);
+    }
+
+    #[test]
+    fn should_skip_repeated_unknown_fields_in_any_order() {
+        // Arrange
+        let payload = from_hex("000000026869100100000000100000000000100000000000");
+        // Act
+        let (core, _) = decode(&payload, 104, 4).unwrap();
+        // Assert
+        assert_eq!(core, b"hi");
+    }
 }

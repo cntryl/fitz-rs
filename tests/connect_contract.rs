@@ -1,7 +1,51 @@
-use cntryl_fitz::{Client, ConnectWhenReadyOptions, FitzError, Result};
+use cntryl_fitz::{
+    Client, ConnectWhenReadyOptions, ConnectionState, FitzError, ReconnectPolicy, Result,
+};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+
+#[tokio::test]
+async fn should_close_session_when_broker_repeats_hello() -> Result<()> {
+    // Arrange
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let client = Client::anonymous(format!("tcp://{}", listener.local_addr()?))
+        .reconnect_policy(ReconnectPolicy {
+            enabled: false,
+            ..ReconnectPolicy::default()
+        })
+        .build()?;
+    let (repeat, repeat_requested) = tokio::sync::oneshot::channel();
+    let (finish, finished) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let length = stream.read_u32().await.unwrap();
+        let mut connect = vec![0; usize::try_from(length).unwrap()];
+        stream.read_exact(&mut connect).await.unwrap();
+        stream.write_all(&hello_frame()).await.unwrap();
+        repeat_requested.await.unwrap();
+        stream.write_all(&hello_frame()).await.unwrap();
+        let _ = finished.await;
+    });
+    client.connect().await?;
+    // Act
+    repeat.send(()).unwrap();
+    let disconnected = tokio::time::timeout(Duration::from_millis(500), async {
+        while client.state() == ConnectionState::Authenticated {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+    // Assert
+    assert!(
+        disconnected.is_ok(),
+        "repeated HELLO must close the session"
+    );
+    let _ = finish.send(());
+    client.close().await?;
+    server.await.expect("server task panicked");
+    Ok(())
+}
 
 #[test]
 fn should_accept_service_name_at_utf8_byte_limit() {

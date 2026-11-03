@@ -1,4 +1,4 @@
-//! Broker-side transport fixture that echoes each request's wire-2 correlation.
+//! Broker-side transport fixture that echoes each request's wire-3 correlation.
 
 use crate::codec::{decode_frame_header, try_encode_frame};
 use parking_lot::Mutex;
