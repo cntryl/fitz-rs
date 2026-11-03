@@ -28,6 +28,7 @@ pub mod message_type {
     pub const QUEUE_SUBSCRIBE: u16 = 207;
     pub const QUEUE_UNSUBSCRIBE: u16 = 208;
     pub const QUEUE_NOTIFY: u16 = 209;
+    pub const QUEUE_NACK: u16 = 210;
 
     // RPC domain (300-399)
     pub const RPC_SUBSCRIBE: u16 = 300;

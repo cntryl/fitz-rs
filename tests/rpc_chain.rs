@@ -101,7 +101,7 @@ impl Chain {
         let clients = [client(&endpoint)?, client(&endpoint)?, client(&endpoint)?];
         for client in &clients {
             client.connect().await?;
-            assert_eq!(client.server_capabilities().0, 2);
+            assert_eq!(client.server_capabilities().0, 3);
         }
         let suffix = uuid::Uuid::new_v4();
         let route_b = format!("rpc://chain/app/b-{suffix}");

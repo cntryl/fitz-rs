@@ -36,6 +36,7 @@ mod observability;
 mod protocol;
 #[cfg(test)]
 mod test_support;
+mod wire3;
 
 pub use error::error_code;
 pub use error::{FitzError, FitzErrorKind, Result};
@@ -376,6 +377,16 @@ impl Client {
             .map_or((0, 0), |connection| {
                 (connection.protocol_version(), connection.capability_bits())
             })
+    }
+
+    /// Numeric capabilities negotiated for the current session.
+    #[must_use]
+    pub fn capability_ids(&self) -> Vec<u32> {
+        self.inner
+            .connection
+            .lock()
+            .as_ref()
+            .map_or_else(Vec::new, AsyncConnection::capability_ids)
     }
     /// The current effective negotiated message and in-flight limits.
     #[must_use]

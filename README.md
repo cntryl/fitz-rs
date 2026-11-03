@@ -1,12 +1,14 @@
 # cntryl-fitz
 
+Current release candidate: **0.4.0**, requiring Fitz **0.4.0 / Wire 3**. See [Wire 3 migration](WIRE3_MIGRATION.md) for Queue TTL, NACK, negotiation, and coordinated upgrade guidance.
+
 The Rust SDK for [Fitz](https://github.com/cntryl/fitz). The crate uses the
 `cntryl_fitz` import name, treats tokens and routes as opaque values, and
 supports TCP and binary WebSocket transports.
 
 ```toml
 [dependencies]
-cntryl-fitz = "0.2"
+cntryl-fitz = "0.4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -29,10 +31,10 @@ async fn main() -> Result<()> {
 }
 ```
 
-`service_name` is optional and is sent in the Wire-2 `CONNECT` payload with the
-client build identity. Capability bits are reserved as zero in Wire 2.
+`service_name` is optional and is sent in the Wire 3 `CONNECT` payload with the
+client build identity. Legacy capability bits remain zero; numeric capability IDs are negotiated separately.
 
-`connect()` waits for Wire-2 `HELLO` on both transports within the configured
+`connect()` waits for Wire 3 `HELLO` on both transports within the configured
 connection timeout, so the negotiated message-size and in-flight-request limits
 are available before registration.
 
@@ -87,7 +89,7 @@ Workers can link a downstream call to an inbound request with
 `rpc.call_from_request(&request, route, body).await?`. This carries the current
 remaining budget and ends the downstream stream when the parent request is
 cancelled. Dropping a response stream also sends best-effort cancellation using
-the Wire-2 RPC cancellation messages.
+the Wire 3 RPC cancellation messages.
 
 RPC timeouts are remaining end-to-end budgets (up to one day). Worker budgets
 start at transport receipt, include local buffering time, and cancel

@@ -1,12 +1,11 @@
-# Fitz Client Specification
+# Canonical Client Specification
 
-> Provenance: the canonical Fitz client protocol documentation lives in the server repository under [../fitz/docs/clients](../fitz/docs/clients). This SDK-local file is a convenience entry point only and must stay aligned with that canonical source.
+This SDK implements Fitz 0.4.0 / Wire 3. The server repository owns protocol behavior:
 
-Use the following canonical documents as normative for `fitz-rs`:
+- [Client specification](https://github.com/cntryl/fitz/blob/main/docs/clients/client-spec.md)
+- [Wire 3 framing and negotiation](https://github.com/cntryl/fitz/blob/main/docs/clients/spec/wire-routing-3.md)
+- [Extension and capability registry](https://github.com/cntryl/fitz/blob/main/docs/clients/spec/extension-registry.md)
+- [Client implementation guide](https://github.com/cntryl/fitz/blob/main/docs/clients/client-implementation-guide.md)
+- [Shared conformance scenarios](https://github.com/cntryl/fitz/blob/main/docs/clients/cross-language-conformance-suite.yaml)
 
-- [CLIENT_SPEC.md](../fitz/docs/clients/CLIENT_SPEC.md)
-- [CLIENT_ACCEPTANCE_CRITERIA.md](../fitz/docs/clients/CLIENT_ACCEPTANCE_CRITERIA.md)
-- [CLIENT_IMPLEMENTATION_GUIDE.md](../fitz/docs/clients/CLIENT_IMPLEMENTATION_GUIDE.md)
-- [CONNECTION_FLOW.md](../fitz/docs/clients/CONNECTION_FLOW.md)
-
-This repository should not maintain an independent copy of the client protocol specification.
+See [Wire 3 migration](WIRE3_MIGRATION.md) for the SDK's Queue TTL and NACK APIs and coordinated upgrade guidance.

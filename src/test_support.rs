@@ -1,4 +1,4 @@
-//! Broker-side transport fixture that echoes each request's wire-2 correlation.
+//! Broker-side transport fixture that echoes each request's wire-3 correlation.
 
 use crate::codec::{decode_frame_header, try_encode_frame};
 use parking_lot::Mutex;
@@ -107,7 +107,17 @@ async fn read<R: AsyncRead + Unpin>(reader: &mut R, pending: &Pending) -> (u16, 
             .or_default()
             .push_back(header.correlation_id);
     }
-    (header.message_type, frame[header.payload_start..].to_vec())
+    (
+        header.message_type,
+        crate::wire3::decode(
+            &frame[header.payload_start..],
+            header.message_type,
+            header.flags,
+        )
+        .unwrap()
+        .0
+        .to_vec(),
+    )
 }
 
 async fn write<W: AsyncWrite + Unpin>(
@@ -134,6 +144,14 @@ async fn write<W: AsyncWrite + Unpin>(
         crate::codec::RESPONSE_FINAL
     } else {
         0
+    };
+    let extended;
+    let (payload, flags) = if kind == 2 {
+        extended =
+            crate::wire3::encode(payload, &[(1, &crate::wire3::CLIENT_CAPABILITIES)]).unwrap();
+        (extended.as_slice(), crate::wire3::EXTENSIONS_PRESENT)
+    } else {
+        (payload, flags)
     };
     let frame = try_encode_frame(kind, flags, correlation, payload).unwrap();
     writer

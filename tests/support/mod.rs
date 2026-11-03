@@ -4,7 +4,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 pub fn hello() -> Vec<u8> {
-    let mut payload = 2_u16.to_be_bytes().to_vec();
+    let mut payload = 3_u16.to_be_bytes().to_vec();
     payload.extend_from_slice(&0_u32.to_be_bytes());
     payload.extend_from_slice(&1_048_576_u32.to_be_bytes());
     payload.extend_from_slice(&64_u32.to_be_bytes());
@@ -70,8 +70,15 @@ impl DerefMut for Session {
 }
 
 pub fn encode(kind: u16, correlation: u64, payload: &[u8]) -> Vec<u8> {
+    let extended;
+    let payload = if kind == 2 {
+        extended = extend(payload);
+        extended.as_slice()
+    } else {
+        payload
+    };
     let mut frame = kind.to_be_bytes().to_vec();
-    frame.push(0);
+    frame.push(if kind == 2 { 4 } else { 0 });
     frame.extend_from_slice(&correlation.to_be_bytes());
     frame.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
     frame.extend_from_slice(payload);
@@ -79,10 +86,25 @@ pub fn encode(kind: u16, correlation: u64, payload: &[u8]) -> Vec<u8> {
 }
 pub fn decode(frame: &[u8]) -> (u16, u64, Vec<u8>) {
     assert!(frame.len() >= 15);
-    assert_eq!(frame[2], 0);
+    assert_eq!(frame[2] & !4, 0);
     let kind = u16::from_be_bytes(frame[..2].try_into().unwrap());
     let correlation = u64::from_be_bytes(frame[3..11].try_into().unwrap());
     let length = usize::try_from(u32::from_be_bytes(frame[11..15].try_into().unwrap())).unwrap();
     assert_eq!(frame.len(), 15 + length);
-    (kind, correlation, frame[15..].to_vec())
+    let payload = if frame[2] & 4 != 0 {
+        let length =
+            usize::try_from(u32::from_be_bytes(frame[15..19].try_into().unwrap())).unwrap();
+        &frame[19..19 + length]
+    } else {
+        &frame[15..]
+    };
+    (kind, correlation, payload.to_vec())
+}
+
+// Encodes the required explicit numeric capability list on broker handshakes.
+pub fn extend(core: &[u8]) -> Vec<u8> {
+    let mut value = u32::try_from(core.len()).unwrap().to_be_bytes().to_vec();
+    value.extend_from_slice(core);
+    value.extend_from_slice(&[0, 1, 0, 0, 0, 10, 0, 2, 0, 0, 0, 1, 0, 0, 0, 2]);
+    value
 }

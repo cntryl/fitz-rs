@@ -228,6 +228,25 @@ impl AsyncConnection {
             .expect("capability bits were masked to u32")
     }
 
+    pub(crate) fn capability_ids(&self) -> Vec<u32> {
+        // Local session snapshot: zero legacy bits 0..31, version 32..47, active IDs 48..63.
+        let mask = self.capabilities.load(Ordering::Acquire) >> 48;
+        (1..=2).filter(|id| mask & (1 << id) != 0).collect()
+    }
+
+    pub(crate) fn require_capability(&self, id: u32) -> Result<()> {
+        if matches!(id, 1 | 2)
+            && self.protocol_version() == 3
+            && self.capabilities.load(Ordering::Acquire) >> 48 & (1 << id) != 0
+        {
+            Ok(())
+        } else {
+            Err(FitzError::Protocol(format!(
+                "capability {id} was not negotiated"
+            )))
+        }
+    }
+
     pub(crate) fn negotiated_limits(&self) -> (usize, usize) {
         (
             usize::try_from(self.max_message_bytes.load(Ordering::Acquire)).unwrap_or(usize::MAX),
@@ -342,10 +361,11 @@ impl AsyncConnection {
         Err(FitzError::ConnectionClosed)
     }
 
-    pub(crate) async fn request_confirmed_negative(
+    pub(crate) async fn request_confirmed_negative_with_flags(
         &self,
         message_type: u16,
         payload: Vec<u8>,
+        flags: u8,
         retryable_rejection: impl Fn(&[u8]) -> bool,
     ) -> Result<Vec<u8>> {
         let attempts = if self.retry.enabled {
@@ -355,7 +375,9 @@ impl AsyncConnection {
         };
         let mut delay = self.retry.base_delay;
         for attempt in 1..=attempts {
-            let response = self.request(message_type, payload.clone()).await?;
+            let response = self
+                .request_with_flags(message_type, payload.clone(), flags)
+                .await?;
             if attempt == attempts || !retryable_rejection(&response) {
                 return Ok(response);
             }
@@ -743,8 +765,8 @@ async fn open_session(supervisor: &Supervisor) -> Result<Session> {
     emit_lifecycle(supervisor, "auth_start");
     let mut connect = crate::codec::PayloadEncoder::new();
     connect
-        .put_u16(2)
-        .put_u16(2)
+        .put_u16(3)
+        .put_u16(3)
         .put_u32(0)
         .put_string(&token)
         .put_string(supervisor.service_name.as_deref().unwrap_or(""))
@@ -752,7 +774,10 @@ async fn open_session(supervisor: &Supervisor) -> Result<Session> {
     write_session(
         &mut session,
         crate::protocol::message_type::CONNECT,
-        connect.finish(),
+        crate::wire3::encode(
+            &connect.finish(),
+            &[(1, &crate::wire3::CLIENT_CAPABILITIES)],
+        )?,
     )
     .await?;
     settle_authentication(supervisor, &mut session).await?;
@@ -780,16 +805,26 @@ fn emit_lifecycle(supervisor: &Supervisor, name: &'static str) {
     }
 }
 
-fn apply_server_hello(supervisor: &Supervisor, payload: &[u8]) -> Result<()> {
+fn apply_server_hello(supervisor: &Supervisor, payload: &[u8], capability_mask: u16) -> Result<()> {
+    if supervisor.capabilities.load(Ordering::Acquire) != 0 {
+        return Err(FitzError::Protocol(
+            "repeated HELLO cannot renegotiate an established session".into(),
+        ));
+    }
     let mut decoder = crate::codec::PayloadDecoder::new(payload);
     let version = decoder.get_u16()?;
     let bits = decoder.get_u32()?;
     let max_message_bytes = decoder.get_u32()?;
     let max_in_flight = decoder.get_u32()?;
     let _session_id = decoder.get_u64()?;
-    if version != 2 || max_message_bytes < 15 || max_in_flight == 0 {
+    if version != 3
+        || bits != 0
+        || !decoder.is_empty()
+        || max_message_bytes < 15
+        || max_in_flight == 0
+    {
         return Err(FitzError::Protocol(
-            "broker advertised invalid Wire-2 limits".into(),
+            "broker advertised invalid Wire-3 limits".into(),
         ));
     }
     let max_message_bytes = usize::try_from(max_message_bytes)
@@ -798,7 +833,7 @@ fn apply_server_hello(supervisor: &Supervisor, payload: &[u8]) -> Result<()> {
     let max_in_flight =
         u64::from(max_in_flight).min(supervisor.max_in_flight.load(Ordering::Acquire));
     supervisor.capabilities.store(
-        (u64::from(version) << 32) | u64::from(bits),
+        (u64::from(capability_mask) << 48) | (u64::from(version) << 32),
         Ordering::Release,
     );
     supervisor.max_message_bytes.store(
@@ -866,13 +901,17 @@ fn process_auth_frame(
     header: crate::codec::FrameHeader,
     payload: &[u8],
 ) -> Result<()> {
-    if header.flags != 0 || header.correlation_id != 0 {
+    let (payload, capability_mask) =
+        crate::wire3::decode(payload, header.message_type, header.flags)?;
+    if header.flags & !crate::wire3::EXTENSIONS_PRESENT != 0 || header.correlation_id != 0 {
         return Err(FitzError::Protocol(
             "authentication control frame has nonzero flags or correlation".into(),
         ));
     }
     match header.message_type {
-        crate::protocol::message_type::HELLO => apply_server_hello(supervisor, payload),
+        crate::protocol::message_type::HELLO => {
+            apply_server_hello(supervisor, payload, capability_mask)
+        }
         crate::protocol::message_type::CONNECT_REJECTED => {
             let mut decoder = crate::codec::PayloadDecoder::new(payload);
             let code = decoder.get_u16()?;
@@ -1102,15 +1141,13 @@ async fn run_websocket(
 }
 
 async fn write_session(session: &mut Session, message_type: u16, payload: Vec<u8>) -> Result<()> {
+    let frame = try_encode_frame(message_type, crate::wire3::EXTENSIONS_PRESENT, 0, &payload)?;
     match session {
-        Session::Tcp(stream) => write_tcp(stream, message_type, payload).await,
-        Session::WebSocket(socket) => {
-            let frame = try_encode_message_frame(message_type, &payload)?;
-            socket
-                .send(Message::Binary(frame.into()))
-                .await
-                .map_err(|e| FitzError::Transport(e.to_string()))
-        }
+        Session::Tcp(stream) => write_tcp_frame(stream, &frame).await,
+        Session::WebSocket(socket) => socket
+            .send(Message::Binary(frame.into()))
+            .await
+            .map_err(|e| FitzError::Transport(e.to_string())),
     }
 }
 
@@ -1250,17 +1287,21 @@ fn decode_incoming(supervisor: &Supervisor, frame: &[u8]) -> Result<Vec<Incoming
         return Err(FitzError::FrameTooLarge(frame.len()));
     }
     let header = decode_frame_header(frame)?;
-    let payload = &frame[header.payload_start..];
+    let (payload, capability_mask) = crate::wire3::decode(
+        &frame[header.payload_start..],
+        header.message_type,
+        header.flags,
+    )?;
     match header.message_type {
         crate::protocol::message_type::HELLO => {
-            if header.flags != 0 || header.correlation_id != 0 {
+            if header.flags != crate::wire3::EXTENSIONS_PRESENT || header.correlation_id != 0 {
                 return Err(FitzError::Protocol("HELLO has flags or correlation".into()));
             }
-            apply_server_hello(supervisor, payload)?;
+            apply_server_hello(supervisor, payload, capability_mask)?;
             return Ok(Vec::new());
         }
         crate::protocol::message_type::GOAWAY => {
-            if header.flags != 0 || header.correlation_id != 0 {
+            if header.flags & !crate::wire3::EXTENSIONS_PRESENT != 0 || header.correlation_id != 0 {
                 return Err(FitzError::Protocol(
                     "GOAWAY has flags or correlation".into(),
                 ));
@@ -1532,10 +1573,14 @@ mod tests {
             drop(first);
             let (mut second, _) = listener.accept().await.unwrap();
             let _ = read_tcp(&mut second).await.unwrap();
-            write_tcp(
-                &mut second,
+            write_session(
+                &mut Session::Tcp(second),
                 crate::protocol::message_type::HELLO,
-                crate::codec::test_hello_payload(),
+                crate::wire3::encode(
+                    &crate::codec::test_hello_payload(),
+                    &[(1, &crate::wire3::CLIENT_CAPABILITIES)],
+                )
+                .unwrap(),
             )
             .await
             .unwrap();
