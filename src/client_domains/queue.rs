@@ -17,6 +17,13 @@ pub struct QueueClient {
     connection: AsyncConnection,
 }
 
+/// Optional publication controls. Queue persistence remains best effort.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct QueueEnqueueOptions {
+    pub delay_seconds: Option<u64>,
+    pub ttl_hours: Option<std::num::NonZeroU32>,
+}
+
 impl QueueClient {
     pub(crate) fn new(connection: AsyncConnection) -> Self {
         Self { connection }
@@ -32,13 +39,41 @@ impl QueueClient {
         body: &[u8],
         delay_seconds: Option<u64>,
     ) -> Result<u64> {
+        self.enqueue_with_options(
+            route,
+            body,
+            QueueEnqueueOptions {
+                delay_seconds,
+                ttl_hours: None,
+            },
+        )
+        .await
+    }
+
+    /// Enqueues with an optional positive TTL override in hours.
+    ///
+    /// # Errors
+    /// Fails if TTL was requested without negotiated support or the request fails.
+    pub async fn enqueue_with_options(
+        &self,
+        route: &str,
+        body: &[u8],
+        options: QueueEnqueueOptions,
+    ) -> Result<u64> {
         validate_fixed_route(route, "queue", 3)?;
-        let payload = Self::encode_enqueue(route, body, delay_seconds);
+        let mut payload = Self::encode_enqueue(route, body, options.delay_seconds);
+        let mut flags = 0;
+        if let Some(ttl) = options.ttl_hours {
+            self.connection.require_capability(1)?;
+            payload = crate::wire3::encode(&payload, &[(1, &ttl.get().to_be_bytes())])?;
+            flags = crate::wire3::EXTENSIONS_PRESENT;
+        }
         let response = self
             .connection
-            .request_confirmed_negative(
+            .request_confirmed_negative_with_flags(
                 message_type::QUEUE_ENQUEUE,
                 payload,
+                flags,
                 is_retryable_enqueue_rejection,
             )
             .await?;
@@ -314,6 +349,34 @@ impl QueueItem {
             &self
                 .connection
                 .request(message_type::QUEUE_COMPLETE, encoder.finish())
+                .await?,
+        )?;
+        self.state.store(2, Ordering::Release);
+        drop(completion);
+        Ok(())
+    }
+
+    /// Relinquishes this reservation with an optional visibility delay in seconds.
+    ///
+    /// # Errors
+    /// Fails for a stale handle, unavailable capability, or broker rejection.
+    pub async fn nack(&self, visibility_seconds: u64) -> Result<()> {
+        self.ensure_current()?;
+        self.connection.require_capability(2)?;
+        self.state
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| FitzError::StaleHandle)?;
+        let completion = CompletionGuard(&self.state);
+        let mut encoder = PayloadEncoder::new();
+        encoder
+            .put_string(&self.route)
+            .put_u64(self.id)
+            .put_u64(self.token)
+            .put_u64(visibility_seconds);
+        decode_queue_plain_ok(
+            &self
+                .connection
+                .request(message_type::QUEUE_NACK, encoder.finish())
                 .await?,
         )?;
         self.state.store(2, Ordering::Release);

@@ -154,13 +154,13 @@ pub const FRAME_HEADER_LEN: usize = 15;
 pub const MAX_MESSAGE_SIZE: usize = 1_048_576;
 pub const ACK_REQUESTED: u8 = 1;
 pub const RESPONSE_FINAL: u8 = 2;
-const VALID_FLAGS: u8 = ACK_REQUESTED | RESPONSE_FINAL;
+const VALID_FLAGS: u8 = ACK_REQUESTED | RESPONSE_FINAL | crate::wire3::EXTENSIONS_PRESENT;
 
 #[cfg(test)]
 pub(crate) fn test_hello_payload() -> Vec<u8> {
     let mut encoder = PayloadEncoder::new();
     encoder
-        .put_u16(2)
+        .put_u16(3)
         .put_u32(0)
         .put_u32(u32::try_from(MAX_MESSAGE_SIZE).expect("frame limit fits in u32"))
         .put_u32(256)
@@ -176,18 +176,18 @@ pub struct FrameHeader {
     pub payload_start: usize,
 }
 
-/// Encode one Wire-2 message frame with an empty header correlation.
+/// Encode one Wire 3 message frame with an empty header correlation.
 #[cfg(test)]
 pub fn encode_message_frame(msg_type: u16, payload: &[u8]) -> Vec<u8> {
-    try_encode_message_frame(msg_type, payload).expect("payload fits Wire-2 message limit")
+    try_encode_message_frame(msg_type, payload).expect("payload fits Wire 3 message limit")
 }
 
-/// Checked Wire-2 message frame encoding used by transport-facing code.
+/// Checked Wire 3 message frame encoding used by transport-facing code.
 pub fn try_encode_message_frame(msg_type: u16, payload: &[u8]) -> Result<Vec<u8>> {
     try_encode_frame(msg_type, 0, 0, payload)
 }
 
-/// Encode one Wire-2 message with explicit flags and correlation.
+/// Encode one Wire 3 message with explicit flags and correlation.
 pub fn try_encode_frame(
     msg_type: u16,
     flags: u8,
@@ -216,10 +216,10 @@ pub fn try_encode_frame(
     Ok(frame)
 }
 
-/// Decode and validate one Wire-2 message header and exact payload length.
+/// Decode and validate one Wire 3 message header and exact payload length.
 pub fn decode_frame_header(buf: &[u8]) -> Result<FrameHeader> {
     if buf.len() < FRAME_HEADER_LEN {
-        return Err(FitzError::Codec("truncated Wire-2 frame header".into()));
+        return Err(FitzError::Codec("truncated Wire 3 frame header".into()));
     }
     let message_type = u16::from_be_bytes([buf[0], buf[1]]);
     let flags = buf[2];
@@ -237,7 +237,7 @@ pub fn decode_frame_header(buf: &[u8]) -> Result<FrameHeader> {
     }
     if buf.len() != expected {
         return Err(FitzError::Codec(
-            "Wire-2 frame length does not match payload size".into(),
+            "Wire 3 frame length does not match payload size".into(),
         ));
     }
     Ok(FrameHeader {

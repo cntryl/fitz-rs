@@ -2,12 +2,6 @@ name: Spec
 
 on:
   workflow_dispatch:
-    inputs:
-      broker_tag:
-        description: Fitz broker image tag
-        type: choice
-        options: [0.3.0, main, develop]
-        default: 0.3.0
   push:
   pull_request:
   schedule:
@@ -21,7 +15,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  FITZ_BROKER_IMAGE: ghcr.io/cntryl/fitz:${{ inputs.broker_tag || '0.3.0' }}
+  FITZ_BROKER_IMAGE: ghcr.io/cntryl/fitz:latest
 
 jobs:
   spec:
@@ -38,7 +32,7 @@ jobs:
           toolchain: stable
 
       - name: Start broker stack
-        run: docker compose up -d
+        run: docker compose up -d --pull always
 
       - name: Run broker-backed conformance and domain matrix
         shell: bash
@@ -62,8 +56,7 @@ jobs:
           path: artifacts/conformance-*.json
           if-no-files-found: warn
 
-      - name: Run cancellation chains against selected broker
-        if: github.event_name == 'workflow_dispatch' && inputs.broker_tag == '0.3.0'
+      - name: Run cancellation chains against latest broker
         shell: bash
         run: |
           for transport in tcp ws; do

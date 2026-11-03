@@ -216,12 +216,12 @@ async fn should_send_service_name_in_connect_before_delayed_hello() -> Result<()
 
     // Assert
     let connect = server.await.expect("server task panicked");
-    let payload = &connect[15..];
-    assert_eq!(&payload[..4], &[0, 2, 0, 2]);
+    let payload = &connect[19..];
+    assert_eq!(&payload[..4], &[0, 3, 0, 3]);
     assert_eq!(&payload[8..12], &[0, 0, 0, 0]);
     assert_eq!(&payload[12..16], &128_u32.to_be_bytes());
     assert_eq!(&payload[16..144], service_name.as_bytes());
-    assert_eq!(client.server_capabilities(), (2, 0));
+    assert_eq!(client.server_capabilities(), (3, 0));
     client.close().await?;
     Ok(())
 }
@@ -248,14 +248,18 @@ async fn should_stop_given_cancellation_when_connect_when_ready_called() -> Resu
 }
 
 fn hello_frame() -> Vec<u8> {
-    let mut payload = 2_u16.to_be_bytes().to_vec();
+    let mut payload = 3_u16.to_be_bytes().to_vec();
     payload.extend_from_slice(&0_u32.to_be_bytes());
     payload.extend_from_slice(&1_048_576_u32.to_be_bytes());
     payload.extend_from_slice(&64_u32.to_be_bytes());
     payload.extend_from_slice(&1_u64.to_be_bytes());
-    let mut frame = vec![0, 2, 0];
+    let mut value = 22_u32.to_be_bytes().to_vec();
+    value.extend_from_slice(&payload);
+    value.extend_from_slice(&[0, 1, 0, 0, 0, 10, 0, 2, 0, 0, 0, 1, 0, 0, 0, 2]);
+    let payload = value;
+    let mut frame = vec![0, 2, 4];
     frame.extend_from_slice(&0_u64.to_be_bytes());
-    frame.extend_from_slice(&22_u32.to_be_bytes());
+    frame.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
     frame.extend_from_slice(&payload);
     let mut transport = u32::try_from(frame.len()).unwrap().to_be_bytes().to_vec();
     transport.extend_from_slice(&frame);

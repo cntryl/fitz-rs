@@ -507,8 +507,22 @@ async fn read_frame(stream: &mut TcpStream) -> (u16, Vec<u8>) {
 
 fn encode_message_frame(kind: u16, payload: &[u8]) -> Vec<u8> {
     let mut body = kind.to_be_bytes().to_vec();
+    let extended;
+    let payload = if kind == 2 {
+        let mut value = u32::try_from(payload.len()).unwrap().to_be_bytes().to_vec();
+        value.extend_from_slice(payload);
+        value.extend_from_slice(&[0, 1, 0, 0, 0, 10, 0, 2, 0, 0, 0, 1, 0, 0, 0, 2]);
+        extended = value;
+        extended.as_slice()
+    } else {
+        payload
+    };
     let correlation = u64::from(kind == 300);
-    body.push(u8::from(correlation != 0) * 2);
+    body.push(if kind == 2 {
+        4
+    } else {
+        u8::from(correlation != 0) * 2
+    });
     body.extend_from_slice(&correlation.to_be_bytes());
     body.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
     body.extend_from_slice(payload);
@@ -517,7 +531,7 @@ fn encode_message_frame(kind: u16, payload: &[u8]) -> Vec<u8> {
     frame
 }
 fn hello() -> Vec<u8> {
-    let mut p = 2_u16.to_be_bytes().to_vec();
+    let mut p = 3_u16.to_be_bytes().to_vec();
     p.extend_from_slice(&0_u32.to_be_bytes());
     p.extend_from_slice(&1_048_576_u32.to_be_bytes());
     p.extend_from_slice(&64_u32.to_be_bytes());
